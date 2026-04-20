@@ -33,7 +33,18 @@ DB_URL = "{driver}://{user}:{password}@{host}:{port}/{name}".format(
 
 if _db_engine == "mssql":
     odbc_driver = os.getenv("DB_ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
-    DB_URL += f"?driver={quote_plus(odbc_driver)}"
+    _user = os.getenv("DB_USER", "")
+    _password = os.getenv("DB_PASSWORD", "")
+    if not _user and not _password:
+        DB_URL = "{driver}://@{host}:{port}/{name}?driver={odbc}&trusted_connection=yes".format(
+            driver=_driver,
+            host=os.getenv("DB_HOST", "127.0.0.1"),
+            port=os.getenv("DB_PORT", "1433"),
+            name=os.getenv("DB_NAME", "zkteco_sync"),
+            odbc=quote_plus(odbc_driver),
+        )
+    else:
+        DB_URL += f"?driver={quote_plus(odbc_driver)}"
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
