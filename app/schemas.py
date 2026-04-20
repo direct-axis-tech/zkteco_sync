@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 
 class DeviceCreate(BaseModel):
@@ -63,3 +63,72 @@ class AttendanceOut(BaseModel):
 
 class CommandCreate(BaseModel):
     command: str
+
+
+# --- Device info ---
+
+class DeviceSizesOut(BaseModel):
+    users: int
+    fingers: int
+    records: int
+    cards: int
+    faces: int
+    users_cap: int
+    fingers_cap: int
+    rec_cap: int
+    faces_cap: int
+
+
+class DeviceNetworkOut(BaseModel):
+    ip: str
+    mask: str
+    gateway: str
+
+
+class DeviceInfoOut(BaseModel):
+    serial_number: str
+    firmware_version: str
+    platform: str
+    device_name: str
+    mac: str
+    face_version: Optional[int]
+    fp_version: int
+    pin_width: int
+    network: DeviceNetworkOut
+    sizes: DeviceSizesOut
+
+
+# --- Device control ---
+
+class UnlockRequest(BaseModel):
+    seconds: int = 3
+
+
+class LcdRequest(BaseModel):
+    line: int = 1
+    text: str
+
+
+class SetTimeRequest(BaseModel):
+    sync: bool = False
+    dt: Optional[str] = None  # ISO 8601, e.g. "2024-01-15T09:00:00" — used when sync=False
+
+
+# --- Fingerprints ---
+
+class FingerprintTemplateOut(BaseModel):
+    id: int
+    user_id: str
+    finger_id: int
+    valid: int
+    template: str
+    source_device_sn: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class EnrollRequest(BaseModel):
+    finger_id: int = 0  # 0-9, which finger to enroll

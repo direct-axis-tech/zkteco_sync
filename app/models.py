@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, UniqueConstraint, Enum
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, UniqueConstraint, Enum, Text
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -67,3 +67,20 @@ class DeviceCommand(Base):
     command = Column(String(500), nullable=False)
     status = Column(Enum("pending", "sent", "acknowledged"), default="pending")
     created_at = Column(DateTime, server_default=func.now())
+
+
+class FingerprintTemplate(Base):
+    __tablename__ = "fingerprint_templates"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(24), nullable=False, index=True)
+    finger_id = Column(Integer, nullable=False)          # 0-9, which finger
+    valid = Column(Integer, nullable=False, default=1)
+    template = Column(Text, nullable=False)              # hex-encoded binary from pyzk
+    source_device_sn = Column(String(50), nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "finger_id", name="uq_fingerprint"),
+    )

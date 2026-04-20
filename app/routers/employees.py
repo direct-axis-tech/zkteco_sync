@@ -3,8 +3,8 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from app.database import get_db
-from app.models import DeviceEmployee, Employee
-from app.schemas import DeviceEmployeeOut, EmployeeOut
+from app.models import DeviceEmployee, Employee, FingerprintTemplate
+from app.schemas import DeviceEmployeeOut, EmployeeOut, FingerprintTemplateOut
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -27,3 +27,10 @@ def get_employee_devices(user_id: str, db: Session = Depends(get_db)):
     if not db.query(Employee).filter_by(user_id=user_id).first():
         raise HTTPException(status_code=404, detail="Employee not found")
     return db.query(DeviceEmployee).filter_by(user_id=user_id).all()
+
+
+@router.get("/{user_id}/templates", response_model=List[FingerprintTemplateOut])
+def get_employee_templates(user_id: str, db: Session = Depends(get_db)):
+    if not db.query(Employee).filter_by(user_id=user_id).first():
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return db.query(FingerprintTemplate).filter_by(user_id=user_id).all()
