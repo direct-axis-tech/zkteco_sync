@@ -92,6 +92,19 @@ async def adms_receive(
     return PlainTextResponse(content="OK")
 
 
+@router.get("/iclock/ping", response_class=PlainTextResponse)
+def adms_ping(
+    SN: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    device = db.query(Device).filter_by(serial_number=SN).first()
+    if device:
+        device.last_seen = datetime.utcnow()
+        device.is_online = True
+        db.commit()
+    return PlainTextResponse(content="OK")
+
+
 @router.get("/iclock/getrequest", response_class=PlainTextResponse)
 def adms_getrequest(
     SN: str = Query(...),
