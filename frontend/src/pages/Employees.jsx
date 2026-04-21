@@ -315,7 +315,7 @@ function DetailPanel({ employee, allDevices }) {
                 <select
                   value={enrollDeviceSn}
                   onChange={(e) => setEnrollDeviceSn(e.target.value)}
-                  className="input flex-1 text-sm"
+                  className="input flex-1 min-w-0 text-sm"
                 >
                   <option value="">Select device…</option>
                   {enrolledDevices.map((d) => {
@@ -330,7 +330,7 @@ function DetailPanel({ employee, allDevices }) {
                 <select
                   value={enrollFingerId}
                   onChange={(e) => setEnrollFingerId(Number(e.target.value))}
-                  className="input text-sm"
+                  className="input w-32 text-sm"
                 >
                   {FINGER_NAMES.map((name, i) => (
                     <option key={i} value={i}>{name}</option>
