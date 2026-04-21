@@ -132,3 +132,15 @@ class FingerprintTemplateOut(BaseModel):
 
 class EnrollRequest(BaseModel):
     finger_id: int = 0  # 0-9, which finger to enroll
+
+
+# --- Auth ---
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"

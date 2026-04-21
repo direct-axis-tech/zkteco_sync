@@ -8,6 +8,7 @@ from zk.finger import Finger
 
 from app.database import get_db
 from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate
+from app.deps import require_auth
 from app.schemas import (
     CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut,
     EnrollRequest, FingerprintTemplateOut, LcdRequest,
@@ -16,7 +17,7 @@ from app.schemas import (
 from app.services.poller import pull_device
 from app.services.sdk import device_connection, enroll_user_task
 
-router = APIRouter(prefix="/devices", tags=["devices"])
+router = APIRouter(prefix="/devices", tags=["devices"], dependencies=[Depends(require_auth)])
 
 
 def _get_device_or_404(sn: str, db: Session) -> Device:

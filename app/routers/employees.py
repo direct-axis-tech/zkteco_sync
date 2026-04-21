@@ -3,10 +3,11 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from app.database import get_db
+from app.deps import require_auth
 from app.models import DeviceEmployee, Employee, FingerprintTemplate
 from app.schemas import DeviceEmployeeOut, EmployeeOut, FingerprintTemplateOut
 
-router = APIRouter(prefix="/employees", tags=["employees"])
+router = APIRouter(prefix="/employees", tags=["employees"], dependencies=[Depends(require_auth)])
 
 
 @router.get("", response_model=List[EmployeeOut])

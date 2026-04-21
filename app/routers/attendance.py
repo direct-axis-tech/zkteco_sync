@@ -4,11 +4,13 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app.deps import require_auth
+
 from app.database import get_db
 from app.models import AttendanceLog
 from app.schemas import AttendanceOut
 
-router = APIRouter(prefix="/attendance", tags=["attendance"])
+router = APIRouter(prefix="/attendance", tags=["attendance"], dependencies=[Depends(require_auth)])
 
 
 @router.get("", response_model=List[AttendanceOut])
