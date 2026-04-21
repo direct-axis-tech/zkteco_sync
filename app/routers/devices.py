@@ -14,7 +14,7 @@ from app.schemas import (
     EnrollRequest, FingerprintTemplateOut, LcdRequest,
     SetTimeRequest, UnlockRequest,
 )
-from app.services.poller import pull_device
+from app.services.poller import pull_attendance, pull_device, pull_employees
 from app.services.sdk import device_connection, enroll_user_task
 
 router = APIRouter(prefix="/devices", tags=["devices"], dependencies=[Depends(require_auth)])
@@ -78,6 +78,20 @@ def trigger_pull(sn: str, background_tasks: BackgroundTasks, db: Session = Depen
     _get_device_or_404(sn, db)
     background_tasks.add_task(pull_device, sn)
     return {"message": "Pull started", "device": sn}
+
+
+@router.post("/{sn}/pull/employees")
+def trigger_pull_employees(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    _get_device_or_404(sn, db)
+    background_tasks.add_task(pull_employees, sn)
+    return {"message": "Employee sync started", "device": sn}
+
+
+@router.post("/{sn}/pull/attendance")
+def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    _get_device_or_404(sn, db)
+    background_tasks.add_task(pull_attendance, sn)
+    return {"message": "Attendance sync started", "device": sn}
 
 
 # ---------------------------------------------------------------------------

@@ -3,12 +3,16 @@ from zk import ZK
 from zk.exception import ZKErrorConnection, ZKNetworkError
 
 from app.database import SessionLocal
-from app.models import Device, Employee, DeviceEmployee, AttendanceLog
+from app.models import AttendanceLog, Device, DeviceEmployee, Employee
 
 
-def pull_device(serial_number: str) -> dict:
-    result = {"users_synced": 0, "attendance_synced": 0, "errors": []}
+def _connect(device):
+    zk = ZK(device.ip_address, port=device.port, timeout=30, verbose=False)
+    return zk.connect()
 
+
+def pull_employees(serial_number: str) -> dict:
+    result = {"users_synced": 0, "errors": []}
     db = SessionLocal()
     try:
         device = db.query(Device).filter_by(serial_number=serial_number).first()
@@ -16,15 +20,12 @@ def pull_device(serial_number: str) -> dict:
             result["errors"].append("Device not found")
             return result
 
-        zk = ZK(device.ip_address, port=device.port, timeout=30, verbose=False)
         conn = None
         try:
-            conn = zk.connect()
+            conn = _connect(device)
             conn.disable_device()
 
-            # --- Sync users ---
-            users = conn.get_users()
-            for user in users:
+            for user in conn.get_users():
                 emp = db.query(Employee).filter_by(user_id=str(user.user_id)).first()
                 if emp:
                     emp.name = user.name
@@ -47,39 +48,14 @@ def pull_device(serial_number: str) -> dict:
                     de.uid = user.uid
                     de.synced_at = datetime.utcnow()
                 else:
-                    de = DeviceEmployee(
+                    db.add(DeviceEmployee(
                         device_sn=serial_number,
                         user_id=str(user.user_id),
                         uid=user.uid,
-                    )
-                    db.add(de)
-
+                    ))
                 result["users_synced"] += 1
 
             db.commit()
-
-            # --- Sync attendance ---
-            attendances = conn.get_attendance()
-            for att in attendances:
-                exists = db.query(AttendanceLog).filter_by(
-                    device_sn=serial_number,
-                    user_id=str(att.user_id),
-                    timestamp=att.timestamp,
-                ).first()
-                if not exists:
-                    log = AttendanceLog(
-                        device_sn=serial_number,
-                        user_id=str(att.user_id),
-                        timestamp=att.timestamp,
-                        status=att.status,
-                        punch=att.punch,
-                        source="sdk_pull",
-                    )
-                    db.add(log)
-                    result["attendance_synced"] += 1
-
-            db.commit()
-
             device.last_seen = datetime.utcnow()
             device.is_online = True
             db.commit()
@@ -98,8 +74,74 @@ def pull_device(serial_number: str) -> dict:
                     conn.disconnect()
                 except Exception:
                     pass
-
     finally:
         db.close()
 
     return result
+
+
+def pull_attendance(serial_number: str) -> dict:
+    result = {"attendance_synced": 0, "errors": []}
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter_by(serial_number=serial_number).first()
+        if not device:
+            result["errors"].append("Device not found")
+            return result
+
+        conn = None
+        try:
+            conn = _connect(device)
+            conn.disable_device()
+
+            for att in conn.get_attendance():
+                exists = db.query(AttendanceLog).filter_by(
+                    device_sn=serial_number,
+                    user_id=str(att.user_id),
+                    timestamp=att.timestamp,
+                ).first()
+                if not exists:
+                    db.add(AttendanceLog(
+                        device_sn=serial_number,
+                        user_id=str(att.user_id),
+                        timestamp=att.timestamp,
+                        status=att.status,
+                        punch=att.punch,
+                        source="sdk_pull",
+                    ))
+                    result["attendance_synced"] += 1
+
+            db.commit()
+            device.last_seen = datetime.utcnow()
+            device.is_online = True
+            db.commit()
+
+        except (ZKErrorConnection, ZKNetworkError) as e:
+            result["errors"].append(str(e))
+            device.is_online = False
+            db.commit()
+        except Exception as e:
+            result["errors"].append(str(e))
+            db.rollback()
+        finally:
+            if conn:
+                try:
+                    conn.enable_device()
+                    conn.disconnect()
+                except Exception:
+                    pass
+    finally:
+        db.close()
+
+    return result
+
+
+def pull_device(serial_number: str) -> dict:
+    """Sync everything: employees + attendance. Used by Sync All and auto-registration."""
+    emp_result  = pull_employees(serial_number)
+    att_result  = pull_attendance(serial_number)
+    return {
+        "users_synced":      emp_result["users_synced"],
+        "attendance_synced": att_result["attendance_synced"],
+        "errors":            emp_result["errors"] + att_result["errors"],
+    }
