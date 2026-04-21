@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import Login from './pages/Login'
 import Devices from './pages/Devices'
+import Employees from './pages/Employees'
 import Layout from './components/Layout'
 
 function ProtectedRoute({ children }) {
@@ -18,6 +19,7 @@ export default function App() {
         >
           <Route index element={<Navigate to="/devices" replace />} />
           <Route path="devices" element={<Devices />} />
+          <Route path="employees" element={<Employees />} />
         </Route>
         <Route path="*" element={<Navigate to="/devices" replace />} />
       </Routes>

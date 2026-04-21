@@ -32,6 +32,9 @@ async function request(method, path, body) {
 export const api = {
   employees: {
     list: () => request('GET', '/employees'),
+    get: (userId) => request('GET', `/employees/${userId}`),
+    getDevices: (userId) => request('GET', `/employees/${userId}/devices`),
+    getTemplates: (userId) => request('GET', `/employees/${userId}/templates`),
   },
   auth: {
     login: (username, password) =>
