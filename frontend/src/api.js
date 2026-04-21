@@ -31,7 +31,8 @@ async function request(method, path, body) {
 
 export const api = {
   hrmSync: {
-    status: () => request('GET', '/hrm-sync/status'),
+    status: () => request('GET', '/hrm-sync'),
+    update: (data) => request('PUT', '/hrm-sync', data),
     run: () => request('POST', '/hrm-sync/run'),
   },
   attendance: {

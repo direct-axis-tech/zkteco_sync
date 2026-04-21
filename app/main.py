@@ -7,8 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.database import Base, engine
-from app.routers import adms, attendance, auth, devices, employees, hrm_sync
-from app.services.hrm_sync import is_configured, run_sync
+from app.routers import adms, attendance, auth, devices, employees
+from app.routers import hrm_sync
+from app.database import SessionLocal
+from app.models import HrmIntegration
+from app.services.hrm_sync import run_sync
 
 log = logging.getLogger(__name__)
 
@@ -17,20 +20,34 @@ Base.metadata.create_all(bind=engine)
 _scheduler = None
 
 
+def _hrm_tick():
+    """Called every 60s. Checks DB interval before actually running."""
+    db = SessionLocal()
+    try:
+        row = db.query(HrmIntegration).filter_by(id=1).first()
+        if not row or not row.enabled or not row.endpoint or not row.secret:
+            return
+        from datetime import datetime, timedelta
+        interval = row.interval_seconds or 300
+        if row.last_run_at and (datetime.utcnow() - row.last_run_at) < timedelta(seconds=interval):
+            return
+    finally:
+        db.close()
+    run_sync()
+
+
 def _start_scheduler():
     global _scheduler
-    interval = int(os.getenv("HRM_SYNC_INTERVAL", "300"))
     from apscheduler.schedulers.background import BackgroundScheduler
     _scheduler = BackgroundScheduler()
-    _scheduler.add_job(run_sync, "interval", seconds=interval, id="hrm_sync")
+    _scheduler.add_job(_hrm_tick, "interval", seconds=60, id="hrm_tick")
     _scheduler.start()
-    log.info("HRM sync scheduler started (every %ds)", interval)
+    log.info("HRM sync scheduler started (60s tick)")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if is_configured():
-        _start_scheduler()
+    _start_scheduler()
     yield
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)

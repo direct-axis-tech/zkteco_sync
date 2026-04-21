@@ -86,13 +86,21 @@ class FingerprintTemplate(Base):
     )
 
 
-class HrmSyncState(Base):
-    __tablename__ = "hrm_sync_state"
+class HrmIntegration(Base):
+    """Single-row table — config and sync state for the HRM push integration."""
+    __tablename__ = "hrm_integration"
 
     id = Column(Integer, primary_key=True, default=1)
+    # Config (editable from UI)
+    endpoint = Column(String(500), nullable=True)
+    secret = Column(String(200), nullable=True)
+    location_id = Column(String(20), default="1")
+    interval_seconds = Column(Integer, default=300)
+    timezone = Column(String(50), default="UTC")
+    enabled = Column(Boolean, default=True)
+    # State (updated after each push; last_synced_id also editable from UI)
+    last_synced_id = Column(Integer, default=0)
     last_run_at = Column(DateTime, nullable=True)
-    last_synced_id = Column(Integer, default=0)   # last attendance_log.id pushed
     records_last_push = Column(Integer, default=0)
     total_pushed = Column(Integer, default=0)
     last_error = Column(String(1000), nullable=True)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
