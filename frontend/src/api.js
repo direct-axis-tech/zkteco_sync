@@ -41,14 +41,6 @@ export const api = {
       if (params.offset != null) q.set('offset', params.offset)
       return request('GET', `/attendance?${q}`)
     },
-    count: (params = {}) => {
-      const q = new URLSearchParams()
-      if (params.device_sn) q.set('device_sn', params.device_sn)
-      if (params.user_id) q.set('user_id', params.user_id)
-      if (params.from_date) q.set('from_date', params.from_date)
-      if (params.to_date) q.set('to_date', params.to_date)
-      return request('GET', `/attendance/count?${q}`)
-    },
   },
   employees: {
     list: () => request('GET', '/employees'),

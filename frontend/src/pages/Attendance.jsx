@@ -34,6 +34,7 @@ export default function Attendance() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     api.devices.list().then(setDevices).catch(() => {})
@@ -42,6 +43,7 @@ export default function Attendance() {
 
   const load = useCallback(async (f, p) => {
     setLoading(true)
+    setError('')
     try {
       const params = {
         ...(f.device_sn ? { device_sn: f.device_sn } : {}),
@@ -51,13 +53,11 @@ export default function Attendance() {
         limit: PAGE_SIZE,
         offset: p * PAGE_SIZE,
       }
-      const [data, countData] = await Promise.all([
-        api.attendance.list(params),
-        api.attendance.count(params),
-      ])
-      setRows(data)
-      setTotal(countData.count)
-    } catch {
+      const data = await api.attendance.list(params)
+      setRows(data.items)
+      setTotal(data.total)
+    } catch (err) {
+      setError(err.message)
       setRows([])
       setTotal(0)
     } finally {
@@ -152,6 +152,8 @@ export default function Attendance() {
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         {loading ? (
           <div className="p-12 text-center text-sm text-gray-400">Loading…</div>
+        ) : error ? (
+          <div className="p-12 text-center text-sm text-red-600">{error}</div>
         ) : rows.length === 0 ? (
           <div className="p-12 text-center text-sm text-gray-400">No records found.</div>
         ) : (

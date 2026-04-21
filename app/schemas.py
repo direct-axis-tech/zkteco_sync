@@ -55,7 +55,7 @@ class AttendanceOut(BaseModel):
     status: int
     punch: int
     source: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
