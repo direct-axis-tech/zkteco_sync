@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -37,7 +37,7 @@ def adms_handshake(
     db: Session = Depends(get_db),
 ):
     device = _ensure_registered(SN, request.client.host, db, background_tasks)
-    device.last_seen = datetime.utcnow()
+    device.last_seen = datetime.now(timezone.utc)
     device.is_online = True
     db.commit()
 
@@ -105,7 +105,7 @@ async def adms_receive(
     db.commit()
 
     device = _ensure_registered(SN, request.client.host, db, background_tasks)
-    device.last_seen = datetime.utcnow()
+    device.last_seen = datetime.now(timezone.utc)
     device.is_online = True
     db.commit()
 
@@ -120,7 +120,7 @@ def adms_ping(
     db: Session = Depends(get_db),
 ):
     device = _ensure_registered(SN, request.client.host, db, background_tasks)
-    device.last_seen = datetime.utcnow()
+    device.last_seen = datetime.now(timezone.utc)
     device.is_online = True
     db.commit()
     return PlainTextResponse(content="OK")
@@ -134,7 +134,7 @@ def adms_getrequest(
     db: Session = Depends(get_db),
 ):
     device = _ensure_registered(SN, request.client.host, db, background_tasks)
-    device.last_seen = datetime.utcnow()
+    device.last_seen = datetime.now(timezone.utc)
     device.is_online = True
     db.commit()
 

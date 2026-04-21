@@ -1,8 +1,20 @@
-from sqlalchemy import create_engine
+from datetime import timezone
+from sqlalchemy import create_engine, DateTime, TypeDecorator
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 from urllib.parse import quote_plus
 import os
+
+
+class UTCDateTime(TypeDecorator):
+    """DateTime column that always returns timezone-aware UTC datetimes."""
+    impl = DateTime
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
 
 load_dotenv()
 

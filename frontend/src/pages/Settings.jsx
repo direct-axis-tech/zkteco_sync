@@ -255,7 +255,12 @@ export default function Settings() {
         {/* Status */}
         {cfg && !form && (
           <div className="px-5">
-            <StatusRow label="Last run" value={cfg.last_run_at ? new Date(cfg.last_run_at).toLocaleString() : null} />
+            <StatusRow
+              label="Last run"
+              value={cfg.last_run_at
+                ? new Date(cfg.last_run_at).toLocaleString(undefined, { timeZone: cfg.timezone || 'UTC' })
+                : null}
+            />
             <StatusRow
               label="Last synced ID"
               value={cfg.last_synced_id ?? 0}

@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -50,7 +50,7 @@ def run_sync() -> dict:
         )
 
         if not rows:
-            cfg.last_run_at = datetime.utcnow()
+            cfg.last_run_at = datetime.now(timezone.utc)
             cfg.records_last_push = 0
             db.commit()
             return {"pushed": 0, "last_synced_id": last_id}
@@ -74,14 +74,14 @@ def run_sync() -> dict:
                 resp.raise_for_status()
                 total_pushed += len(batch)
             except Exception as e:
-                cfg.last_run_at = datetime.utcnow()
+                cfg.last_run_at = datetime.now(timezone.utc)
                 cfg.last_error = f"Batch {i // BATCH_SIZE} failed: {e}"
                 db.commit()
                 log.error("HRM sync batch error: %s", e)
                 return {"error": str(e), "pushed_so_far": total_pushed}
 
         new_last_id = rows[-1].id
-        cfg.last_run_at = datetime.utcnow()
+        cfg.last_run_at = datetime.now(timezone.utc)
         cfg.last_synced_id = new_last_id
         cfg.records_last_push = total_pushed
         cfg.total_pushed = (cfg.total_pushed or 0) + total_pushed
@@ -95,7 +95,7 @@ def run_sync() -> dict:
         log.exception("HRM sync unexpected error")
         try:
             cfg = _get_or_create(db)
-            cfg.last_run_at = datetime.utcnow()
+            cfg.last_run_at = datetime.now(timezone.utc)
             cfg.last_error = str(e)
             db.commit()
         except Exception:

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from zk import ZK
 from zk.exception import ZKErrorConnection, ZKNetworkError
 
@@ -31,7 +31,7 @@ def pull_employees(serial_number: str) -> dict:
                     emp.name = user.name
                     emp.privilege = user.privilege
                     emp.card = str(user.card)
-                    emp.updated_at = datetime.utcnow()
+                    emp.updated_at = datetime.now(timezone.utc)
                 else:
                     emp = Employee(
                         user_id=str(user.user_id),
@@ -46,7 +46,7 @@ def pull_employees(serial_number: str) -> dict:
                 ).first()
                 if de:
                     de.uid = user.uid
-                    de.synced_at = datetime.utcnow()
+                    de.synced_at = datetime.now(timezone.utc)
                 else:
                     db.add(DeviceEmployee(
                         device_sn=serial_number,
@@ -56,7 +56,7 @@ def pull_employees(serial_number: str) -> dict:
                 result["users_synced"] += 1
 
             db.commit()
-            device.last_seen = datetime.utcnow()
+            device.last_seen = datetime.now(timezone.utc)
             device.is_online = True
             db.commit()
 
@@ -112,7 +112,7 @@ def pull_attendance(serial_number: str) -> dict:
                     result["attendance_synced"] += 1
 
             db.commit()
-            device.last_seen = datetime.utcnow()
+            device.last_seen = datetime.now(timezone.utc)
             device.is_online = True
             db.commit()
 

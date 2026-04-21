@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -163,7 +163,7 @@ def get_device_time(sn: str, db: Session = Depends(get_db)):
 def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     if payload.sync:
-        target = datetime.utcnow()
+        target = datetime.now(timezone.utc)
     elif payload.dt:
         try:
             target = datetime.fromisoformat(payload.dt)
@@ -285,7 +285,7 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get
                     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
                     if de:
                         de.uid = actual_uid
-                        de.synced_at = datetime.utcnow()
+                        de.synced_at = datetime.now(timezone.utc)
                     else:
                         db.add(DeviceEmployee(device_sn=sn, user_id=user_id, uid=actual_uid))
                     pushed.append(user_id)
@@ -332,7 +332,7 @@ def push_user_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
             de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
             if de:
                 de.uid = actual_uid
-                de.synced_at = datetime.utcnow()
+                de.synced_at = datetime.now(timezone.utc)
             else:
                 db.add(DeviceEmployee(device_sn=sn, user_id=user_id, uid=actual_uid))
             db.commit()

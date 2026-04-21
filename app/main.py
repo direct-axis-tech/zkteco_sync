@@ -27,9 +27,9 @@ def _hrm_tick():
         row = db.query(HrmIntegration).filter_by(id=1).first()
         if not row or not row.enabled or not row.endpoint or not row.secret:
             return
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         interval = row.interval_seconds or 300
-        if row.last_run_at and (datetime.utcnow() - row.last_run_at) < timedelta(seconds=interval):
+        if row.last_run_at and (datetime.now(timezone.utc) - row.last_run_at) < timedelta(seconds=interval):
             return
     finally:
         db.close()

@@ -1,6 +1,6 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, UniqueConstraint, Enum, Text
+from sqlalchemy import Column, Integer, String, Boolean, UniqueConstraint, Enum, Text
 from sqlalchemy.sql import func
-from app.database import Base
+from app.database import Base, UTCDateTime as DateTime
 
 
 class Device(Base):

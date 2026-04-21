@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from jose import jwt
@@ -25,7 +25,7 @@ def login(payload: LoginRequest):
     token = jwt.encode(
         {
             "sub": payload.username,
-            "exp": datetime.utcnow() + timedelta(hours=_TOKEN_EXPIRE_HOURS),
+            "exp": datetime.now(timezone.utc) + timedelta(hours=_TOKEN_EXPIRE_HOURS),
         },
         _SECRET_KEY,
         algorithm=_ALGORITHM,
