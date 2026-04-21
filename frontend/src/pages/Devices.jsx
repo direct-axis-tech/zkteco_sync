@@ -196,7 +196,7 @@ export default function Devices() {
         </button>
       </div>
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-white rounded-xl border border-gray-200">
         {loading ? (
           <div className="p-12 text-center text-sm text-gray-400">Loading…</div>
         ) : devices.length === 0 ? (
@@ -206,7 +206,7 @@ export default function Devices() {
         ) : (
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-gray-200 bg-gray-50">
+              <tr className="border-b border-gray-200 bg-gray-50 [&>th:first-child]:rounded-tl-xl [&>th:last-child]:rounded-tr-xl">
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Name</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Serial</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Address</th>
