@@ -82,5 +82,12 @@ export const api = {
     queueCommand: (sn, command) => request('POST', `/devices/${sn}/commands`, { command }),
     listUsers: (sn) => request('GET', `/devices/${sn}/users`),
     pushBulk: (sn, user_ids) => request('POST', `/devices/${sn}/users/push_bulk`, { user_ids }),
+    pushUser: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/push`),
+    removeUser: (sn, userId) => request('DELETE', `/devices/${sn}/users/${userId}`),
+    pushTemplates: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/templates/push`),
+    enrollUser: (sn, userId, fingerId) =>
+      request('POST', `/devices/${sn}/users/${userId}/enroll`, { finger_id: fingerId }),
+    deleteTemplate: (sn, userId, fingerId) =>
+      request('DELETE', `/devices/${sn}/users/${userId}/templates/${fingerId}`),
   },
 }
