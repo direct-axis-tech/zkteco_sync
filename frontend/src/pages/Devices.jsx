@@ -7,6 +7,7 @@ import SetClockDrawer from '../components/SetClockDrawer'
 import WriteLcdDrawer from '../components/WriteLcdDrawer'
 import CommandsDrawer from '../components/CommandsDrawer'
 import DeviceUsersDrawer from '../components/DeviceUsersDrawer'
+import PasswordConfirmModal from '../components/PasswordConfirmModal'
 
 function StatusBadge({ isOnline }) {
   return (
@@ -43,6 +44,7 @@ export default function Devices() {
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
   const [drawer, setDrawer] = useState(null) // { type, device }
+  const [pwConfirm, setPwConfirm] = useState(null) // { title, description, onConfirm }
   const [toast, setToast] = useState(null)
 
   const showToast = useCallback((message, type = 'success') => setToast({ message, type }), [])
@@ -108,6 +110,28 @@ export default function Devices() {
     }
   }
 
+  function confirmAction(title, description, action) {
+    setPwConfirm({ title, description, onConfirm: action })
+  }
+
+  async function handleClearAttendance(device) {
+    try {
+      await api.devices.clearAttendance(device.serial_number)
+      showToast(`Attendance cleared on ${device.name || device.serial_number}`)
+    } catch (err) {
+      showToast(err.message, 'error')
+    }
+  }
+
+  async function handleRestart(device) {
+    try {
+      await api.devices.restart(device.serial_number)
+      showToast(`${device.name || device.serial_number} is restarting`)
+    } catch (err) {
+      showToast(err.message, 'error')
+    }
+  }
+
   async function handleUnlock(device) {
     try {
       await api.devices.unlock(device.serial_number)
@@ -130,6 +154,25 @@ export default function Devices() {
       { label: 'Write LCD', onClick: () => setDrawer({ type: 'lcd', device }) },
       { label: 'Unlock Door', onClick: () => handleUnlock(device) },
       { label: 'Queue Command', onClick: () => setDrawer({ type: 'commands', device }) },
+      'divider',
+      {
+        label: 'Clear Attendance',
+        danger: true,
+        onClick: () => confirmAction(
+          'Clear Attendance',
+          `This will permanently wipe attendance logs from the device memory. Records already synced to the database are kept.`,
+          () => { setPwConfirm(null); handleClearAttendance(device) }
+        ),
+      },
+      {
+        label: 'Restart Device',
+        danger: true,
+        onClick: () => confirmAction(
+          'Restart Device',
+          `The device will reboot. It will go offline briefly and reconnect automatically.`,
+          () => { setPwConfirm(null); handleRestart(device) }
+        ),
+      },
       'divider',
       { label: 'Edit', onClick: () => setModal({ mode: 'edit', device }) },
       { label: 'Delete', danger: true, onClick: () => handleDelete(device) },
@@ -233,6 +276,15 @@ export default function Devices() {
           device={drawer.device}
           onClose={() => setDrawer(null)}
           showToast={showToast}
+        />
+      )}
+
+      {pwConfirm && (
+        <PasswordConfirmModal
+          title={pwConfirm.title}
+          description={pwConfirm.description}
+          onConfirm={pwConfirm.onConfirm}
+          onClose={() => setPwConfirm(null)}
         />
       )}
 
