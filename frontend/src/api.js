@@ -30,6 +30,9 @@ async function request(method, path, body) {
 }
 
 export const api = {
+  employees: {
+    list: () => request('GET', '/employees'),
+  },
   auth: {
     login: (username, password) =>
       request('POST', '/auth/login', { username, password }),
@@ -54,5 +57,7 @@ export const api = {
     clearAttendance: (sn) => request('DELETE', `/devices/${sn}/attendance`),
     restart: (sn) => request('POST', `/devices/${sn}/restart`),
     queueCommand: (sn, command) => request('POST', `/devices/${sn}/commands`, { command }),
+    listUsers: (sn) => request('GET', `/devices/${sn}/users`),
+    pushBulk: (sn, user_ids) => request('POST', `/devices/${sn}/users/push_bulk`, { user_ids }),
   },
 }

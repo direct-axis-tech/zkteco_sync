@@ -10,7 +10,7 @@ from app.database import get_db
 from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate
 from app.deps import require_auth
 from app.schemas import (
-    CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
+    BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
     EnrollRequest, FingerprintTemplateOut, LcdRequest,
     SetTimeRequest, UnlockRequest,
 )
@@ -242,8 +242,62 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# User sync: push/remove individual users on a device
+# User sync: list enrolled, push/remove individual users on a device
 # ---------------------------------------------------------------------------
+
+@router.get("/{sn}/users")
+def list_device_users(sn: str, db: Session = Depends(get_db)):
+    """Return user_ids enrolled on this device."""
+    _get_device_or_404(sn, db)
+    rows = db.query(DeviceEmployee).filter_by(device_sn=sn).all()
+    return [{"user_id": r.user_id, "uid": r.uid, "synced_at": r.synced_at} for r in rows]
+
+
+@router.post("/{sn}/users/push_bulk")
+def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get_db)):
+    """Push multiple employees to a device in one call."""
+    device = _get_device_or_404(sn, db)
+    pushed = []
+    errors = []
+
+    try:
+        with device_connection(device) as conn:
+            users_on_device = conn.get_users()
+            uid_by_user = {u.user_id: u for u in users_on_device}
+
+            for user_id in payload.user_ids:
+                emp = db.query(Employee).filter_by(user_id=user_id).first()
+                if not emp:
+                    errors.append(f"{user_id}: employee not found in DB")
+                    continue
+                try:
+                    existing = uid_by_user.get(str(user_id))
+                    uid = existing.uid if existing else None
+                    pre_uid = conn.next_uid
+                    conn.set_user(
+                        uid=uid,
+                        name=emp.name,
+                        privilege=emp.privilege,
+                        user_id=emp.user_id,
+                        card=int(emp.card) if emp.card and emp.card != "0" else 0,
+                    )
+                    actual_uid = uid if uid is not None else pre_uid
+                    de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
+                    if de:
+                        de.uid = actual_uid
+                        de.synced_at = datetime.utcnow()
+                    else:
+                        db.add(DeviceEmployee(device_sn=sn, user_id=user_id, uid=actual_uid))
+                    pushed.append(user_id)
+                except Exception as e:
+                    errors.append(f"{user_id}: {e}")
+
+            db.commit()
+    except (ZKErrorConnection, ZKNetworkError):
+        raise HTTPException(status_code=503, detail="Could not connect to device")
+
+    return {"device_sn": sn, "pushed": pushed, "errors": errors}
+
 
 @router.post("/{sn}/users/{user_id}/push")
 def push_user_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):

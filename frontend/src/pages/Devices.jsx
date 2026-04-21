@@ -6,6 +6,7 @@ import DeviceInfoDrawer from '../components/DeviceInfoDrawer'
 import SetClockDrawer from '../components/SetClockDrawer'
 import WriteLcdDrawer from '../components/WriteLcdDrawer'
 import CommandsDrawer from '../components/CommandsDrawer'
+import DeviceUsersDrawer from '../components/DeviceUsersDrawer'
 
 function StatusBadge({ isOnline }) {
   return (
@@ -123,6 +124,7 @@ export default function Devices() {
       { label: 'Sync Attendance', onClick: () => handleSync(device, 'attendance') },
       { label: 'Sync Templates', onClick: () => handleSync(device, 'templates') },
       'divider',
+      { label: 'Manage Users', onClick: () => setDrawer({ type: 'users', device }) },
       { label: 'Device Info', onClick: () => setDrawer({ type: 'info', device }) },
       { label: 'Set Clock', onClick: () => setDrawer({ type: 'clock', device }) },
       { label: 'Write LCD', onClick: () => setDrawer({ type: 'lcd', device }) },
@@ -202,6 +204,13 @@ export default function Devices() {
         />
       )}
 
+      {drawer?.type === 'users' && (
+        <DeviceUsersDrawer
+          device={drawer.device}
+          onClose={() => setDrawer(null)}
+          showToast={showToast}
+        />
+      )}
       {drawer?.type === 'info' && (
         <DeviceInfoDrawer device={drawer.device} onClose={() => setDrawer(null)} />
       )}

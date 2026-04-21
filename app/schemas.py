@@ -156,3 +156,7 @@ class DeviceUpdate(BaseModel):
     ip_address: Optional[str] = None
     port: Optional[int] = None
     name: Optional[str] = None
+
+
+class BulkPushRequest(BaseModel):
+    user_ids: List[str]
