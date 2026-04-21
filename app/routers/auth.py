@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from jose import jwt
 import os
 
-from app.schemas import LoginRequest, TokenOut
+from app.deps import require_auth
+from app.schemas import LoginRequest, PasswordVerify, TokenOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -30,3 +31,10 @@ def login(payload: LoginRequest):
         algorithm=_ALGORITHM,
     )
     return TokenOut(access_token=token)
+
+
+@router.post("/verify", status_code=204, dependencies=[Depends(require_auth)])
+def verify_password(payload: PasswordVerify):
+    expected_pass = os.getenv("API_PASSWORD", "admin")
+    if payload.password != expected_pass:
+        raise HTTPException(status_code=401, detail="Invalid password")

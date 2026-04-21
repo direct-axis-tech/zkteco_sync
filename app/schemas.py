@@ -146,6 +146,10 @@ class TokenOut(BaseModel):
     token_type: str = "bearer"
 
 
+class PasswordVerify(BaseModel):
+    password: str
+
+
 # --- Device update ---
 
 class DeviceUpdate(BaseModel):
