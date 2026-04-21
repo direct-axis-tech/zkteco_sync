@@ -155,6 +155,23 @@ if configure:
 
     secret_key = secrets.token_hex(32)
 
+    header("HRM sync  (optional)")
+    info("Automatically pushes attendance records to your HRM server on a schedule.")
+    hrm_configure = ask_yn("Configure HRM sync?", default="n")
+
+    hrm_endpoint = ""
+    hrm_secret   = ""
+    hrm_loc      = "1"
+    hrm_interval = "300"
+    hrm_tz       = "UTC"
+
+    if hrm_configure:
+        hrm_endpoint = ask("HRM server endpoint URL", "")
+        hrm_secret   = ask_secret("Shared secret key")
+        hrm_loc      = ask("Location ID", "1")
+        hrm_interval = ask("Sync interval (seconds)", "300")
+        hrm_tz       = ask("Timezone (e.g. Asia/Dubai)", "UTC")
+
     header("Writing .env")
     env_file.write_text(
         f"APP_HOST={app_host}\n"
@@ -172,6 +189,12 @@ if configure:
         f"DB_USER={db_user}\n"
         f"DB_PASSWORD={db_password}\n"
         f"DB_ODBC_DRIVER={db_odbc}\n"
+        f"\n"
+        f"HRM_SYNC_ENDPOINT={hrm_endpoint}\n"
+        f"HRM_SYNC_SECRET={hrm_secret}\n"
+        f"HRM_SYNC_LOCATION_ID={hrm_loc}\n"
+        f"HRM_SYNC_INTERVAL={hrm_interval}\n"
+        f"HRM_SYNC_TIMEZONE={hrm_tz}\n"
     )
     success(".env written")
     info("SECRET_KEY was auto-generated.")

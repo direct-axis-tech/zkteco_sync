@@ -4,6 +4,7 @@ const tabs = [
   { label: 'Devices', to: '/devices' },
   { label: 'Employees', to: '/employees' },
   { label: 'Attendance', to: '/attendance' },
+  { label: 'Settings', to: '/settings' },
 ]
 
 export default function Layout() {

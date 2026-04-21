@@ -3,6 +3,7 @@ import Login from './pages/Login'
 import Devices from './pages/Devices'
 import Employees from './pages/Employees'
 import Attendance from './pages/Attendance'
+import Settings from './pages/Settings'
 import Layout from './components/Layout'
 
 function ProtectedRoute({ children }) {
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="devices" element={<Devices />} />
           <Route path="employees" element={<Employees />} />
           <Route path="attendance" element={<Attendance />} />
+          <Route path="settings" element={<Settings />} />
         </Route>
         <Route path="*" element={<Navigate to="/devices" replace />} />
       </Routes>

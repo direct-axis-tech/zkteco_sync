@@ -84,3 +84,15 @@ class FingerprintTemplate(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "finger_id", name="uq_fingerprint"),
     )
+
+
+class HrmSyncState(Base):
+    __tablename__ = "hrm_sync_state"
+
+    id = Column(Integer, primary_key=True, default=1)
+    last_run_at = Column(DateTime, nullable=True)
+    last_synced_id = Column(Integer, default=0)   # last attendance_log.id pushed
+    records_last_push = Column(Integer, default=0)
+    total_pushed = Column(Integer, default=0)
+    last_error = Column(String(1000), nullable=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

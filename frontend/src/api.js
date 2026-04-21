@@ -30,6 +30,10 @@ async function request(method, path, body) {
 }
 
 export const api = {
+  hrmSync: {
+    status: () => request('GET', '/hrm-sync/status'),
+    run: () => request('POST', '/hrm-sync/run'),
+  },
   attendance: {
     list: (params = {}) => {
       const q = new URLSearchParams()
