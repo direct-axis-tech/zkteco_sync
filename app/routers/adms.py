@@ -1,25 +1,45 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import AttendanceLog, Device, DeviceCommand
+from app.services.poller import pull_device
 
 router = APIRouter(tags=["adms"])
 
 
+def _ensure_registered(
+    sn: str, ip: str, db: Session, background_tasks: BackgroundTasks
+) -> Device:
+    device = db.query(Device).filter_by(serial_number=sn).first()
+    if not device:
+        device = Device(
+            serial_number=sn,
+            ip_address=ip,
+            port=4370,
+            name="Unknown Device",
+        )
+        db.add(device)
+        db.commit()
+        db.refresh(device)
+        background_tasks.add_task(pull_device, sn)
+    return device
+
+
 @router.get("/iclock/cdata", response_class=PlainTextResponse)
 def adms_handshake(
+    request: Request,
+    background_tasks: BackgroundTasks,
     SN: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    device = db.query(Device).filter_by(serial_number=SN).first()
-    if device:
-        device.last_seen = datetime.utcnow()
-        device.is_online = True
-        db.commit()
+    device = _ensure_registered(SN, request.client.host, db, background_tasks)
+    device.last_seen = datetime.utcnow()
+    device.is_online = True
+    db.commit()
 
     body = "\n".join([
         f"GET OPTION FROM: {SN}",
@@ -41,6 +61,7 @@ def adms_handshake(
 @router.post("/iclock/cdata", response_class=PlainTextResponse)
 async def adms_receive(
     request: Request,
+    background_tasks: BackgroundTasks,
     SN: str = Query(...),
     table: str = Query(default=""),
     db: Session = Depends(get_db),
@@ -83,38 +104,39 @@ async def adms_receive(
 
     db.commit()
 
-    device = db.query(Device).filter_by(serial_number=SN).first()
-    if device:
-        device.last_seen = datetime.utcnow()
-        device.is_online = True
-        db.commit()
+    device = _ensure_registered(SN, request.client.host, db, background_tasks)
+    device.last_seen = datetime.utcnow()
+    device.is_online = True
+    db.commit()
 
     return PlainTextResponse(content="OK")
 
 
 @router.get("/iclock/ping", response_class=PlainTextResponse)
 def adms_ping(
+    request: Request,
+    background_tasks: BackgroundTasks,
     SN: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    device = db.query(Device).filter_by(serial_number=SN).first()
-    if device:
-        device.last_seen = datetime.utcnow()
-        device.is_online = True
-        db.commit()
+    device = _ensure_registered(SN, request.client.host, db, background_tasks)
+    device.last_seen = datetime.utcnow()
+    device.is_online = True
+    db.commit()
     return PlainTextResponse(content="OK")
 
 
 @router.get("/iclock/getrequest", response_class=PlainTextResponse)
 def adms_getrequest(
+    request: Request,
+    background_tasks: BackgroundTasks,
     SN: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    device = db.query(Device).filter_by(serial_number=SN).first()
-    if device:
-        device.last_seen = datetime.utcnow()
-        device.is_online = True
-        db.commit()
+    device = _ensure_registered(SN, request.client.host, db, background_tasks)
+    device.last_seen = datetime.utcnow()
+    device.is_online = True
+    db.commit()
 
     cmd = (
         db.query(DeviceCommand)
