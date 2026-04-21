@@ -144,3 +144,11 @@ class LoginRequest(BaseModel):
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+# --- Device update ---
+
+class DeviceUpdate(BaseModel):
+    ip_address: Optional[str] = None
+    port: Optional[int] = None
+    name: Optional[str] = None

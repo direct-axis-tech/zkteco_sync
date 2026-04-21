@@ -10,7 +10,7 @@ from app.database import get_db
 from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate
 from app.deps import require_auth
 from app.schemas import (
-    CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut,
+    CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
     EnrollRequest, FingerprintTemplateOut, LcdRequest,
     SetTimeRequest, UnlockRequest,
 )
@@ -50,6 +50,16 @@ def create_device(payload: DeviceCreate, db: Session = Depends(get_db)):
 @router.get("/{sn}", response_model=DeviceOut)
 def get_device(sn: str, db: Session = Depends(get_db)):
     return _get_device_or_404(sn, db)
+
+
+@router.patch("/{sn}", response_model=DeviceOut)
+def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db)):
+    device = _get_device_or_404(sn, db)
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(device, key, value)
+    db.commit()
+    db.refresh(device)
+    return device
 
 
 @router.delete("/{sn}", status_code=204)
