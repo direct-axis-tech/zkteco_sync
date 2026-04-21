@@ -3,6 +3,7 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 const tabs = [
   { label: 'Devices', to: '/devices' },
   { label: 'Employees', to: '/employees' },
+  { label: 'Attendance', to: '/attendance' },
 ]
 
 export default function Layout() {

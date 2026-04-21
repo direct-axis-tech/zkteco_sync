@@ -33,3 +33,23 @@ def list_attendance(
     if to_date:
         q = q.filter(AttendanceLog.timestamp <= to_date)
     return q.order_by(AttendanceLog.timestamp.desc()).offset(offset).limit(limit).all()
+
+
+@router.get("/count")
+def count_attendance(
+    device_sn: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    from_date: Optional[datetime] = Query(None),
+    to_date: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(AttendanceLog)
+    if device_sn:
+        q = q.filter(AttendanceLog.device_sn == device_sn)
+    if user_id:
+        q = q.filter(AttendanceLog.user_id == user_id)
+    if from_date:
+        q = q.filter(AttendanceLog.timestamp >= from_date)
+    if to_date:
+        q = q.filter(AttendanceLog.timestamp <= to_date)
+    return {"count": q.count()}
