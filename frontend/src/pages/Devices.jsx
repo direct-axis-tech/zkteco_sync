@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
 import DeviceFormModal from '../components/DeviceFormModal'
+import KebabMenu from '../components/KebabMenu'
+import DeviceInfoDrawer from '../components/DeviceInfoDrawer'
+import SetClockDrawer from '../components/SetClockDrawer'
+import WriteLcdDrawer from '../components/WriteLcdDrawer'
+import CommandsDrawer from '../components/CommandsDrawer'
 
 function StatusBadge({ isOnline }) {
   return (
@@ -23,7 +28,7 @@ function Toast({ message, type, onDismiss }) {
 
   return (
     <div
-      className={`fixed bottom-6 right-6 px-4 py-3 rounded-lg shadow-lg text-sm font-medium text-white ${
+      className={`fixed bottom-6 right-6 px-4 py-3 rounded-lg shadow-lg text-sm font-medium text-white z-50 ${
         type === 'error' ? 'bg-red-600' : 'bg-gray-900'
       }`}
     >
@@ -35,11 +40,11 @@ function Toast({ message, type, onDismiss }) {
 export default function Devices() {
   const [devices, setDevices] = useState([])
   const [loading, setLoading] = useState(true)
-  const [pulling, setPulling] = useState({})
   const [modal, setModal] = useState(null)
+  const [drawer, setDrawer] = useState(null) // { type, device }
   const [toast, setToast] = useState(null)
 
-  const showToast = (message, type = 'success') => setToast({ message, type })
+  const showToast = useCallback((message, type = 'success') => setToast({ message, type }), [])
   const dismissToast = useCallback(() => setToast(null), [])
 
   const loadDevices = useCallback(async () => {
@@ -50,7 +55,7 @@ export default function Devices() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [showToast])
 
   useEffect(() => {
     loadDevices()
@@ -81,16 +86,52 @@ export default function Devices() {
     }
   }
 
-  async function handlePull(device) {
-    setPulling((p) => ({ ...p, [device.serial_number]: true }))
+  async function handleSync(device, type) {
+    const labels = {
+      all: 'Sync All',
+      employees: 'Sync Employees',
+      attendance: 'Sync Attendance',
+      templates: 'Sync Templates',
+    }
+    const calls = {
+      all: () => api.devices.pull(device.serial_number),
+      employees: () => api.devices.pullEmployees(device.serial_number),
+      attendance: () => api.devices.pullAttendance(device.serial_number),
+      templates: () => api.devices.pullTemplates(device.serial_number),
+    }
     try {
-      await api.devices.pull(device.serial_number)
-      showToast(`Pull started for ${device.name || device.serial_number}`)
+      await calls[type]()
+      showToast(`${labels[type]} started for ${device.name || device.serial_number}`)
     } catch (err) {
       showToast(err.message, 'error')
-    } finally {
-      setPulling((p) => ({ ...p, [device.serial_number]: false }))
     }
+  }
+
+  async function handleUnlock(device) {
+    try {
+      await api.devices.unlock(device.serial_number)
+      showToast(`Door unlocked on ${device.name || device.serial_number}`)
+    } catch (err) {
+      showToast(err.message, 'error')
+    }
+  }
+
+  function menuItems(device) {
+    return [
+      { label: 'Sync All', onClick: () => handleSync(device, 'all') },
+      { label: 'Sync Employees', onClick: () => handleSync(device, 'employees') },
+      { label: 'Sync Attendance', onClick: () => handleSync(device, 'attendance') },
+      { label: 'Sync Templates', onClick: () => handleSync(device, 'templates') },
+      'divider',
+      { label: 'Device Info', onClick: () => setDrawer({ type: 'info', device }) },
+      { label: 'Set Clock', onClick: () => setDrawer({ type: 'clock', device }) },
+      { label: 'Write LCD', onClick: () => setDrawer({ type: 'lcd', device }) },
+      { label: 'Unlock Door', onClick: () => handleUnlock(device) },
+      { label: 'Queue Command', onClick: () => setDrawer({ type: 'commands', device }) },
+      'divider',
+      { label: 'Edit', onClick: () => setModal({ mode: 'edit', device }) },
+      { label: 'Delete', danger: true, onClick: () => handleDelete(device) },
+    ]
   }
 
   function formatDate(iso) {
@@ -142,28 +183,8 @@ export default function Devices() {
                   <td className="px-4 py-3 text-gray-500">{device.ip_address}:{device.port}</td>
                   <td className="px-4 py-3"><StatusBadge isOnline={device.is_online} /></td>
                   <td className="px-4 py-3 text-gray-400 text-xs">{formatDate(device.last_seen)}</td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-2 justify-end">
-                      <button
-                        onClick={() => setModal({ mode: 'edit', device })}
-                        className="text-xs text-gray-500 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 transition-colors"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => handlePull(device)}
-                        disabled={pulling[device.serial_number]}
-                        className="text-xs text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 disabled:opacity-50 transition-colors"
-                      >
-                        {pulling[device.serial_number] ? 'Pulling…' : 'Pull'}
-                      </button>
-                      <button
-                        onClick={() => handleDelete(device)}
-                        className="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 transition-colors"
-                      >
-                        Delete
-                      </button>
-                    </div>
+                  <td className="px-4 py-3 text-right">
+                    <KebabMenu items={menuItems(device)} />
                   </td>
                 </tr>
               ))}
@@ -178,6 +199,31 @@ export default function Devices() {
           device={modal.device}
           onSave={handleSave}
           onClose={() => setModal(null)}
+        />
+      )}
+
+      {drawer?.type === 'info' && (
+        <DeviceInfoDrawer device={drawer.device} onClose={() => setDrawer(null)} />
+      )}
+      {drawer?.type === 'clock' && (
+        <SetClockDrawer
+          device={drawer.device}
+          onClose={() => setDrawer(null)}
+          showToast={showToast}
+        />
+      )}
+      {drawer?.type === 'lcd' && (
+        <WriteLcdDrawer
+          device={drawer.device}
+          onClose={() => setDrawer(null)}
+          showToast={showToast}
+        />
+      )}
+      {drawer?.type === 'commands' && (
+        <CommandsDrawer
+          device={drawer.device}
+          onClose={() => setDrawer(null)}
+          showToast={showToast}
         />
       )}
 

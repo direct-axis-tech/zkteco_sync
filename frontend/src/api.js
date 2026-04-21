@@ -33,6 +33,8 @@ export const api = {
   auth: {
     login: (username, password) =>
       request('POST', '/auth/login', { username, password }),
+    verify: (password) =>
+      request('POST', '/auth/verify', { password }),
   },
   devices: {
     list: () => request('GET', '/devices'),
@@ -40,5 +42,17 @@ export const api = {
     update: (sn, data) => request('PATCH', `/devices/${sn}`, data),
     delete: (sn) => request('DELETE', `/devices/${sn}`),
     pull: (sn) => request('POST', `/devices/${sn}/pull`),
+    pullEmployees: (sn) => request('POST', `/devices/${sn}/pull/employees`),
+    pullAttendance: (sn) => request('POST', `/devices/${sn}/pull/attendance`),
+    pullTemplates: (sn) => request('POST', `/devices/${sn}/templates/pull`),
+    info: (sn) => request('GET', `/devices/${sn}/info`),
+    getTime: (sn) => request('GET', `/devices/${sn}/time`),
+    setTime: (sn, data) => request('POST', `/devices/${sn}/time`, data),
+    unlock: (sn, seconds = 3) => request('POST', `/devices/${sn}/unlock`, { seconds }),
+    writeLcd: (sn, line, text) => request('POST', `/devices/${sn}/lcd`, { line, text }),
+    clearLcd: (sn) => request('DELETE', `/devices/${sn}/lcd`),
+    clearAttendance: (sn) => request('DELETE', `/devices/${sn}/attendance`),
+    restart: (sn) => request('POST', `/devices/${sn}/restart`),
+    queueCommand: (sn, command) => request('POST', `/devices/${sn}/commands`, { command }),
   },
 }
