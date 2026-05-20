@@ -49,16 +49,22 @@ def ask_yn(prompt, default="y"):
     val = input(f"   {prompt} {suffix}: ").strip().lower()
     return val in ("", "y", "yes") if default == "y" else val in ("y", "yes")
 
+def _winify(args):
+    # On Windows we need shell=True to find .cmd/.bat shims (npm, uv via shim).
+    # list2cmdline applies proper argv quoting so args with spaces/semicolons
+    # survive cmd.exe parsing.
+    return subprocess.list2cmdline([str(a) for a in args])
+
 def run(args, cwd=None):
     """Stream command output to terminal. Dies on failure."""
-    cmd = " ".join(str(a) for a in args) if IS_WINDOWS else args
+    cmd = _winify(args) if IS_WINDOWS else args
     result = subprocess.run(cmd, shell=IS_WINDOWS, cwd=cwd)
     if result.returncode != 0:
         die(f"Command failed: {' '.join(str(a) for a in args)}")
 
 def run_capture(args, cwd=None):
     """Run command, return (stdout, stderr, success)."""
-    cmd = " ".join(str(a) for a in args) if IS_WINDOWS else args
+    cmd = _winify(args) if IS_WINDOWS else args
     result = subprocess.run(
         cmd, shell=IS_WINDOWS, cwd=cwd, capture_output=True, text=True
     )
@@ -200,7 +206,7 @@ else:
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 header("Installing frontend dependencies")
-run(["npm", "install", "--prefix", "frontend", "--silent"], cwd=ROOT)
+run(["npm", "install", "--prefix", "frontend"], cwd=ROOT)
 success("Node modules installed")
 
 header("Building frontend")
