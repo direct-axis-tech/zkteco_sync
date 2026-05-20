@@ -221,11 +221,11 @@ else:
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 header("Installing frontend dependencies")
-run(["npm", "install", "--prefix", "frontend"], cwd=ROOT)
+run(["npm", "install"], cwd=ROOT / "frontend")
 success("Node modules installed")
 
 header("Building frontend")
-run(["npm", "run", "build", "--prefix", "frontend"], cwd=ROOT)
+run(["npm", "run", "build"], cwd=ROOT / "frontend")
 success("Frontend built  →  frontend/dist/")
 
 # ── Service setup ─────────────────────────────────────────────────────────────
