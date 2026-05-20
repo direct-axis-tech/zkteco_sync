@@ -130,8 +130,19 @@ if configure:
             break
         warn(f"Invalid engine '{db_engine}'. Choose: mariadb, mysql, postgresql, mssql")
 
-    db_host = ask("Host",     "127.0.0.1")
-    db_port = ask("Port",     default_ports[db_engine])
+    if db_engine == "mssql":
+        print()
+        info("For SQL Server Express / named instances, enter Host as")
+        info(r"  HOSTNAME\INSTANCE   (e.g. DESKTOP-ABC\SQLEXPRESS)")
+        info("Port will then be discovered automatically via SQL Browser.")
+        print()
+
+    db_host = ask("Host", "127.0.0.1")
+    if db_engine == "mssql" and "\\" in db_host:
+        db_port = ""
+        info("Named instance detected — skipping port (SQL Browser will resolve it).")
+    else:
+        db_port = ask("Port", default_ports[db_engine])
     db_name = ask("Database", "zkteco_sync")
 
     if db_engine == "mssql":

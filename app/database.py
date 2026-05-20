@@ -45,18 +45,34 @@ DB_URL = "{driver}://{user}:{password}@{host}:{port}/{name}".format(
 
 if _db_engine == "mssql":
     odbc_driver = os.getenv("DB_ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
-    _user = os.getenv("DB_USER", "")
+    _host = os.getenv("DB_HOST", "127.0.0.1")
+    _port = os.getenv("DB_PORT", "").strip()
+    _name = os.getenv("DB_NAME", "zkteco_sync")
+    _user = os.getenv("DB_USER", "").strip()
     _password = os.getenv("DB_PASSWORD", "")
-    if not _user and not _password:
-        DB_URL = "{driver}://@{host}:{port}/{name}?driver={odbc}&trusted_connection=yes".format(
-            driver=_driver,
-            host=os.getenv("DB_HOST", "127.0.0.1"),
-            port=os.getenv("DB_PORT", "1433"),
-            name=os.getenv("DB_NAME", "zkteco_sync"),
-            odbc=quote_plus(odbc_driver),
-        )
+
+    # Named instances (HOST\INSTANCE) use dynamic ports — let SQL Browser
+    # resolve them. Adding ,PORT only works for default instances or
+    # instances explicitly bound to a static port.
+    if "\\" in _host:
+        _server = _host
+    elif _port:
+        _server = f"{_host},{_port}"
     else:
-        DB_URL += f"?driver={quote_plus(odbc_driver)}"
+        _server = _host
+
+    parts = [
+        f"DRIVER={{{odbc_driver}}}",
+        f"SERVER={_server}",
+        f"DATABASE={_name}",
+    ]
+    if _user or _password:
+        parts.append(f"UID={_user}")
+        parts.append(f"PWD={_password}")
+    else:
+        parts.append("Trusted_Connection=yes")
+
+    DB_URL = f"mssql+pyodbc:///?odbc_connect={quote_plus(';'.join(parts))}"
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
