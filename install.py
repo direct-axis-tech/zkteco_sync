@@ -196,10 +196,14 @@ _, err, ok = run_capture(["uv", "run", "python", "-c", db_test], cwd=ROOT)
 if ok:
     success("Database connection successful")
 else:
-    last_err = next(
-        (l for l in reversed(err.splitlines()) if l.strip()), err
+    # Find the exception line (e.g. "sqlalchemy.exc.OperationalError: ...").
+    # The very last line is typically just the docs URL pointer, so skip it.
+    err_lines = [l for l in err.splitlines() if l.strip()]
+    exc_line = next(
+        (l for l in reversed(err_lines) if "Error" in l or "Exception" in l),
+        err_lines[-1] if err_lines else err,
     )
-    warn(f"Connection failed: {last_err}")
+    warn(f"Connection failed: {exc_line.strip()}")
     warn(f"Check credentials in .env and ensure the '{db_name if configure else '?'}' database exists.")
     if not ask_yn("Continue anyway?", default="n"):
         die("Aborted. Fix the database connection and re-run.")
