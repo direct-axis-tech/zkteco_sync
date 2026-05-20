@@ -219,6 +219,54 @@ else:
     if not ask_yn("Continue anyway?", default="n"):
         die("Aborted. Fix the database connection and re-run.")
 
+# ── MSSQL Windows-Auth bootstrap ──────────────────────────────────────────────
+# If the user chose Windows Auth for MSSQL, use their session to create a
+# dedicated SQL Auth login for the app. This decouples DB access from
+# whichever Windows account ends up running the service.
+if configure and db_engine == "mssql" and not db_user and not db_password:
+    header("Bootstrapping dedicated SQL login")
+    new_user = "zkteco_sync_app"
+    new_pw   = secrets.token_urlsafe(24)
+
+    bootstrap_args = ["uv", "run", "python", "scripts/bootstrap_sql_user.py", new_user]
+    bootstrap_cmd  = _winify(bootstrap_args) if IS_WINDOWS else bootstrap_args
+    result = subprocess.run(
+        bootstrap_cmd,
+        shell=IS_WINDOWS,
+        cwd=ROOT,
+        input=new_pw,
+        text=True,
+        capture_output=True,
+    )
+
+    if result.returncode != 0:
+        err_lines = [l for l in result.stderr.splitlines() if l.strip()]
+        exc_line = next(
+            (l for l in reversed(err_lines) if "Error" in l or "Exception" in l),
+            err_lines[-1] if err_lines else result.stderr,
+        )
+        warn(f"Bootstrap failed: {exc_line.strip()}")
+        info("Your Windows user likely lacks CREATE LOGIN permission")
+        info("(needs sysadmin or securityadmin on the SQL Server instance).")
+        info("Re-run install.py from a SQL Server sysadmin Windows session,")
+        info("or have a DBA create the login manually and provide it instead")
+        info("of leaving the Username blank.")
+        die("Aborted. Cannot proceed without a SQL Auth login for the service.")
+
+    # Rewrite .env to use SQL Auth from now on.
+    env_lines = []
+    for line in env_file.read_text().splitlines():
+        if line.startswith("DB_USER="):
+            env_lines.append(f"DB_USER={new_user}")
+        elif line.startswith("DB_PASSWORD="):
+            env_lines.append(f"DB_PASSWORD={new_pw}")
+        else:
+            env_lines.append(line)
+    env_file.write_text("\n".join(env_lines) + "\n")
+
+    success(f"Created SQL login '{new_user}' with db_owner on '{db_name}'")
+    info(".env updated to SQL Auth — service identity no longer matters.")
+
 # ── Frontend ──────────────────────────────────────────────────────────────────
 header("Installing frontend dependencies")
 run(["npm", "install"], cwd=ROOT / "frontend")
@@ -253,6 +301,8 @@ if IS_WINDOWS:
             log_dir.mkdir(exist_ok=True)
             svc = "zkteco-sync"
 
+            # Run as LocalSystem (NSSM default). DB access uses SQL Auth from
+            # .env, so the service identity doesn't need any DB grants.
             for args in [
                 [nssm, "install",  svc, uv_path, "run", "python", "run.py"],
                 [nssm, "set", svc, "AppDirectory",   str(ROOT)],
