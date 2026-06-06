@@ -90,10 +90,10 @@ class DeviceInfoOut(BaseModel):
     firmware_version: str
     platform: str
     device_name: str
-    mac: str
+    mac: Optional[str]
     face_version: Optional[int]
-    fp_version: int
-    pin_width: int
+    fp_version: Optional[int]
+    pin_width: Optional[int]
     network: DeviceNetworkOut
     sizes: DeviceSizesOut
 

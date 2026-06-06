@@ -3,7 +3,7 @@ from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
-from zk.exception import ZKErrorConnection, ZKNetworkError
+from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 from zk.finger import Finger
 
 from app.database import get_db
@@ -25,6 +25,16 @@ def _get_device_or_404(sn: str, db: Session) -> Device:
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     return device
+
+
+def _safe(fn, default=None):
+    """Call an optional device getter, returning ``default`` if the device
+    reports it cannot read that field (some models lack MAC, face/fp version,
+    etc. and raise ZKErrorResponse instead of returning a value)."""
+    try:
+        return fn()
+    except ZKErrorResponse:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +133,10 @@ def get_device_info(sn: str, db: Session = Depends(get_db)):
                 "firmware_version": conn.get_firmware_version(),
                 "platform": conn.get_platform(),
                 "device_name": conn.get_device_name(),
-                "mac": conn.get_mac(),
-                "face_version": conn.get_face_version(),
-                "fp_version": conn.get_fp_version(),
-                "pin_width": conn.get_pin_width(),
+                "mac": _safe(conn.get_mac),
+                "face_version": _safe(conn.get_face_version),
+                "fp_version": _safe(conn.get_fp_version),
+                "pin_width": _safe(conn.get_pin_width),
                 "network": conn.get_network_params(),
                 "sizes": {
                     "users": getattr(conn, "users", 0),
