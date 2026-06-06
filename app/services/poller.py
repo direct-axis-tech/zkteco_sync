@@ -112,22 +112,39 @@ def pull_attendance(serial_number: str) -> dict:
             records = conn.get_attendance()
             log.info("pull_attendance: device %s returned %d records from device",
                      serial_number, len(records))
+
+            # Load the keys already stored for this device in one query, rather
+            # than a SELECT per record (20k+ round-trips otherwise).
+            existing = {
+                (uid, ts)
+                for uid, ts in db.query(
+                    AttendanceLog.user_id, AttendanceLog.timestamp
+                ).filter_by(device_sn=serial_number)
+            }
+
+            # Devices routinely report the same punch more than once in a single
+            # pull, so dedupe within the batch too — the session has
+            # autoflush=False, so the per-row check below can't see rows added
+            # earlier in this loop, and a duplicate would trip uq_attendance and
+            # roll back the entire pull.
+            seen = set()
+            new_rows = []
             for att in records:
-                exists = db.query(AttendanceLog).filter_by(
+                key = (str(att.user_id), att.timestamp)
+                if key in existing or key in seen:
+                    continue
+                seen.add(key)
+                new_rows.append(AttendanceLog(
                     device_sn=serial_number,
                     user_id=str(att.user_id),
                     timestamp=att.timestamp,
-                ).first()
-                if not exists:
-                    db.add(AttendanceLog(
-                        device_sn=serial_number,
-                        user_id=str(att.user_id),
-                        timestamp=att.timestamp,
-                        status=att.status,
-                        punch=att.punch,
-                        source="sdk_pull",
-                    ))
-                    result["attendance_synced"] += 1
+                    status=att.status,
+                    punch=att.punch,
+                    source="sdk_pull",
+                ))
+
+            db.bulk_save_objects(new_rows)
+            result["attendance_synced"] = len(new_rows)
 
             db.commit()
             device.last_seen = datetime.now(timezone.utc)
