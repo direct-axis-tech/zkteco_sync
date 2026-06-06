@@ -13,6 +13,11 @@ from app.database import SessionLocal
 from app.models import HrmIntegration
 from app.services.hrm_sync import run_sync
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
 log = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)

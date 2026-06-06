@@ -1,9 +1,12 @@
+import logging
 from datetime import datetime, timezone
 from zk import ZK
 from zk.exception import ZKErrorConnection, ZKNetworkError
 
 from app.database import SessionLocal
 from app.models import AttendanceLog, Device, DeviceEmployee, Employee
+
+log = logging.getLogger(__name__)
 
 
 def _connect(device):
@@ -12,16 +15,20 @@ def _connect(device):
 
 
 def pull_employees(serial_number: str) -> dict:
+    log.info("pull_employees: starting for device %s", serial_number)
     result = {"users_synced": 0, "errors": []}
     db = SessionLocal()
     try:
         device = db.query(Device).filter_by(serial_number=serial_number).first()
         if not device:
+            log.warning("pull_employees: device %s not found in DB", serial_number)
             result["errors"].append("Device not found")
             return result
 
         conn = None
         try:
+            log.info("pull_employees: connecting to %s (%s:%s)",
+                     serial_number, device.ip_address, device.port)
             conn = _connect(device)
             conn.disable_device()
 
@@ -59,12 +66,16 @@ def pull_employees(serial_number: str) -> dict:
             device.last_seen = datetime.now(timezone.utc)
             device.is_online = True
             db.commit()
+            log.info("pull_employees: done for %s — %d users synced",
+                     serial_number, result["users_synced"])
 
         except (ZKErrorConnection, ZKNetworkError) as e:
+            log.error("pull_employees: connection error for %s — %s", serial_number, e)
             result["errors"].append(str(e))
             device.is_online = False
             db.commit()
         except Exception as e:
+            log.exception("pull_employees: unexpected error for %s", serial_number)
             result["errors"].append(str(e))
             db.rollback()
         finally:
@@ -81,20 +92,27 @@ def pull_employees(serial_number: str) -> dict:
 
 
 def pull_attendance(serial_number: str) -> dict:
+    log.info("pull_attendance: starting for device %s", serial_number)
     result = {"attendance_synced": 0, "errors": []}
     db = SessionLocal()
     try:
         device = db.query(Device).filter_by(serial_number=serial_number).first()
         if not device:
+            log.warning("pull_attendance: device %s not found in DB", serial_number)
             result["errors"].append("Device not found")
             return result
 
         conn = None
         try:
+            log.info("pull_attendance: connecting to %s (%s:%s)",
+                     serial_number, device.ip_address, device.port)
             conn = _connect(device)
             conn.disable_device()
 
-            for att in conn.get_attendance():
+            records = conn.get_attendance()
+            log.info("pull_attendance: device %s returned %d records from device",
+                     serial_number, len(records))
+            for att in records:
                 exists = db.query(AttendanceLog).filter_by(
                     device_sn=serial_number,
                     user_id=str(att.user_id),
@@ -115,12 +133,16 @@ def pull_attendance(serial_number: str) -> dict:
             device.last_seen = datetime.now(timezone.utc)
             device.is_online = True
             db.commit()
+            log.info("pull_attendance: done for %s — %d new records inserted",
+                     serial_number, result["attendance_synced"])
 
         except (ZKErrorConnection, ZKNetworkError) as e:
+            log.error("pull_attendance: connection error for %s — %s", serial_number, e)
             result["errors"].append(str(e))
             device.is_online = False
             db.commit()
         except Exception as e:
+            log.exception("pull_attendance: unexpected error for %s", serial_number)
             result["errors"].append(str(e))
             db.rollback()
         finally:
