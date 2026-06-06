@@ -54,7 +54,7 @@ class AttendanceLog(Base):
     timestamp = Column(DateTime, nullable=False, index=True)
     status = Column(Integer, nullable=False)   # 0=check-in 1=check-out 4=OT-in 5=OT-out
     punch = Column(Integer, default=0)          # verify mode: 1=finger 3=password 4=card 15=face
-    source = Column(Enum("adms_push", "sdk_pull"), nullable=False)
+    source = Column(Enum("adms_push", "sdk_pull", name="attendance_source"), nullable=False)
     created_at = Column(DateTime, default=_now)
 
     __table_args__ = (
@@ -68,7 +68,7 @@ class DeviceCommand(Base):
     id = Column(Integer, primary_key=True)
     device_sn = Column(String(50), nullable=False, index=True)
     command = Column(String(500), nullable=False)
-    status = Column(Enum("pending", "sent", "acknowledged"), default="pending")
+    status = Column(Enum("pending", "sent", "acknowledged", name="device_command_status"), default="pending")
     created_at = Column(DateTime, default=_now)
 
 
