@@ -28,17 +28,17 @@ This app runs both listeners. Devices push attendance events the moment they hap
 ## Requirements
 
 - Python 3.11+
-- Node 18+ (for frontend build)
 - One of: MariaDB/MySQL, PostgreSQL, or MSSQL
+- Node 18+ (development only — servers download a prebuilt frontend from GitHub Releases)
 
 ## Setup
 
 ### Prerequisites
 
 - Python 3.11+
-- Node 18+ with npm
 - `uv` — `pip install uv`
 - One of: MariaDB/MySQL, PostgreSQL, or MSSQL
+- Node 18+ with npm (development only)
 
 ### Guided installer (recommended)
 
@@ -47,15 +47,46 @@ The installer handles everything interactively — configuration, dependencies, 
 ```bash
 git clone <repo-url>
 cd zkteco-sync
-python install.py
+python install.py          # production deployment
+python install.py --dev    # development machine
 ```
+
+Production installs download the prebuilt frontend from GitHub Releases (no
+Node needed) and offer to register a background service. Dev installs build
+the frontend from your checkout (Node required), set `APP_ENV=development`
+(uvicorn auto-reload), and skip service registration — use `npm run dev` in
+`frontend/` for hot reload while editing.
+
+### Upgrading
+
+```bash
+python install.py --upgrade
+```
+
+`--upgrade` is non-interactive: it pulls the latest code (re-executing itself
+if the installer changed), re-syncs Python dependencies, refreshes the
+frontend (prebuilt download on production boxes, npm build on dev boxes —
+detected from `.env`), restarts the registered service, and never touches
+`.env` or asks questions. Add `--skip-pull` to upgrade without pulling.
+
+### Releasing (maintainers)
+
+1. Bump `version` in `pyproject.toml` and commit
+2. Tag and push: `git tag v<version> && git push origin v<version>`
+3. GitHub Actions builds the frontend and attaches
+   `zkteco-sync-frontend-v<version>.zip` (plus a `.sha256` checksum) to the
+   release — servers pick it up on their next `install.py --upgrade`
+
+Keep the pyproject version and the tag in sync: servers prefer the release
+matching their checked-out `pyproject.toml` version and only fall back to the
+latest release if that tag has no build.
 
 The installer will:
 1. Prompt for database credentials, bind address, port, and admin credentials
 2. Write `.env` with an auto-generated secret key
-3. Install Python and Node dependencies
+3. Install Python dependencies
 4. Test the database connection
-5. Build the frontend
+5. Download the prebuilt frontend from GitHub Releases (falls back to a local npm build)
 6. Optionally register a **systemd** service (Linux) or **NSSM Windows service** (Windows) so the app starts on boot and restarts on crash
 
 If a `.env` already exists it will ask before overwriting.
