@@ -1,10 +1,20 @@
 import logging
+import mimetypes
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
+# Some Linux distros ship a system mime.types (mime-support package) that
+# files .js/.mjs under text/plain, predating ES modules. That overrides
+# Python's own guess and makes browsers reject the frontend bundle under
+# strict MIME checking for <script type="module">. Force the correct types
+# regardless of what the OS provides.
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("text/css", ".css")
 
 from app.database import Base, engine
 from app.routers import adms, attendance, auth, devices, employees
