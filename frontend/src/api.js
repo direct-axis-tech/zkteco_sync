@@ -20,6 +20,12 @@ async function request(method, path, body) {
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
+      // On every call, not just the unsafe ones: several client-side routes
+      // (/devices, /employees, /attendance, /users) are also real API paths,
+      // and the server tells the two apart by this flag — without it, a plain
+      // GET /devices is read as a browser navigating to the page and answered
+      // with the app shell instead of JSON. See SpaNavigationMiddleware.
+      'X-Requested-With': 'XMLHttpRequest',
       ...(UNSAFE_METHODS.has(method) && csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -29,8 +35,8 @@ async function request(method, path, body) {
   // "wrong password" message off the login form.
   if (res.status === 401 && !path.startsWith('/auth/')) {
     csrfToken = null
-    // Bounce through the app root: only '/' is served as the SPA shell, and
-    // the router sends an unauthenticated visitor on to /login from there.
+    // Bounce through the app root and let the router send an
+    // unauthenticated visitor on to /login from there.
     window.location.href = '/'
     throw new Error('Unauthorized')
   }

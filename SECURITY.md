@@ -179,6 +179,40 @@ communication key configured on the device's keypad and mirrored on its
   them through. Adding a CORS allowlist here would only create a path for
   some other origin to be permitted by mistake, for no offsetting benefit.
 
+## Web UI and REST API share the same paths
+
+`/devices`, `/employees`, `/attendance` and `/users` are simultaneously
+client-side routes of the SPA and real API endpoints. Which one you get is
+decided by `SpaNavigationMiddleware` (`app/middleware.py`), on intent rather
+than on path:
+
+- **Default is the page.** A `GET`/`HEAD` that looks like a top-level browser
+  navigation (`Sec-Fetch-Mode: navigate`, or — for browsers old enough not to
+  send `Sec-Fetch-*` — an `Accept` header explicitly preferring `text/html`
+  over `application/json`) is answered with the SPA shell, and React Router
+  resolves the path. That is what makes a hard reload, a bookmark or a pasted
+  deep link work on every route.
+- **With the XHR flag you get JSON.** Every call the app makes carries
+  `X-Requested-With: XMLHttpRequest`, and any request carrying it is passed
+  straight to the API.
+- **Non-browser clients are untouched.** `curl`, cron scripts and any other
+  consumer of the REST API send `Accept: */*` (or no `Accept` at all) and no
+  `Sec-Fetch-*`, none of which reads as a navigation, so they keep getting
+  JSON exactly as before. An explicit `Accept: application/json` always wins,
+  even on a request that otherwise looks like a navigation.
+- **`/iclock/*` is exempt by path, before any header is examined.** Devices
+  are embedded ADMS clients that send no flag and no `Accept` worth the name;
+  handing one of them an HTML page would stop attendance collection silently.
+  Nothing about the ADMS wire protocol changes.
+- Static assets are excluded too (`/assets/*` and anything with a file
+  extension), so `StaticFiles` still serves the real files out of
+  `frontend/dist`.
+
+The shell is served from inside `SecurityHeadersMiddleware`, so it carries
+the same CSP and other headers as any other document response, and from
+inside `TrustedHostMiddleware`, so an unrecognised `Host` is still rejected
+before the shell is ever considered.
+
 ## HRM integration secret
 
 The HRM push integration's API key (`hrm_integration.secret`) is
@@ -191,16 +225,6 @@ replace it.
 
 These are documented deliberately rather than hidden — read them before
 relying on behavior they touch.
-
-- **Hard GETs of some SPA routes return raw API JSON, not the app.**
-  `/login`, `/change-password`, and `/settings` have an SPA-shell fallback
-  (a hard reload or bookmark works), but `/devices`, `/employees`,
-  `/attendance`, and `/users` are claimed by API routers at those exact
-  paths — a hard GET of `/devices` returns the device list as JSON instead
-  of rendering the page. Navigating to those pages *from within* the app
-  (client-side routing) works fine; it's only a direct browser
-  navigation/reload/bookmark on those four paths that hits the API instead
-  of the SPA. Bookmark `/` and navigate from there if this bites you.
 
 - **SDK pull cannot traverse NAT from a public server.** `SDK pull`
   (server → device, TCP 4370: employee sync, attendance backfill, template

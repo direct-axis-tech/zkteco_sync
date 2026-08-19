@@ -3,8 +3,7 @@ import mimetypes
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -19,7 +18,11 @@ mimetypes.add_type("text/css", ".css")
 
 from app import config
 from app.database import Base, engine
-from app.middleware import MaxBodySizeMiddleware, SecurityHeadersMiddleware
+from app.middleware import (
+    MaxBodySizeMiddleware,
+    SecurityHeadersMiddleware,
+    SpaNavigationMiddleware,
+)
 from app.migrations import run_migrations
 from app.routers import adms, attendance, audit, auth, devices, employees, users
 from app.routers import hrm_sync
@@ -96,9 +99,20 @@ app = FastAPI(
 # cross-origin request wouldn't carry it. Wiring up CORS here would only add
 # a path for some other origin to be allowed in by mistake, for no benefit.
 
+_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+_index_html = os.path.join(_dist, "index.html")
+
 # Middleware runs in the reverse of the order added below, so TrustedHost
 # (the cheapest, most important gate — reject an unrecognised Host before
 # doing anything else) ends up outermost, checked first on every request.
+#
+# SpaNavigation is added first and therefore runs innermost, immediately
+# before routing. That placement is deliberate: a bad Host is still rejected
+# by TrustedHost before the shell is ever considered, MaxBodySize is
+# untouched (it only guards request bodies, and this only claims GET/HEAD),
+# and because SecurityHeaders wraps it, the shell it returns carries exactly
+# the same CSP and friends as every other document response.
+app.add_middleware(SpaNavigationMiddleware, index_html=_index_html)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(MaxBodySizeMiddleware, max_bytes=config.MAX_REQUEST_BYTES)
 app.add_middleware(
@@ -120,20 +134,11 @@ app.include_router(users.router)
 app.include_router(audit.router)
 
 # Serve the React build — must come last so API routes take priority.
-_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+#
+# StaticFiles keeps serving the real files out of dist (bundles, favicon).
+# Client-side routes never reach it: SpaNavigationMiddleware above answers a
+# browser navigation with the shell before routing happens at all, which is
+# what makes a hard reload of /devices work even though an API router owns
+# that exact path.
 if os.path.isdir(_dist):
-    _index_html = os.path.join(_dist, "index.html")
-
-    async def _spa_shell(request: Request):
-        return FileResponse(_index_html)
-
-    # StaticFiles(html=True) below only serves index.html for "/" itself and
-    # for on-disk directories — it has no SPA history-fallback, so a hard
-    # GET/reload of a client-side route 404s unless we hand it index.html
-    # explicitly. Only routes no API router owns are safe to add here:
-    # /devices, /employees, /attendance, /users, /auth, /hrm-sync and
-    # /iclock are all claimed by routers above and must not be shadowed.
-    for _path in ("/login", "/change-password", "/settings"):
-        app.add_api_route(_path, _spa_shell, methods=["GET"], include_in_schema=False)
-
     app.mount("/", StaticFiles(directory=_dist, html=True), name="spa")

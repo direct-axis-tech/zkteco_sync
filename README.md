@@ -226,6 +226,30 @@ indirectly from the internet. See [SECURITY.md](SECURITY.md) for the full
 threat model, the accepted residual risk around device-serial forgery, and
 incident-response steps.
 
+## Web UI and REST API on one origin
+
+The UI and the API are served from the same origin, and some paths belong to
+both: `/devices`, `/employees`, `/attendance` and `/users` are client-side
+routes of the app *and* real API endpoints. The server decides which one you
+meant from the request, not from the path — **the default is the page; add
+the XHR flag to get JSON**:
+
+```bash
+# The app: a browser hard-refreshing, bookmarking or deep-linking any route
+# gets the SPA shell and client-side routing takes over.
+
+# The API: any client sending Accept: */* (curl's default, and every script)
+# gets JSON, exactly as before.
+curl -b cookies.txt https://zk.example.com/devices
+
+# Explicitly, from anything that might look like a browser:
+curl -b cookies.txt -H 'X-Requested-With: XMLHttpRequest' https://zk.example.com/devices
+curl -b cookies.txt -H 'Accept: application/json'         https://zk.example.com/devices
+```
+
+`/iclock/*` is exempt from this entirely — the ADMS device protocol is
+untouched. See [SECURITY.md](SECURITY.md) for the exact rule.
+
 ## HRM Integration
 
 Go to **Settings → HRM Sync** in the UI to configure:

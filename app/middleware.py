@@ -1,16 +1,20 @@
 """Security middleware for the public HTTP surface.
 
-Two independent concerns, kept apart because they fail differently:
+Three independent concerns, kept apart because they fail differently:
 ``SecurityHeadersMiddleware`` never rejects a request, it only decorates the
 response; ``MaxBodySizeMiddleware`` can reject a request outright and must do
 so as the body streams in, not after Starlette has buffered all of it into
-memory to find out it was too big.
+memory to find out it was too big; ``SpaNavigationMiddleware`` answers a
+request itself instead of routing it, and so must be extremely conservative
+about which requests it claims.
 """
 
 import logging
+import os
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import FileResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import config
@@ -126,3 +130,124 @@ class MaxBodySizeMiddleware:
             ],
         })
         await send({"type": "http.response.body", "body": _BODY_TOO_LARGE, "more_body": False})
+
+
+# --------------------------------------------------------------------------
+# SPA navigation vs API content negotiation
+# --------------------------------------------------------------------------
+#
+# /devices, /employees, /attendance and /users are real API routes returning
+# 200 JSON, so a 404-triggered history fallback cannot work: nothing 404s.
+# The two callers are told apart by intent instead of by path.
+#
+#   default              -> the page
+#   with the XHR flag    -> JSON
+#
+# The positive signal is the flag frontend/src/api.js puts on every single
+# call (X-Requested-With: XMLHttpRequest). The negative signal is that the
+# request also has to look like a real top-level browser navigation, so that
+# a caller which simply doesn't know about the flag — curl, a cron script,
+# any existing consumer of the documented REST API — keeps getting JSON.
+
+_XHR_HEADER = "x-requested-with"
+_XHR_VALUE = "xmlhttprequest"
+
+# Sec-Fetch-Mode is a forbidden header name: browsers set it on every request
+# and page JavaScript cannot override it, so "navigate" is a signal the SPA's
+# own fetch() calls could not produce even if the flag above were dropped.
+# Only browsers old enough to omit Sec-Fetch-* entirely fall through to the
+# Accept sniff below.
+_NAV_MODES = {"navigate"}
+
+_SAFE_METHODS = {"GET", "HEAD"}
+
+# StaticFiles owns everything under here plus anything that looks like a
+# file. favicon.svg and icons.svg are covered by the extension test.
+_ASSET_PREFIX = "/assets/"
+
+
+def _accept_quality(accept: str, media_type: str) -> float:
+    """Quality this Accept header gives ``media_type`` **explicitly**.
+
+    A bare ``*/*`` deliberately scores 0: that is what curl and every other
+    non-browser client sends, and it must never be read as asking for HTML.
+    """
+    best = 0.0
+    for part in accept.split(","):
+        bits = part.strip().split(";")
+        if bits[0].strip().lower() != media_type:
+            continue
+        quality = 1.0
+        for param in bits[1:]:
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        best = max(best, quality)
+    return best
+
+
+def _is_navigation(headers) -> bool:
+    mode = headers.get("sec-fetch-mode")
+    accept = headers.get("accept", "")
+    html = _accept_quality(accept, "text/html")
+    json_ = _accept_quality(accept, "application/json")
+
+    if mode is not None:
+        # Modern browser. Anything other than a top-level navigation
+        # (fetch/XHR arrive as cors|same-origin|no-cors) is not ours. The
+        # Accept test is kept as an escape hatch so an operator poking at the
+        # API from a browser-based client with an explicit
+        # Accept: application/json still gets JSON.
+        return mode.lower() in _NAV_MODES and json_ <= html
+
+    # Pre-Sec-Fetch browser: the only thing left to go on is a stated
+    # preference for HTML over JSON.
+    return html > 0 and html >= json_
+
+
+class SpaNavigationMiddleware(BaseHTTPMiddleware):
+    """Serve the SPA shell for browser navigations; route everything else.
+
+    Sits inside SecurityHeadersMiddleware so the shell it returns picks up
+    the same CSP and friends as any other document response.
+    """
+
+    def __init__(self, app: ASGIApp, index_html: str):
+        super().__init__(app)
+        self.index_html = index_html
+
+    async def dispatch(self, request: Request, call_next):
+        if not self._claims(request):
+            return await call_next(request)
+
+        # A backend-only checkout has no build to serve — fall through to
+        # whatever the app would have done rather than 500.
+        if not os.path.isfile(self.index_html):
+            return await call_next(request)
+
+        return FileResponse(self.index_html)
+
+    def _claims(self, request: Request) -> bool:
+        # The single most dangerous line in this file. Devices are embedded
+        # ADMS clients: they send no XHR flag, no Sec-Fetch-*, and no Accept
+        # worth the name, so every later test would happily hand one of them
+        # an HTML page — which stops attendance collection site-wide, with no
+        # error anywhere. Checked first, before any header is looked at.
+        if request.url.path.startswith(_DEVICE_PREFIX):
+            return False
+
+        if request.method not in _SAFE_METHODS:
+            return False
+
+        headers = request.headers
+        if headers.get(_XHR_HEADER, "").lower() == _XHR_VALUE:
+            return False
+
+        path = request.url.path
+        if path.startswith(_ASSET_PREFIX) or "." in path.rsplit("/", 1)[-1]:
+            return False
+
+        return _is_navigation(headers)
