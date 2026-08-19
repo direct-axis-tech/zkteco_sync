@@ -1,4 +1,6 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
+import { api } from '../api'
+import { useAuth } from '../auth'
 
 const tabs = [
   { label: 'Devices', to: '/devices' },
@@ -9,10 +11,16 @@ const tabs = [
 
 export default function Layout() {
   const navigate = useNavigate()
+  const { user, refresh } = useAuth()
 
-  function logout() {
-    localStorage.removeItem('token')
-    navigate('/login')
+  async function logout() {
+    // Revoke server-side first; the cookie alone means nothing afterwards.
+    try {
+      await api.auth.logout()
+    } finally {
+      await refresh()
+      navigate('/login', { replace: true })
+    }
   }
 
   return (
@@ -22,12 +30,15 @@ export default function Layout() {
           {/* Top bar */}
           <div className="flex items-center justify-between h-14">
             <span className="font-semibold text-gray-900">ZKTeco Sync</span>
-            <button
-              onClick={logout}
-              className="text-sm text-gray-500 hover:text-gray-800 transition-colors"
-            >
-              Logout
-            </button>
+            <div className="flex items-center gap-4">
+              <span className="text-sm text-gray-500">{user?.username}</span>
+              <button
+                onClick={logout}
+                className="text-sm text-gray-500 hover:text-gray-800 transition-colors"
+              >
+                Logout
+              </button>
+            </div>
           </div>
 
           {/* Tabs */}

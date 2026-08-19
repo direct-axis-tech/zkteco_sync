@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
+import { useAuth } from '../auth'
 
 export default function Login() {
   const navigate = useNavigate()
+  const { refresh } = useAuth()
   const [form, setForm] = useState({ username: '', password: '' })
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -13,12 +15,14 @@ export default function Login() {
     setError('')
     setLoading(true)
     try {
+      // The session arrives as an HttpOnly cookie; only the CSRF token comes
+      // back in the body, and api.js keeps that in memory.
       const data = await api.auth.login(form.username, form.password)
-      localStorage.setItem('token', data.access_token)
-      navigate('/')
+      await refresh()
+      navigate(data.must_change_password ? '/change-password' : '/', { replace: true })
     } catch (err) {
+      // Generic on bad credentials, explicit about the wait when locked out.
       setError(err.message)
-    } finally {
       setLoading(false)
     }
   }

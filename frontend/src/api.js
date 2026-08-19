@@ -2,23 +2,36 @@
 // In production the frontend is served by FastAPI on the same origin
 const BASE = import.meta.env.PROD ? '' : '/api'
 
-function token() {
-  return localStorage.getItem('token')
+// Auth rides on an HttpOnly session cookie the browser sets at login, so
+// no token is ever written to browser storage. The matching CSRF token lives in
+// this module variable only — memory the page can read but another origin
+// cannot — and is re-seeded from GET /auth/me after a reload.
+const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+let csrfToken = null
+
+export function setCsrfToken(value) {
+  csrfToken = value || null
 }
 
 async function request(method, path, body) {
   const res = await fetch(`${BASE}${path}`, {
     method,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
-      ...(token() ? { Authorization: `Bearer ${token()}` } : {}),
+      ...(UNSAFE_METHODS.has(method) && csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   })
 
-  if (res.status === 401) {
-    localStorage.removeItem('token')
-    window.location.href = '/login'
+  // /auth/* callers render their own errors — a redirect there would wipe the
+  // "wrong password" message off the login form.
+  if (res.status === 401 && !path.startsWith('/auth/')) {
+    csrfToken = null
+    // Bounce through the app root: only '/' is served as the SPA shell, and
+    // the router sends an unauthenticated visitor on to /login from there.
+    window.location.href = '/'
     throw new Error('Unauthorized')
   }
 
@@ -54,8 +67,22 @@ export const api = {
     getTemplates: (userId) => request('GET', `/employees/${userId}/templates`),
   },
   auth: {
-    login: (username, password) =>
-      request('POST', '/auth/login', { username, password }),
+    login: async (username, password) => {
+      const data = await request('POST', '/auth/login', { username, password })
+      setCsrfToken(data.csrf_token)
+      return data
+    },
+    logout: async () => {
+      await request('POST', '/auth/logout')
+      setCsrfToken(null)
+    },
+    me: async () => {
+      const data = await request('GET', '/auth/me')
+      setCsrfToken(data.csrf_token)
+      return data
+    },
+    changePassword: (current_password, new_password) =>
+      request('POST', '/auth/change-password', { current_password, new_password }),
     verify: (password) =>
       request('POST', '/auth/verify', { password }),
   },

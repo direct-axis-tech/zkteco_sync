@@ -141,9 +141,18 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+class SessionOut(BaseModel):
+    """Returned by /auth/login and /auth/me. The session token itself never
+    appears here — it only ever travels in the HttpOnly cookie."""
+    username: str
+    role: str
+    must_change_password: bool
+    csrf_token: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class PasswordVerify(BaseModel):

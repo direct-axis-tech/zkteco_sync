@@ -107,3 +107,38 @@ class HrmIntegration(Base):
     records_last_push = Column(Integer, default=0)
     total_pushed = Column(Integer, default=0)
     last_error = Column(String(1000), nullable=True)
+
+
+class User(Base):
+    """An operator account. Replaces the single credential pair in .env."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(150), unique=True, nullable=False, index=True)
+    full_name = Column(String(150), nullable=True)
+    password_hash = Column(String(255), nullable=False)   # Argon2id, never a plaintext password
+    role = Column(Enum("admin", "viewer", name="user_role"), nullable=False, default="viewer")
+    is_active = Column(Boolean, nullable=False, default=True)
+    must_change_password = Column(Boolean, nullable=False, default=False)
+    failed_attempts = Column(Integer, nullable=False, default=0)
+    locked_until = Column(DateTime, nullable=True)         # set once failed_attempts hits the limit
+    last_login_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+
+class UserSession(Base):
+    """A live sign-in. The cookie carries an opaque token; only its SHA-256
+    digest is stored here, so the table cannot be replayed if it leaks."""
+    __tablename__ = "user_sessions"
+
+    id = Column(Integer, primary_key=True)
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    csrf_token = Column(String(64), nullable=False)
+    expires_at = Column(DateTime, nullable=False)   # absolute cap, independent of activity
+    last_seen_at = Column(DateTime, nullable=False, default=_now)  # slides, drives the idle timeout
+    revoked = Column(Boolean, nullable=False, default=False)
+    ip = Column(String(64), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=_now)

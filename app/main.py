@@ -17,10 +17,12 @@ mimetypes.add_type("application/javascript", ".mjs")
 mimetypes.add_type("text/css", ".css")
 
 from app.database import Base, engine
+from app.migrations import run_migrations
 from app.routers import adms, attendance, auth, devices, employees
 from app.routers import hrm_sync
 from app.database import SessionLocal
 from app.models import HrmIntegration
+from app.services.bootstrap import seed_first_admin
 from app.services.hrm_sync import run_sync
 
 logging.basicConfig(
@@ -62,6 +64,10 @@ def _start_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # create_all above only builds missing tables; run_migrations brings
+    # existing ones up to date before anything queries them.
+    run_migrations(engine)
+    seed_first_admin()
     _start_scheduler()
     yield
     if _scheduler and _scheduler.running:
