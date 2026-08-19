@@ -1,23 +1,28 @@
+import logging
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 from zk.finger import Finger
 
 from app.database import get_db
-from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate
+from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate, User
 from app.deps import require_admin, require_auth
+from app.net import valid_cidrs
 from app.schemas import (
     BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
-    EnrollRequest, FingerprintTemplateOut, LcdRequest,
+    EnrollRequest, FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
     SetTimeRequest, UnlockRequest,
 )
+from app.services import pairing
 from app.services.poller import pull_attendance, pull_device, pull_employees
 from app.services.sdk import device_connection, enroll_user_task
 
 router = APIRouter(prefix="/devices", tags=["devices"], dependencies=[Depends(require_auth)])
+
+log = logging.getLogger(__name__)
 
 
 def _get_device_or_404(sn: str, db: Session) -> Device:
@@ -42,19 +47,68 @@ def _safe(fn, default=None):
 # ---------------------------------------------------------------------------
 
 @router.get("", response_model=List[DeviceOut])
-def list_devices(db: Session = Depends(get_db)):
-    return db.query(Device).all()
+def list_devices(
+    status: Optional[str] = Query(default=None, pattern="^(pending|approved|rejected)$"),
+    db: Session = Depends(get_db),
+):
+    """All devices, or one trust state — ``?status=pending`` is the approval queue."""
+    query = db.query(Device)
+    if status:
+        query = query.filter(Device.status == status)
+    return query.all()
 
 
-@router.post("", response_model=DeviceOut, status_code=201, dependencies=[Depends(require_admin)])
-def create_device(payload: DeviceCreate, db: Session = Depends(get_db)):
+@router.post("", response_model=DeviceOut, status_code=201)
+def create_device(payload: DeviceCreate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     if db.query(Device).filter_by(serial_number=payload.serial_number).first():
         raise HTTPException(status_code=409, detail="Device already registered")
-    device = Device(**payload.model_dump())
+    # An admin typing a serial in by hand *is* the approval — only serials the
+    # server discovers on its own have to wait in the queue.
+    device = Device(
+        **payload.model_dump(),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        approved_by=admin.username,
+    )
     db.add(device)
     db.commit()
     db.refresh(device)
     return device
+
+
+# ---------------------------------------------------------------------------
+# Pairing window — declared before /{sn} so "pairing" is not read as a serial
+# ---------------------------------------------------------------------------
+
+def _window_out(row) -> dict:
+    remaining = pairing.seconds_remaining(row)
+    return {
+        "is_open": remaining > 0,
+        "open_until": row.open_until if remaining > 0 else None,
+        "seconds_remaining": remaining,
+        "opened_at": row.opened_at,
+        "opened_by": row.opened_by,
+    }
+
+
+@router.get("/pairing", response_model=PairingWindowOut)
+def get_pairing_window(db: Session = Depends(get_db)):
+    return _window_out(pairing.get_window(db))
+
+
+@router.post("/pairing", response_model=PairingWindowOut)
+def open_pairing_window(
+    payload: PairingOpenRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Accept unrecognised serials into the approval queue, briefly."""
+    return _window_out(pairing.open_window(db, payload.minutes, admin.username))
+
+
+@router.delete("/pairing", response_model=PairingWindowOut)
+def close_pairing_window(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return _window_out(pairing.close_window(db, admin.username))
 
 
 @router.get("/{sn}", response_model=DeviceOut)
@@ -65,10 +119,72 @@ def get_device(sn: str, db: Session = Depends(get_db)):
 @router.patch("/{sn}", response_model=DeviceOut, dependencies=[Depends(require_admin)])
 def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    fields = payload.model_dump(exclude_unset=True)
+
+    if "allowed_cidrs" in fields:
+        good, bad = valid_cidrs(fields["allowed_cidrs"])
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not a valid CIDR or IP address: {', '.join(bad)}",
+            )
+        # Store normalised, or NULL when cleared, so "is a list set?" is one test.
+        fields["allowed_cidrs"] = ", ".join(good) or None
+
+    # An IP check with nothing to match against would refuse every push from
+    # this device, which is never what the operator meant.
+    enabled = fields.get("ip_check_enabled", device.ip_check_enabled)
+    allowed = fields.get("allowed_cidrs", device.allowed_cidrs)
+    if enabled and not valid_cidrs(allowed)[0]:
+        raise HTTPException(
+            status_code=400,
+            detail="Add at least one allowed CIDR before enabling the IP check",
+        )
+
+    for key, value in fields.items():
         setattr(device, key, value)
     db.commit()
     db.refresh(device)
+    return device
+
+
+# ---------------------------------------------------------------------------
+# Device approval
+# ---------------------------------------------------------------------------
+
+@router.post("/{sn}/approve", response_model=DeviceOut)
+def approve_device(
+    sn: str,
+    background_tasks: BackgroundTasks,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Let this serial push. Until this happens it is refused at /iclock/*."""
+    device = _get_device_or_404(sn, db)
+    was_approved = device.status == "approved"
+    device.status = "approved"
+    device.approved_at = datetime.now(timezone.utc)
+    device.approved_by = admin.username
+    db.commit()
+    db.refresh(device)
+    log.warning("device %s approved by %s", sn, admin.username)
+    if not was_approved:
+        # Same first-contact sync auto-registration used to do, moved to the
+        # moment a human actually vouches for the device.
+        background_tasks.add_task(pull_device, sn)
+    return device
+
+
+@router.post("/{sn}/reject", response_model=DeviceOut)
+def reject_device(sn: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Refuse this serial without forgetting it — it stays visible and refused."""
+    device = _get_device_or_404(sn, db)
+    device.status = "rejected"
+    device.approved_at = None
+    device.approved_by = None
+    db.commit()
+    db.refresh(device)
+    log.warning("device %s rejected by %s", sn, admin.username)
     return device
 
 

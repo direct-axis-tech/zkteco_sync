@@ -18,6 +18,23 @@ class Device(Base):
     is_online = Column(Boolean, default=False)
     created_at = Column(DateTime, default=_now)
 
+    # Device trust. /iclock/* is reachable from the public internet, so a
+    # serial only pushes once an admin has approved it — a newly seen serial
+    # lands in "pending" and does nothing until then.
+    status = Column(
+        Enum("pending", "approved", "rejected", name="device_status"),
+        nullable=False,
+        default="pending",
+    )
+    approved_at = Column(DateTime, nullable=True)
+    approved_by = Column(String(150), nullable=True)   # username, for accountability
+    # Optional second factor for sites with a static IP: when enabled the push
+    # must also arrive from inside allowed_cidrs. Off by default because some
+    # sites are on dynamic addresses (locked decision D4).
+    ip_check_enabled = Column(Boolean, nullable=False, default=False)
+    allowed_cidrs = Column(Text, nullable=True)        # comma-separated CIDRs or bare IPs
+    last_ip = Column(String(64), nullable=True)        # resolved source of the last push
+
 
 class Employee(Base):
     __tablename__ = "employees"
@@ -107,6 +124,21 @@ class HrmIntegration(Base):
     records_last_push = Column(Integer, default=0)
     total_pushed = Column(Integer, default=0)
     last_error = Column(String(1000), nullable=True)
+
+
+class AdmsPairing(Base):
+    """Single-row table — the time-boxed window during which an unrecognised
+    serial is filed for approval instead of being refused outright.
+
+    Onboarding a device is the one moment the server must accept a serial it
+    has never seen, so that moment is made deliberate, short and attributable
+    rather than permanent."""
+    __tablename__ = "adms_pairing"
+
+    id = Column(Integer, primary_key=True, default=1)
+    open_until = Column(DateTime, nullable=True)   # window is open while this is in the future
+    opened_at = Column(DateTime, nullable=True)
+    opened_by = Column(String(150), nullable=True)
 
 
 class User(Base):

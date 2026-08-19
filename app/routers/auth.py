@@ -14,6 +14,7 @@ from app import config
 from app.database import get_db
 from app.deps import current_user, require_auth
 from app.models import User, UserSession
+from app.net import client_ip
 from app.schemas import ChangePasswordRequest, LoginRequest, PasswordVerify, SessionOut
 from app.security import generate_token, hash_password, hash_token, needs_rehash, verify_password
 
@@ -101,7 +102,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
         expires_at=_now() + timedelta(hours=config.SESSION_ABSOLUTE_HOURS),
         last_seen_at=_now(),
         revoked=False,
-        ip=request.client.host if request.client else None,
+        ip=client_ip(request),
         user_agent=(request.headers.get("User-Agent") or "")[:255],
     )
     db.add(session)

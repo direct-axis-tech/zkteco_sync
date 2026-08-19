@@ -16,8 +16,8 @@ Rules this module holds to, because it runs unattended on operator databases:
 
 Later units extend this file by adding columns to ``app/models.py`` (nothing
 to do here — they are picked up automatically) and, if a new column needs
-existing rows backfilled, by adding an idempotent statement to
-``_run_data_fixups``.
+existing rows backfilled, by adding a statement to ``_run_data_fixups``,
+which is handed the set of columns this run actually created.
 """
 
 import logging
@@ -37,18 +37,24 @@ log = logging.getLogger(__name__)
 
 def run_migrations(engine) -> None:
     """Single entry point, called from the app lifespan right after create_all."""
-    _add_missing_columns(engine)
+    added = _add_missing_columns(engine)
     _add_missing_indexes(engine)
-    _run_data_fixups(engine)
+    _run_data_fixups(engine, added)
 
 
 # ---------------------------------------------------------------------------
 # Columns
 # ---------------------------------------------------------------------------
 
-def _add_missing_columns(engine) -> None:
+def _add_missing_columns(engine) -> set:
+    """Add every mapped column the database lacks; return what was added.
+
+    The returned ``{(table, column)}`` set is what tells a data fixup that a
+    column has just appeared on a table that already held rows — the only
+    moment a backfill is meaningful."""
     inspector = inspect(engine)
     known_tables = set(inspector.get_table_names())
+    added = set()
 
     with engine.begin() as conn:
         for table in Base.metadata.sorted_tables:
@@ -59,6 +65,9 @@ def _add_missing_columns(engine) -> None:
                 if column.name in present:
                     continue
                 _add_column(conn, engine.dialect, table, column)
+                added.add((table.name, column.name))
+
+    return added
 
 
 def add_column_sql(dialect, table, column) -> str:
@@ -159,10 +168,37 @@ def _add_missing_indexes(engine) -> None:
 # Data fixups
 # ---------------------------------------------------------------------------
 
-def _run_data_fixups(engine) -> None:
+def _run_data_fixups(engine, added: set) -> None:
     """Backfills for columns whose default is wrong for pre-existing rows.
 
-    Each statement must be idempotent and must guard on the column existing,
-    since a fresh database has already been created correctly by create_all.
-    Nothing to do yet."""
-    return
+    ``added`` holds the ``(table, column)`` pairs this run created. Keying a
+    backfill on it is what makes the backfill idempotent: it fires on the one
+    boot that introduced the column and never again, so it cannot later undo a
+    value an operator has since chosen.
+    """
+    _approve_pre_existing_devices(engine, added)
+
+
+def _approve_pre_existing_devices(engine, added: set) -> None:
+    """Devices already in the database were trusted before D3 existed.
+
+    ``Device.status`` defaults to 'pending', which is right for a serial seen
+    for the first time and badly wrong for an install that has been collecting
+    attendance for months: those devices would go quiet the moment this
+    version boots. Anything present at the instant the column appears is
+    therefore grandfathered in as approved."""
+    if ("devices", "status") not in added:
+        return
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                "UPDATE devices SET status = 'approved', approved_by = 'migration' "
+                "WHERE status IS NULL OR status = 'pending'"
+            )
+        )
+    log.warning(
+        "migration: grandfathered %s pre-existing device(s) to status='approved' — "
+        "newly seen serials from now on require explicit approval",
+        result.rowcount,
+    )

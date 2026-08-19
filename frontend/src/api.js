@@ -87,8 +87,15 @@ export const api = {
       request('POST', '/auth/verify', { password }),
   },
   devices: {
-    list: () => request('GET', '/devices'),
+    list: (status) => request('GET', status ? `/devices?status=${status}` : '/devices'),
     create: (data) => request('POST', '/devices', data),
+    approve: (sn) => request('POST', `/devices/${sn}/approve`),
+    reject: (sn) => request('POST', `/devices/${sn}/reject`),
+    // Time-boxed window during which an unrecognised serial is filed for
+    // approval instead of being refused outright.
+    getPairing: () => request('GET', '/devices/pairing'),
+    openPairing: (minutes) => request('POST', '/devices/pairing', { minutes }),
+    closePairing: () => request('DELETE', '/devices/pairing'),
     update: (sn, data) => request('PATCH', `/devices/${sn}`, data),
     delete: (sn) => request('DELETE', `/devices/${sn}`),
     pull: (sn) => request('POST', `/devices/${sn}/pull`),

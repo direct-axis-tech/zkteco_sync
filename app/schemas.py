@@ -19,6 +19,13 @@ class DeviceOut(BaseModel):
     last_seen: Optional[datetime]
     is_online: bool
     created_at: datetime
+    # Device trust (D3)
+    status: str
+    approved_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    ip_check_enabled: bool = False
+    allowed_cidrs: Optional[str] = None
+    last_ip: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -165,6 +172,24 @@ class DeviceUpdate(BaseModel):
     ip_address: Optional[str] = None
     port: Optional[int] = None
     name: Optional[str] = None
+    # Source-address pinning. `status` is deliberately absent: approval is not
+    # an editable field, it happens through /approve and /reject.
+    ip_check_enabled: Optional[bool] = None
+    allowed_cidrs: Optional[str] = None   # comma-separated; "" or null clears it
+
+
+# --- ADMS pairing window ---
+
+class PairingWindowOut(BaseModel):
+    is_open: bool
+    open_until: Optional[datetime] = None
+    seconds_remaining: int = 0
+    opened_at: Optional[datetime] = None
+    opened_by: Optional[str] = None
+
+
+class PairingOpenRequest(BaseModel):
+    minutes: Optional[int] = None   # defaults to ADMS_PAIRING_MINUTES, capped at 120
 
 
 class BulkPushRequest(BaseModel):

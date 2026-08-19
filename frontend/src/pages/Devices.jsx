@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
+import { useAuth } from '../auth'
 import DeviceFormModal from '../components/DeviceFormModal'
+import DeviceSecurityDrawer from '../components/DeviceSecurityDrawer'
 import KebabMenu from '../components/KebabMenu'
 import DeviceInfoDrawer from '../components/DeviceInfoDrawer'
 import SetClockDrawer from '../components/SetClockDrawer'
@@ -18,6 +20,34 @@ function StatusBadge({ isOnline }) {
     >
       <span className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-green-500' : 'bg-gray-400'}`} />
       {isOnline ? 'Online' : 'Offline'}
+    </span>
+  )
+}
+
+const TRUST_STYLES = {
+  approved: 'bg-blue-50 text-blue-700',
+  pending: 'bg-amber-100 text-amber-800',
+  rejected: 'bg-red-100 text-red-700',
+}
+
+function TrustBadge({ status, ipLocked }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span
+        className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+          TRUST_STYLES[status] || 'bg-gray-100 text-gray-500'
+        }`}
+      >
+        {status ? status[0].toUpperCase() + status.slice(1) : 'Unknown'}
+      </span>
+      {ipLocked && (
+        <span
+          title="Only pushes from the allowed CIDRs are accepted"
+          className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 text-gray-600"
+        >
+          IP
+        </span>
+      )}
     </span>
   )
 }
@@ -40,7 +70,10 @@ function Toast({ message, type, onDismiss }) {
 }
 
 export default function Devices() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const [devices, setDevices] = useState([])
+  const [pairing, setPairing] = useState(null)
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
   const [drawer, setDrawer] = useState(null) // { type, device }
@@ -52,7 +85,9 @@ export default function Devices() {
 
   const loadDevices = useCallback(async () => {
     try {
-      setDevices(await api.devices.list())
+      const [list, window] = await Promise.all([api.devices.list(), api.devices.getPairing()])
+      setDevices(list)
+      setPairing(window)
     } catch {
       showToast('Failed to load devices', 'error')
     } finally {
@@ -65,6 +100,37 @@ export default function Devices() {
     const interval = setInterval(loadDevices, 10_000)
     return () => clearInterval(interval)
   }, [loadDevices])
+
+  async function handleApprove(device) {
+    try {
+      await api.devices.approve(device.serial_number)
+      showToast(`${device.name || device.serial_number} approved`)
+      loadDevices()
+    } catch (err) {
+      showToast(err.message, 'error')
+    }
+  }
+
+  async function handleReject(device) {
+    try {
+      await api.devices.reject(device.serial_number)
+      showToast(`${device.name || device.serial_number} rejected`)
+      loadDevices()
+    } catch (err) {
+      showToast(err.message, 'error')
+    }
+  }
+
+  async function handlePairing(open) {
+    try {
+      const window = open ? await api.devices.openPairing() : await api.devices.closePairing()
+      setPairing(window)
+      showToast(open ? 'Pairing window open' : 'Pairing window closed')
+      loadDevices()
+    } catch (err) {
+      showToast(err.message, 'error')
+    }
+  }
 
   async function handleSave(formData) {
     if (modal.mode === 'create') {
@@ -174,6 +240,7 @@ export default function Devices() {
         ),
       },
       'divider',
+      { label: 'IP Allowlist', onClick: () => setDrawer({ type: 'security', device }) },
       { label: 'Edit', onClick: () => setModal({ mode: 'edit', device }) },
       { label: 'Delete', danger: true, onClick: () => handleDelete(device) },
     ]
@@ -184,17 +251,89 @@ export default function Devices() {
     return new Date(iso).toLocaleString()
   }
 
+  function formatTime(iso) {
+    if (!iso) return '—'
+    return new Date(iso).toLocaleTimeString()
+  }
+
+  const pendingDevices = devices.filter((d) => d.status === 'pending')
+
   return (
     <>
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-semibold text-gray-900">Devices</h1>
-        <button
-          onClick={() => setModal({ mode: 'create' })}
-          className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-        >
-          + Add Device
-        </button>
+        <div className="flex items-center gap-3">
+          {isAdmin && (
+            pairing?.is_open ? (
+              <div className="flex items-center gap-2 text-sm">
+                <span className="text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
+                  Pairing open until {formatTime(pairing.open_until)}
+                </span>
+                <button
+                  onClick={() => handlePairing(false)}
+                  className="border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+                >
+                  Close Pairing
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => handlePairing(true)}
+                title="Briefly accept serials this server has never seen, so they can be approved"
+                className="border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+              >
+                Open Pairing
+              </button>
+            )
+          )}
+          <button
+            onClick={() => setModal({ mode: 'create' })}
+            className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            + Add Device
+          </button>
+        </div>
       </div>
+
+      {pendingDevices.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl mb-6">
+          <div className="px-4 py-3 border-b border-amber-200">
+            <h2 className="text-sm font-semibold text-amber-900">Waiting for approval</h2>
+            <p className="text-xs text-amber-700 mt-0.5">
+              These serials contacted the server but push nothing until approved.
+            </p>
+          </div>
+          <table className="w-full text-sm">
+            <tbody>
+              {pendingDevices.map((device) => (
+                <tr key={device.serial_number} className="border-b border-amber-100 last:border-0">
+                  <td className="px-4 py-3 font-mono text-xs text-gray-700">{device.serial_number}</td>
+                  <td className="px-4 py-3 text-gray-500">from {device.last_ip || '—'}</td>
+                  <td className="px-4 py-3 text-gray-400 text-xs">{formatDate(device.last_seen || device.created_at)}</td>
+                  <td className="px-4 py-3 text-right">
+                    <div className="flex gap-2 justify-end">
+                      <button
+                        onClick={() => handleApprove(device)}
+                        disabled={!isAdmin}
+                        className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        onClick={() => handleReject(device)}
+                        disabled={!isAdmin}
+                        className="border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-40 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <div className="bg-white rounded-xl border border-gray-200">
         {loading ? (
@@ -211,6 +350,7 @@ export default function Devices() {
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Serial</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Address</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Status</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500">Trust</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Last Seen</th>
                 <th className="px-4 py-3" />
               </tr>
@@ -227,6 +367,9 @@ export default function Devices() {
                   <td className="px-4 py-3 text-gray-500 font-mono text-xs">{device.serial_number}</td>
                   <td className="px-4 py-3 text-gray-500">{device.ip_address}:{device.port}</td>
                   <td className="px-4 py-3"><StatusBadge isOnline={device.is_online} /></td>
+                  <td className="px-4 py-3">
+                    <TrustBadge status={device.status} ipLocked={device.ip_check_enabled} />
+                  </td>
                   <td className="px-4 py-3 text-gray-400 text-xs">{formatDate(device.last_seen)}</td>
                   <td className="px-4 py-3 text-right">
                     <KebabMenu items={menuItems(device)} />
@@ -268,6 +411,14 @@ export default function Devices() {
         <WriteLcdDrawer
           device={drawer.device}
           onClose={() => setDrawer(null)}
+          showToast={showToast}
+        />
+      )}
+      {drawer?.type === 'security' && (
+        <DeviceSecurityDrawer
+          device={drawer.device}
+          onClose={() => setDrawer(null)}
+          onSaved={loadDevices}
           showToast={showToast}
         />
       )}
