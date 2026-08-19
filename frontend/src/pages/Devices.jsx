@@ -240,7 +240,7 @@ export default function Devices() {
         ),
       },
       'divider',
-      { label: 'IP Allowlist', onClick: () => setDrawer({ type: 'security', device }) },
+      { label: 'Device Security', onClick: () => setDrawer({ type: 'security', device }) },
       { label: 'Edit', onClick: () => setModal({ mode: 'edit', device }) },
       { label: 'Delete', danger: true, onClick: () => handleDelete(device) },
     ]

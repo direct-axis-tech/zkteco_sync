@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from zk import ZK
-from zk.exception import ZKErrorConnection, ZKNetworkError
+from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 
 from app.database import SessionLocal
 from app.models import AttendanceLog, Device, DeviceEmployee, Employee
@@ -10,8 +10,15 @@ log = logging.getLogger(__name__)
 
 
 def _connect(device):
-    zk = ZK(device.ip_address, port=device.port, timeout=30, verbose=False)
-    return zk.connect()
+    zk = ZK(device.ip_address, port=device.port, timeout=30, password=device.comm_key or 0, verbose=False)
+    try:
+        return zk.connect()
+    except ZKErrorResponse as exc:
+        # See app/services/sdk.py:_connect for why this message match is the
+        # only reliable way pyzk signals a rejected comm key.
+        if str(exc) == "Unauthenticated":
+            raise ZKErrorResponse("Device refused the connection — the configured comm key is likely wrong")
+        raise
 
 
 def pull_employees(serial_number: str) -> dict:
@@ -74,6 +81,10 @@ def pull_employees(serial_number: str) -> dict:
             result["errors"].append(str(e))
             device.is_online = False
             db.commit()
+        except ZKErrorResponse as e:
+            log.error("pull_employees: device %s refused authentication — %s", serial_number, e)
+            result["errors"].append(str(e))
+            db.rollback()
         except Exception as e:
             log.exception("pull_employees: unexpected error for %s", serial_number)
             result["errors"].append(str(e))
@@ -158,6 +169,10 @@ def pull_attendance(serial_number: str) -> dict:
             result["errors"].append(str(e))
             device.is_online = False
             db.commit()
+        except ZKErrorResponse as e:
+            log.error("pull_attendance: device %s refused authentication — %s", serial_number, e)
+            result["errors"].append(str(e))
+            db.rollback()
         except Exception as e:
             log.exception("pull_attendance: unexpected error for %s", serial_number)
             result["errors"].append(str(e))

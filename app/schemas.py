@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Literal, Optional, List
 
@@ -8,6 +8,9 @@ class DeviceCreate(BaseModel):
     ip_address: str
     port: int = 4370
     name: Optional[str] = None
+    # SDK comm key (D7) — write-only, see DeviceOut.comm_key_set. 0/omitted
+    # means no key, matching pyzk's own default.
+    comm_key: int = Field(default=0, ge=0)
 
 
 class DeviceOut(BaseModel):
@@ -26,6 +29,10 @@ class DeviceOut(BaseModel):
     ip_check_enabled: bool = False
     allowed_cidrs: Optional[str] = None
     last_ip: Optional[str] = None
+    # SDK comm key (D7) — deliberately no `comm_key` field here. The key is a
+    # secret and this is the only shape a device is allowed to leave the
+    # server in; only whether one is set is observable.
+    comm_key_set: bool = False
 
     class Config:
         from_attributes = True
@@ -176,6 +183,9 @@ class DeviceUpdate(BaseModel):
     # an editable field, it happens through /approve and /reject.
     ip_check_enabled: Optional[bool] = None
     allowed_cidrs: Optional[str] = None   # comma-separated; "" or null clears it
+    # SDK comm key (D7) — write-only. Omit to leave unchanged; send 0 to clear
+    # it back to "no key".
+    comm_key: Optional[int] = Field(default=None, ge=0)
 
 
 # --- ADMS pairing window ---

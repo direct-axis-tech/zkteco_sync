@@ -35,6 +35,18 @@ class Device(Base):
     allowed_cidrs = Column(Text, nullable=True)        # comma-separated CIDRs or bare IPs
     last_ip = Column(String(64), nullable=True)        # resolved source of the last push
 
+    # SDK comm key (pyzk's `password`) — the only authentication on TCP 4370.
+    # A secret: write-only from the API's point of view. 0 means "no key set",
+    # matching pyzk's own default, so a device that never had a key keeps
+    # connecting exactly as before this column existed.
+    comm_key = Column(Integer, nullable=False, default=0)
+
+    @property
+    def comm_key_set(self) -> bool:
+        """The only externally-visible fact about the comm key: whether one
+        is configured. Never expose ``comm_key`` itself outside this model."""
+        return bool(self.comm_key)
+
 
 class Employee(Base):
     __tablename__ = "employees"
