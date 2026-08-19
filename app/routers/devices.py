@@ -8,7 +8,7 @@ from zk.finger import Finger
 
 from app.database import get_db
 from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate
-from app.deps import require_auth
+from app.deps import require_admin, require_auth
 from app.schemas import (
     BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
     EnrollRequest, FingerprintTemplateOut, LcdRequest,
@@ -46,7 +46,7 @@ def list_devices(db: Session = Depends(get_db)):
     return db.query(Device).all()
 
 
-@router.post("", response_model=DeviceOut, status_code=201)
+@router.post("", response_model=DeviceOut, status_code=201, dependencies=[Depends(require_admin)])
 def create_device(payload: DeviceCreate, db: Session = Depends(get_db)):
     if db.query(Device).filter_by(serial_number=payload.serial_number).first():
         raise HTTPException(status_code=409, detail="Device already registered")
@@ -62,7 +62,7 @@ def get_device(sn: str, db: Session = Depends(get_db)):
     return _get_device_or_404(sn, db)
 
 
-@router.patch("/{sn}", response_model=DeviceOut)
+@router.patch("/{sn}", response_model=DeviceOut, dependencies=[Depends(require_admin)])
 def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     for key, value in payload.model_dump(exclude_unset=True).items():
@@ -72,7 +72,7 @@ def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db))
     return device
 
 
-@router.delete("/{sn}", status_code=204)
+@router.delete("/{sn}", status_code=204, dependencies=[Depends(require_admin)])
 def delete_device(sn: str, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     db.delete(device)
@@ -83,21 +83,21 @@ def delete_device(sn: str, db: Session = Depends(get_db)):
 # SDK pull (background)
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/pull")
+@router.post("/{sn}/pull", dependencies=[Depends(require_admin)])
 def trigger_pull(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     _get_device_or_404(sn, db)
     background_tasks.add_task(pull_device, sn)
     return {"message": "Pull started", "device": sn}
 
 
-@router.post("/{sn}/pull/employees")
+@router.post("/{sn}/pull/employees", dependencies=[Depends(require_admin)])
 def trigger_pull_employees(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     _get_device_or_404(sn, db)
     background_tasks.add_task(pull_employees, sn)
     return {"message": "Employee sync started", "device": sn}
 
 
-@router.post("/{sn}/pull/attendance")
+@router.post("/{sn}/pull/attendance", dependencies=[Depends(require_admin)])
 def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     _get_device_or_404(sn, db)
     background_tasks.add_task(pull_attendance, sn)
@@ -108,7 +108,7 @@ def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks, db: Sess
 # ADMS command queue
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/commands", status_code=201)
+@router.post("/{sn}/commands", status_code=201, dependencies=[Depends(require_admin)])
 def queue_command(sn: str, payload: CommandCreate, db: Session = Depends(get_db)):
     _get_device_or_404(sn, db)
     cmd = DeviceCommand(device_sn=sn, command=payload.command)
@@ -169,7 +169,7 @@ def get_device_time(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.post("/{sn}/time")
+@router.post("/{sn}/time", dependencies=[Depends(require_admin)])
 def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     if payload.sync:
@@ -193,7 +193,7 @@ def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_
 # Door control
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/unlock")
+@router.post("/{sn}/unlock", dependencies=[Depends(require_admin)])
 def unlock_door(sn: str, payload: UnlockRequest, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     try:
@@ -219,7 +219,7 @@ def get_lock_state(sn: str, db: Session = Depends(get_db)):
 # Device control
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/restart")
+@router.post("/{sn}/restart", dependencies=[Depends(require_admin)])
 def restart_device(sn: str, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     try:
@@ -230,7 +230,7 @@ def restart_device(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.post("/{sn}/lcd")
+@router.post("/{sn}/lcd", dependencies=[Depends(require_admin)])
 def write_lcd(sn: str, payload: LcdRequest, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     try:
@@ -241,7 +241,7 @@ def write_lcd(sn: str, payload: LcdRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.delete("/{sn}/lcd", status_code=204)
+@router.delete("/{sn}/lcd", status_code=204, dependencies=[Depends(require_admin)])
 def clear_lcd(sn: str, db: Session = Depends(get_db)):
     device = _get_device_or_404(sn, db)
     try:
@@ -263,7 +263,7 @@ def list_device_users(sn: str, db: Session = Depends(get_db)):
     return [{"user_id": r.user_id, "uid": r.uid, "synced_at": r.synced_at} for r in rows]
 
 
-@router.post("/{sn}/users/push_bulk")
+@router.post("/{sn}/users/push_bulk", dependencies=[Depends(require_admin)])
 def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get_db)):
     """Push multiple employees to a device in one call."""
     device = _get_device_or_404(sn, db)
@@ -309,7 +309,7 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get
     return {"device_sn": sn, "pushed": pushed, "errors": errors}
 
 
-@router.post("/{sn}/users/{user_id}/push")
+@router.post("/{sn}/users/{user_id}/push", dependencies=[Depends(require_admin)])
 def push_user_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
     """
     Write an employee record from DB onto the device.
@@ -352,7 +352,7 @@ def push_user_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.delete("/{sn}/users/{user_id}", status_code=204)
+@router.delete("/{sn}/users/{user_id}", status_code=204, dependencies=[Depends(require_admin)])
 def remove_user_from_device(sn: str, user_id: str, db: Session = Depends(get_db)):
     """Remove a user from the device. Does not delete the employee from DB."""
     device = _get_device_or_404(sn, db)
@@ -372,7 +372,7 @@ def remove_user_from_device(sn: str, user_id: str, db: Session = Depends(get_db)
 # Attendance: clear device memory
 # ---------------------------------------------------------------------------
 
-@router.delete("/{sn}/attendance", status_code=204)
+@router.delete("/{sn}/attendance", status_code=204, dependencies=[Depends(require_admin)])
 def clear_device_attendance(sn: str, db: Session = Depends(get_db)):
     """Wipe attendance logs from device memory. Does not touch our DB."""
     device = _get_device_or_404(sn, db)
@@ -387,7 +387,7 @@ def clear_device_attendance(sn: str, db: Session = Depends(get_db)):
 # Fingerprint templates
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/templates/pull", response_model=List[FingerprintTemplateOut])
+@router.post("/{sn}/templates/pull", response_model=List[FingerprintTemplateOut], dependencies=[Depends(require_admin)])
 def pull_templates(sn: str, db: Session = Depends(get_db)):
     """
     Pull all fingerprint templates from device and save to DB.
@@ -432,7 +432,7 @@ def pull_templates(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.post("/{sn}/users/{user_id}/templates/push")
+@router.post("/{sn}/users/{user_id}/templates/push", dependencies=[Depends(require_admin)])
 def push_templates_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
     """
     Copy fingerprint templates stored in DB onto the device.
@@ -475,7 +475,7 @@ def push_templates_to_device(sn: str, user_id: str, db: Session = Depends(get_db
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.delete("/{sn}/users/{user_id}/templates/{finger_id}", status_code=204)
+@router.delete("/{sn}/users/{user_id}/templates/{finger_id}", status_code=204, dependencies=[Depends(require_admin)])
 def delete_user_template(sn: str, user_id: str, finger_id: int, db: Session = Depends(get_db)):
     """Delete a specific finger template from device and from DB."""
     device = _get_device_or_404(sn, db)
@@ -497,7 +497,7 @@ def delete_user_template(sn: str, user_id: str, finger_id: int, db: Session = De
 # Live enrollment
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/users/{user_id}/enroll", status_code=202)
+@router.post("/{sn}/users/{user_id}/enroll", status_code=202, dependencies=[Depends(require_admin)])
 def enroll_user(
     sn: str,
     user_id: str,

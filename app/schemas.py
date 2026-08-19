@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional, List
+from typing import Literal, Optional, List
 
 
 class DeviceCreate(BaseModel):
@@ -169,3 +169,40 @@ class DeviceUpdate(BaseModel):
 
 class BulkPushRequest(BaseModel):
     user_ids: List[str]
+
+
+# --- Operator accounts (admin-only) ---
+
+class UserOut(BaseModel):
+    """Never carries password_hash — this is the only shape a user record
+    is allowed to leave the server in."""
+    id: int
+    username: str
+    full_name: Optional[str]
+    role: str
+    is_active: bool
+    must_change_password: bool
+    last_login_at: Optional[datetime]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class UserCreate(BaseModel):
+    username: str
+    full_name: Optional[str] = None
+    # A setup password chosen by the admin. must_change_password is always
+    # forced True on create, so the admin never learns the operator's real one.
+    password: str
+    role: Literal["admin", "viewer"] = "viewer"
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[Literal["admin", "viewer"]] = None
+    is_active: Optional[bool] = None
+
+
+class UserResetPassword(BaseModel):
+    new_password: str

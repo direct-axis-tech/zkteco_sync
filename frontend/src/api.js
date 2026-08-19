@@ -114,4 +114,12 @@ export const api = {
     deleteTemplate: (sn, userId, fingerId) =>
       request('DELETE', `/devices/${sn}/users/${userId}/templates/${fingerId}`),
   },
+  users: {
+    list: () => request('GET', '/users'),
+    create: (data) => request('POST', '/users', data),
+    update: (id, data) => request('PATCH', `/users/${id}`, data),
+    resetPassword: (id, newPassword) =>
+      request('POST', `/users/${id}/reset-password`, { new_password: newPassword }),
+    delete: (id) => request('DELETE', `/users/${id}`),
+  },
 }

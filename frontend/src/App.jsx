@@ -6,6 +6,7 @@ import Devices from './pages/Devices'
 import Employees from './pages/Employees'
 import Attendance from './pages/Attendance'
 import Settings from './pages/Settings'
+import Users from './pages/Users'
 import Layout from './components/Layout'
 
 function Loading() {
@@ -34,6 +35,18 @@ function SessionRoute({ children }) {
   return children
 }
 
+// Everything ProtectedRoute requires, plus the admin role. A viewer hitting
+// this by URL is bounced, not just kept off the nav tab — the backend
+// enforces the same rule, this just avoids a page that only ever 403s.
+function AdminRoute({ children }) {
+  const { user, loading } = useAuth()
+  if (loading) return <Loading />
+  if (!user) return <Navigate to="/login" replace />
+  if (user.must_change_password) return <Navigate to="/change-password" replace />
+  if (user.role !== 'admin') return <Navigate to="/devices" replace />
+  return children
+}
+
 function Routing() {
   return (
     <Routes>
@@ -51,6 +64,7 @@ function Routing() {
         <Route path="employees" element={<Employees />} />
         <Route path="attendance" element={<Attendance />} />
         <Route path="settings" element={<Settings />} />
+        <Route path="users" element={<AdminRoute><Users /></AdminRoute>} />
       </Route>
       <Route path="*" element={<Navigate to="/devices" replace />} />
     </Routes>

@@ -18,7 +18,7 @@ mimetypes.add_type("text/css", ".css")
 
 from app.database import Base, engine
 from app.migrations import run_migrations
-from app.routers import adms, attendance, auth, devices, employees
+from app.routers import adms, attendance, auth, devices, employees, users
 from app.routers import hrm_sync
 from app.database import SessionLocal
 from app.models import HrmIntegration
@@ -89,6 +89,7 @@ app.include_router(devices.router)
 app.include_router(employees.router)
 app.include_router(attendance.router)
 app.include_router(hrm_sync.router)
+app.include_router(users.router)
 
 # Serve the React build — must come last so API routes take priority.
 _dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")

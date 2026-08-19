@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.deps import require_auth
+from app.deps import require_admin, require_auth
 from app.models import HrmIntegration
 from app.services.hrm_sync import run_sync
 
@@ -52,7 +52,7 @@ def get_config(db: Session = Depends(get_db)):
     return _serialize(_get_or_create(db))
 
 
-@router.put("")
+@router.put("", dependencies=[Depends(require_admin)])
 def update_config(payload: HrmConfigUpdate, db: Session = Depends(get_db)):
     row = _get_or_create(db)
     for field, value in payload.model_dump(exclude_unset=True).items():
@@ -62,7 +62,7 @@ def update_config(payload: HrmConfigUpdate, db: Session = Depends(get_db)):
     return _serialize(row)
 
 
-@router.post("/run")
+@router.post("/run", dependencies=[Depends(require_admin)])
 def trigger_sync(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_sync)
     return {"message": "Sync started"}

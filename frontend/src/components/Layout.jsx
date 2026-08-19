@@ -7,11 +7,13 @@ const tabs = [
   { label: 'Employees', to: '/employees' },
   { label: 'Attendance', to: '/attendance' },
   { label: 'Settings', to: '/settings' },
+  { label: 'Users', to: '/users', adminOnly: true },
 ]
 
 export default function Layout() {
   const navigate = useNavigate()
   const { user, refresh } = useAuth()
+  const visibleTabs = tabs.filter((tab) => !tab.adminOnly || user?.role === 'admin')
 
   async function logout() {
     // Revoke server-side first; the cookie alone means nothing afterwards.
@@ -43,7 +45,7 @@ export default function Layout() {
 
           {/* Tabs */}
           <nav className="flex gap-1">
-            {tabs.map((tab) => (
+            {visibleTabs.map((tab) => (
               <NavLink
                 key={tab.to}
                 to={tab.to}
