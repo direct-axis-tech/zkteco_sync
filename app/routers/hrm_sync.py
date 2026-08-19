@@ -1,11 +1,13 @@
 from typing import Optional
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db
 from app.deps import require_admin, require_auth
-from app.models import HrmIntegration
+from app.models import HrmIntegration, User
+from app.net import client_ip
 from app.services.hrm_sync import run_sync
 
 router = APIRouter(prefix="/hrm-sync", tags=["hrm-sync"], dependencies=[Depends(require_auth)])
@@ -52,19 +54,34 @@ def get_config(db: Session = Depends(get_db)):
     return _serialize(_get_or_create(db))
 
 
-@router.put("", dependencies=[Depends(require_admin)])
-def update_config(payload: HrmConfigUpdate, db: Session = Depends(get_db)):
+@router.put("")
+def update_config(
+    payload: HrmConfigUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     row = _get_or_create(db)
     updates = payload.model_dump(exclude_unset=True)
     # secret is write-only: the client never sees the current value, so a
     # blank or omitted one must mean "leave it alone", not "erase it". Only
     # a genuinely new, non-empty secret is allowed to overwrite it.
+    secret_changed = bool(updates.get("secret"))
     if "secret" in updates and not updates["secret"]:
         updates.pop("secret")
     for field, value in updates.items():
         setattr(row, field, value)
     db.commit()
     db.refresh(row)
+
+    # Every field name that changed is fine to record — only the secret's
+    # value must never appear in detail. "secret" survives in `updates` here
+    # only when it was genuinely set (see the pop above).
+    fields_changed = sorted(updates.keys())
+    if fields_changed:
+        audit.record(db, admin.username, "hrm_config_change", ip=client_ip(request),
+                     detail=f"fields changed: {', '.join(fields_changed)}"
+                     + (" (secret value not logged)" if secret_changed else ""))
     return _serialize(row)
 
 

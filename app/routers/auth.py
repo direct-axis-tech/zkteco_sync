@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app import config
+from app import audit, config
 from app.database import get_db
 from app.deps import current_user, require_auth
 from app.models import User, UserSession
@@ -71,13 +71,16 @@ def _register_failure(user: User, db: Session) -> None:
 @router.post("/login", response_model=SessionOut)
 def login(payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     user = db.query(User).filter_by(username=payload.username).first()
+    ip = client_ip(request)
 
     # No user, or a disabled one: same answer as a wrong password.
     if not user or not user.is_active:
+        audit.record(db, payload.username, "login_failure", ip=ip, detail="unknown or inactive account")
         raise HTTPException(status_code=401, detail=_GENERIC_FAILURE)
 
     if user.locked_until and user.locked_until > _now():
         remaining = int((user.locked_until - _now()).total_seconds() // 60) + 1
+        audit.record(db, user.username, "login_failure", ip=ip, detail="account locked")
         raise HTTPException(
             status_code=423,
             detail=f"Account locked after too many failed attempts. Try again in {remaining} minute(s).",
@@ -85,6 +88,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
 
     if not verify_password(payload.password, user.password_hash):
         _register_failure(user, db)
+        audit.record(db, user.username, "login_failure", ip=ip, detail="wrong password")
         raise HTTPException(status_code=401, detail=_GENERIC_FAILURE)
 
     # Success — the lockout counter starts again from zero.
@@ -102,7 +106,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
         expires_at=_now() + timedelta(hours=config.SESSION_ABSOLUTE_HOURS),
         last_seen_at=_now(),
         revoked=False,
-        ip=client_ip(request),
+        ip=ip,
         user_agent=(request.headers.get("User-Agent") or "")[:255],
     )
     db.add(session)
@@ -110,6 +114,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
 
     _set_session_cookie(response, token)
     log.info("User '%s' signed in", user.username)
+    audit.record(db, user.username, "login_success", ip=ip)
     return _session_payload(user, session)
 
 
@@ -130,6 +135,7 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db),
         samesite="strict",
     )
     log.info("User '%s' signed out", user.username)
+    audit.record(db, user.username, "logout", ip=client_ip(request))
 
 
 @router.get("/me", response_model=SessionOut)
@@ -167,6 +173,7 @@ def change_password(payload: ChangePasswordRequest, request: Request,
 
     db.commit()
     log.info("User '%s' changed their password", user.username)
+    audit.record(db, user.username, "password_change", target=user.username, ip=client_ip(request))
 
 
 @router.post("/verify", status_code=204)

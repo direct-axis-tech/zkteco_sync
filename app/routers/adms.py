@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db
 from app.models import AttendanceLog, Device, DeviceCommand
 from app.net import client_ip, ip_in_cidrs
@@ -22,8 +23,11 @@ _REFUSAL_BODY = "Unauthorized"
 _REFUSAL_STATUS = 401
 
 
-def _refuse(sn: str, ip: str, reason: str) -> PlainTextResponse:
+def _refuse(db: Session, sn: str, ip: str, reason: str) -> PlainTextResponse:
     log.warning("ADMS refused: serial=%s ip=%s reason=%s", sn, ip, reason)
+    # Actor is "device" — the caller has no operator session, only a serial
+    # number that may or may not be one the server has ever approved.
+    audit.record(db, "device", "adms_refused", target=sn, ip=ip, detail=reason)
     return PlainTextResponse(content=_REFUSAL_BODY, status_code=_REFUSAL_STATUS)
 
 
@@ -54,7 +58,7 @@ def _authorise(sn: str, request: Request, db: Session):
 
     if not device:
         if not pairing.is_open(db):
-            return None, _refuse(sn, ip, "unknown serial, pairing window closed")
+            return None, _refuse(db, sn, ip, "unknown serial, pairing window closed")
         db.add(Device(
             serial_number=sn,
             ip_address=ip,
@@ -67,7 +71,7 @@ def _authorise(sn: str, request: Request, db: Session):
         log.warning(
             "ADMS: new serial %s from %s filed for approval (pairing window open)", sn, ip
         )
-        return None, _refuse(sn, ip, "awaiting approval")
+        return None, _refuse(db, sn, ip, "awaiting approval")
 
     if device.status != "approved":
         # Still worth recording where it is calling from — that is what the
@@ -75,13 +79,13 @@ def _authorise(sn: str, request: Request, db: Session):
         if device.last_ip != ip:
             device.last_ip = ip
             db.commit()
-        return None, _refuse(sn, ip, f"device status is {device.status}")
+        return None, _refuse(db, sn, ip, f"device status is {device.status}")
 
     if device.ip_check_enabled and not ip_in_cidrs(ip, device.allowed_cidrs):
         if device.last_ip != ip:
             device.last_ip = ip
             db.commit()
-        return None, _refuse(sn, ip, "source address outside the device allowlist")
+        return None, _refuse(db, sn, ip, "source address outside the device allowlist")
 
     return device, None
 

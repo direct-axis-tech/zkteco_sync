@@ -241,3 +241,18 @@ class UserUpdate(BaseModel):
 
 class UserResetPassword(BaseModel):
     new_password: str
+
+
+# --- Audit trail (admin-only) ---
+
+class AuditLogOut(BaseModel):
+    id: int
+    actor: str
+    action: str
+    target: Optional[str]
+    ip: Optional[str]
+    detail: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

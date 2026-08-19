@@ -2,15 +2,16 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 from zk.finger import Finger
 
+from app import audit
 from app.database import get_db
 from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate, User
 from app.deps import require_admin, require_auth
-from app.net import valid_cidrs
+from app.net import client_ip, valid_cidrs
 from app.schemas import (
     BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
     EnrollRequest, FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
@@ -59,7 +60,12 @@ def list_devices(
 
 
 @router.post("", response_model=DeviceOut, status_code=201)
-def create_device(payload: DeviceCreate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def create_device(
+    payload: DeviceCreate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     if db.query(Device).filter_by(serial_number=payload.serial_number).first():
         raise HTTPException(status_code=409, detail="Device already registered")
     # An admin typing a serial in by hand *is* the approval — only serials the
@@ -73,6 +79,9 @@ def create_device(payload: DeviceCreate, admin: User = Depends(require_admin), d
     db.add(device)
     db.commit()
     db.refresh(device)
+    # Manual creation grants trust immediately, same as /approve — worth the
+    # same accountability even though it isn't on the roster's call-site list.
+    audit.record(db, admin.username, "device_create", target=device.serial_number, ip=client_ip(request))
     return device
 
 
@@ -99,16 +108,22 @@ def get_pairing_window(db: Session = Depends(get_db)):
 @router.post("/pairing", response_model=PairingWindowOut)
 def open_pairing_window(
     payload: PairingOpenRequest,
+    request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Accept unrecognised serials into the approval queue, briefly."""
-    return _window_out(pairing.open_window(db, payload.minutes, admin.username))
+    row = pairing.open_window(db, payload.minutes, admin.username)
+    audit.record(db, admin.username, "pairing_open", ip=client_ip(request),
+                 detail=f"open_until={row.open_until.isoformat()}")
+    return _window_out(row)
 
 
 @router.delete("/pairing", response_model=PairingWindowOut)
-def close_pairing_window(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    return _window_out(pairing.close_window(db, admin.username))
+def close_pairing_window(request: Request, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    row = pairing.close_window(db, admin.username)
+    audit.record(db, admin.username, "pairing_close", ip=client_ip(request))
+    return _window_out(row)
 
 
 @router.get("/{sn}", response_model=DeviceOut)
@@ -116,8 +131,14 @@ def get_device(sn: str, db: Session = Depends(get_db)):
     return _get_device_or_404(sn, db)
 
 
-@router.patch("/{sn}", response_model=DeviceOut, dependencies=[Depends(require_admin)])
-def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db)):
+@router.patch("/{sn}", response_model=DeviceOut)
+def update_device(
+    sn: str,
+    payload: DeviceUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     device = _get_device_or_404(sn, db)
     fields = payload.model_dump(exclude_unset=True)
 
@@ -145,6 +166,21 @@ def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db))
         setattr(device, key, value)
     db.commit()
     db.refresh(device)
+
+    # "allowlist change" is the roster's call site: ip_address/port/name/
+    # comm_key edits on this same endpoint are not audited here. comm_key is
+    # a secret (D7) — its new value never enters detail, only the fact that
+    # it changed, and only piggy-backed on an allowlist audit row.
+    if "ip_check_enabled" in fields or "allowed_cidrs" in fields:
+        parts = []
+        if "ip_check_enabled" in fields:
+            parts.append(f"ip_check_enabled={device.ip_check_enabled}")
+        if "allowed_cidrs" in fields:
+            parts.append(f"allowed_cidrs={device.allowed_cidrs or '(cleared)'}")
+        if "comm_key" in fields:
+            parts.append("comm_key also changed (value not logged)")
+        audit.record(db, admin.username, "device_allowlist_change", target=sn,
+                     ip=client_ip(request), detail="; ".join(parts))
     return device
 
 
@@ -156,6 +192,7 @@ def update_device(sn: str, payload: DeviceUpdate, db: Session = Depends(get_db))
 def approve_device(
     sn: str,
     background_tasks: BackgroundTasks,
+    request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -168,6 +205,7 @@ def approve_device(
     db.commit()
     db.refresh(device)
     log.warning("device %s approved by %s", sn, admin.username)
+    audit.record(db, admin.username, "device_approve", target=sn, ip=client_ip(request))
     if not was_approved:
         # Same first-contact sync auto-registration used to do, moved to the
         # moment a human actually vouches for the device.
@@ -176,7 +214,7 @@ def approve_device(
 
 
 @router.post("/{sn}/reject", response_model=DeviceOut)
-def reject_device(sn: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def reject_device(sn: str, request: Request, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Refuse this serial without forgetting it — it stays visible and refused."""
     device = _get_device_or_404(sn, db)
     device.status = "rejected"
@@ -185,14 +223,16 @@ def reject_device(sn: str, admin: User = Depends(require_admin), db: Session = D
     db.commit()
     db.refresh(device)
     log.warning("device %s rejected by %s", sn, admin.username)
+    audit.record(db, admin.username, "device_reject", target=sn, ip=client_ip(request))
     return device
 
 
-@router.delete("/{sn}", status_code=204, dependencies=[Depends(require_admin)])
-def delete_device(sn: str, db: Session = Depends(get_db)):
+@router.delete("/{sn}", status_code=204)
+def delete_device(sn: str, request: Request, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     device = _get_device_or_404(sn, db)
     db.delete(device)
     db.commit()
+    audit.record(db, admin.username, "device_delete", target=sn, ip=client_ip(request))
 
 
 # ---------------------------------------------------------------------------
@@ -309,12 +349,20 @@ def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_
 # Door control
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/unlock", dependencies=[Depends(require_admin)])
-def unlock_door(sn: str, payload: UnlockRequest, db: Session = Depends(get_db)):
+@router.post("/{sn}/unlock")
+def unlock_door(
+    sn: str,
+    payload: UnlockRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     device = _get_device_or_404(sn, db)
     try:
         with device_connection(device) as conn:
             conn.unlock(time=payload.seconds)
+            audit.record(db, admin.username, "door_unlock", target=sn,
+                         ip=client_ip(request), detail=f"seconds={payload.seconds}")
             return {"device_sn": sn, "unlocked_for_seconds": payload.seconds}
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
@@ -335,12 +383,13 @@ def get_lock_state(sn: str, db: Session = Depends(get_db)):
 # Device control
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/restart", dependencies=[Depends(require_admin)])
-def restart_device(sn: str, db: Session = Depends(get_db)):
+@router.post("/{sn}/restart")
+def restart_device(sn: str, request: Request, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     device = _get_device_or_404(sn, db)
     try:
         with device_connection(device) as conn:
             conn.restart()
+            audit.record(db, admin.username, "device_restart", target=sn, ip=client_ip(request))
             return {"device_sn": sn, "message": "Device restarting"}
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
@@ -488,13 +537,19 @@ def remove_user_from_device(sn: str, user_id: str, db: Session = Depends(get_db)
 # Attendance: clear device memory
 # ---------------------------------------------------------------------------
 
-@router.delete("/{sn}/attendance", status_code=204, dependencies=[Depends(require_admin)])
-def clear_device_attendance(sn: str, db: Session = Depends(get_db)):
+@router.delete("/{sn}/attendance", status_code=204)
+def clear_device_attendance(
+    sn: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     """Wipe attendance logs from device memory. Does not touch our DB."""
     device = _get_device_or_404(sn, db)
     try:
         with device_connection(device) as conn:
             conn.clear_attendance()
+            audit.record(db, admin.username, "clear_attendance", target=sn, ip=client_ip(request))
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
@@ -548,8 +603,14 @@ def pull_templates(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.post("/{sn}/users/{user_id}/templates/push", dependencies=[Depends(require_admin)])
-def push_templates_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
+@router.post("/{sn}/users/{user_id}/templates/push")
+def push_templates_to_device(
+    sn: str,
+    user_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     """
     Copy fingerprint templates stored in DB onto the device.
     Typical workflow: pull from Device A, then push to Devices B, C, D.
@@ -582,6 +643,8 @@ def push_templates_to_device(sn: str, user_id: str, db: Session = Depends(get_db
             ]
             conn.save_user_template(device_user, fingers)
 
+        audit.record(db, admin.username, "template_push", target=f"{sn}/{user_id}",
+                     ip=client_ip(request), detail=f"fingers={len(fingers)}")
         return {
             "device_sn": sn,
             "user_id": user_id,
@@ -591,8 +654,15 @@ def push_templates_to_device(sn: str, user_id: str, db: Session = Depends(get_db
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.delete("/{sn}/users/{user_id}/templates/{finger_id}", status_code=204, dependencies=[Depends(require_admin)])
-def delete_user_template(sn: str, user_id: str, finger_id: int, db: Session = Depends(get_db)):
+@router.delete("/{sn}/users/{user_id}/templates/{finger_id}", status_code=204)
+def delete_user_template(
+    sn: str,
+    user_id: str,
+    finger_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     """Delete a specific finger template from device and from DB."""
     device = _get_device_or_404(sn, db)
     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
@@ -605,6 +675,8 @@ def delete_user_template(sn: str, user_id: str, finger_id: int, db: Session = De
         if ft:
             db.delete(ft)
             db.commit()
+        audit.record(db, admin.username, "template_delete", target=f"{sn}/{user_id}/{finger_id}",
+                     ip=client_ip(request))
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 

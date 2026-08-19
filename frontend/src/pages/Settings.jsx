@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
+import { useAuth } from '../auth'
 
 function Field({ label, hint, children }) {
   return (
@@ -48,7 +49,146 @@ function Toast({ message, type = 'success', onDismiss }) {
   )
 }
 
+const AUDIT_PAGE_SIZE = 20
+
+function AuditLog() {
+  const [filters, setFilters] = useState({ actor: '', action: '', from_date: '', to_date: '' })
+  const [offset, setOffset] = useState(0)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback((currentFilters, currentOffset) => {
+    setLoading(true)
+    api.audit
+      .list({ ...currentFilters, limit: AUDIT_PAGE_SIZE, offset: currentOffset })
+      .then(setData)
+      .catch(() => setData(null))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => {
+    load(filters, offset)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offset])
+
+  function applyFilters(e) {
+    e.preventDefault()
+    setOffset(0)
+    load(filters, 0)
+  }
+
+  const items = data?.items || []
+  const total = data?.total || 0
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden mt-6">
+      <div className="px-5 py-4 border-b border-gray-200">
+        <p className="font-medium text-gray-900">Audit Log</p>
+        <p className="text-xs text-gray-400 mt-0.5">
+          Privileged and physical actions, attributed to an actor and source IP.
+        </p>
+      </div>
+
+      <form onSubmit={applyFilters} className="px-5 py-4 border-b border-gray-100 grid grid-cols-2 sm:grid-cols-5 gap-3">
+        <input
+          type="text"
+          placeholder="Actor"
+          value={filters.actor}
+          onChange={(e) => setFilters((f) => ({ ...f, actor: e.target.value }))}
+          className="input text-sm"
+        />
+        <input
+          type="text"
+          placeholder="Action"
+          value={filters.action}
+          onChange={(e) => setFilters((f) => ({ ...f, action: e.target.value }))}
+          className="input text-sm"
+        />
+        <input
+          type="date"
+          aria-label="From date"
+          value={filters.from_date}
+          onChange={(e) => setFilters((f) => ({ ...f, from_date: e.target.value }))}
+          className="input text-sm"
+        />
+        <input
+          type="date"
+          aria-label="To date"
+          value={filters.to_date}
+          onChange={(e) => setFilters((f) => ({ ...f, to_date: e.target.value }))}
+          className="input text-sm"
+        />
+        <button
+          type="submit"
+          className="bg-gray-900 hover:bg-gray-800 text-white text-xs font-medium py-2 rounded-lg transition-colors"
+        >
+          Filter
+        </button>
+      </form>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
+              <th className="px-5 py-2 font-medium">Time</th>
+              <th className="px-5 py-2 font-medium">Actor</th>
+              <th className="px-5 py-2 font-medium">Action</th>
+              <th className="px-5 py-2 font-medium">Target</th>
+              <th className="px-5 py-2 font-medium">IP</th>
+              <th className="px-5 py-2 font-medium">Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((row) => (
+              <tr key={row.id} className="border-b border-gray-50 last:border-0">
+                <td className="px-5 py-2 text-xs text-gray-500 whitespace-nowrap">
+                  {new Date(row.created_at).toLocaleString()}
+                </td>
+                <td className="px-5 py-2 text-xs text-gray-900">{row.actor}</td>
+                <td className="px-5 py-2 text-xs font-mono text-gray-700">{row.action}</td>
+                <td className="px-5 py-2 text-xs text-gray-500 font-mono">{row.target || '—'}</td>
+                <td className="px-5 py-2 text-xs text-gray-500 font-mono">{row.ip || '—'}</td>
+                <td className="px-5 py-2 text-xs text-gray-500 break-all">{row.detail || '—'}</td>
+              </tr>
+            ))}
+            {!loading && items.length === 0 && (
+              <tr>
+                <td colSpan={6} className="px-5 py-6 text-center text-xs text-gray-400">
+                  No matching entries
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex items-center justify-between px-5 py-3 border-t border-gray-100 text-xs text-gray-500">
+        <span>{total} total</span>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - AUDIT_PAGE_SIZE))}
+            className="border border-gray-300 disabled:opacity-40 text-gray-600 px-3 py-1 rounded-lg"
+          >
+            Prev
+          </button>
+          <button
+            type="button"
+            disabled={offset + AUDIT_PAGE_SIZE >= total}
+            onClick={() => setOffset(offset + AUDIT_PAGE_SIZE)}
+            className="border border-gray-300 disabled:opacity-40 text-gray-600 px-3 py-1 rounded-lg"
+          >
+            Next
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function Settings() {
+  const { user } = useAuth()
   const [cfg, setCfg] = useState(null)
   const [form, setForm] = useState(null)        // null = view mode, object = edit mode
   const [editId, setEditId] = useState(null)    // editing last_synced_id inline
@@ -137,10 +277,10 @@ export default function Settings() {
   const isConfigured = cfg?.endpoint && cfg?.secret_set
 
   return (
-    <div className="max-w-xl">
+    <div className="max-w-4xl">
       <h1 className="text-xl font-semibold text-gray-900 mb-6">Settings</h1>
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="max-w-xl bg-white rounded-xl border border-gray-200 overflow-hidden">
 
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200">
@@ -341,6 +481,8 @@ export default function Settings() {
           </div>
         )}
       </div>
+
+      {user?.role === 'admin' && <AuditLog />}
 
       {toast && (
         <Toast message={toast.message} type={toast.type} onDismiss={() => setToast(null)} />

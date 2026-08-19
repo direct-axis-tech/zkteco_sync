@@ -171,6 +171,22 @@ class User(Base):
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
 
+class AuditLog(Base):
+    """An append-only accountability trail for privileged and physical
+    actions — the app is public-internet-facing now, so every action that
+    touches trust, credentials or a physical door must be attributable to
+    an actor and a source IP after the fact."""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True)
+    actor = Column(String(150), nullable=False, index=True)   # username, or "system"/"device"
+    action = Column(String(100), nullable=False, index=True)
+    target = Column(String(200), nullable=True)                # the object acted on, e.g. a serial or username
+    ip = Column(String(64), nullable=True)
+    detail = Column(Text, nullable=True)   # human-readable context — NEVER a secret value
+    created_at = Column(DateTime, default=_now, index=True)    # the date-range filter needs this indexed
+
+
 class UserSession(Base):
     """A live sign-in. The cookie carries an opaque token; only its SHA-256
     digest is stored here, so the table cannot be replayed if it leaks."""

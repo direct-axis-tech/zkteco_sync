@@ -15,12 +15,14 @@ Waiting for the session to expire on its own is not good enough.
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db
 from app.deps import require_admin
 from app.models import User, UserSession
+from app.net import client_ip
 from app.schemas import UserCreate, UserOut, UserResetPassword, UserUpdate
 from app.security import hash_password
 
@@ -66,7 +68,12 @@ def list_users(db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=UserOut, status_code=201)
-def create_user(payload: UserCreate, db: Session = Depends(get_db)):
+def create_user(
+    payload: UserCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_admin),
+):
     if db.query(User).filter_by(username=payload.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
     _validate_password(payload.password)
@@ -83,6 +90,8 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     log.info("User '%s' created with role '%s'", user.username, user.role)
+    audit.record(db, current.username, "user_create", target=user.username,
+                 ip=client_ip(request), detail=f"role={user.role}")
     return user
 
 
@@ -90,6 +99,7 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
 def update_user(
     user_id: int,
     payload: UserUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     current: User = Depends(require_admin),
 ):
@@ -123,11 +133,22 @@ def update_user(
         db.commit()
         log.info("Revoked live sessions for '%s' after role/status change", user.username)
 
+    # UserUpdate carries no secret fields (full_name/role/is_active), so the
+    # changed values themselves are safe to record.
+    detail = "; ".join(f"{k}={v}" for k, v in changes.items())
+    audit.record(db, current.username, "user_update", target=user.username,
+                 ip=client_ip(request), detail=detail or None)
     return user
 
 
 @router.post("/{user_id}/reset-password", status_code=204)
-def reset_password(user_id: int, payload: UserResetPassword, db: Session = Depends(get_db)):
+def reset_password(
+    user_id: int,
+    payload: UserResetPassword,
+    request: Request,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_admin),
+):
     """Sets a new setup password chosen by the admin and forces a change at
     next sign-in — the admin still never learns the operator's real password."""
     user = _get_user_or_404(user_id, db)
@@ -142,15 +163,18 @@ def reset_password(user_id: int, payload: UserResetPassword, db: Session = Depen
     _revoke_live_sessions(db, user.id)
     db.commit()
     log.info("Password reset for user '%s'", user.username)
+    audit.record(db, current.username, "user_reset_password", target=user.username, ip=client_ip(request))
 
 
 @router.delete("/{user_id}", status_code=204)
 def delete_user(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current: User = Depends(require_admin),
 ):
     user = _get_user_or_404(user_id, db)
+    deleted_username = user.username
 
     if user.id == current.id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account.")
@@ -166,4 +190,5 @@ def delete_user(
     _revoke_live_sessions(db, user.id)
     db.delete(user)
     db.commit()
-    log.info("User '%s' deleted", user.username)
+    log.info("User '%s' deleted", deleted_username)
+    audit.record(db, current.username, "user_delete", target=deleted_username, ip=client_ip(request))

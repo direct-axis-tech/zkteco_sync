@@ -129,4 +129,16 @@ export const api = {
       request('POST', `/users/${id}/reset-password`, { new_password: newPassword }),
     delete: (id) => request('DELETE', `/users/${id}`),
   },
+  audit: {
+    list: (params = {}) => {
+      const q = new URLSearchParams()
+      if (params.actor) q.set('actor', params.actor)
+      if (params.action) q.set('action', params.action)
+      if (params.from_date) q.set('from_date', params.from_date)
+      if (params.to_date) q.set('to_date', params.to_date)
+      if (params.limit != null) q.set('limit', params.limit)
+      if (params.offset != null) q.set('offset', params.offset)
+      return request('GET', `/audit?${q}`)
+    },
+  },
 }
