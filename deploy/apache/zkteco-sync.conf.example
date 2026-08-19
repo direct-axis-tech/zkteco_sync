@@ -1,0 +1,131 @@
+# ZKTeco Sync — Apache reverse proxy vhost (example)
+#
+# Copy to your Apache sites directory (e.g. /etc/apache2/sites-available/
+# zkteco-sync.conf on Debian/Ubuntu, or /etc/httpd/conf.d/zkteco-sync.conf on
+# RHEL/Fedora), replace zk.example.com and the certificate paths, then enable:
+#
+#   a2enmod ssl proxy proxy_http headers rewrite
+#   a2ensite zkteco-sync
+#   apachectl configtest && systemctl reload apache2
+#
+# This assumes Apache and the app run on the SAME host, with the app bound to
+# 127.0.0.1 only (install.py's default). If Apache runs on a different host,
+# see the TRUSTED_PROXIES note below before you go further.
+
+# ---------------------------------------------------------------------------
+# WHY /iclock/* MUST STAY ON THIS SAME VHOST
+# ---------------------------------------------------------------------------
+# ZKTeco device firmware only exposes a hostname + port field for its ADMS
+# "Cloud Server" setting — there is no server-path field to configure (this
+# was evaluated and rejected as a design option; see roster decision D8).
+# Every device therefore pushes attendance to
+#     https://zk.example.com/iclock/...
+# on the exact same origin the admin UI uses. Do not move /iclock/* to a
+# different vhost, port, or subdomain — devices in the field cannot be told
+# to use anything but "hostname[:port]", so splitting the surface either
+# breaks every device push outright or silently stops working the next time
+# a device reboots and re-resolves its configured server.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# THE X-Forwarded-For / TRUSTED_PROXIES RELATIONSHIP — READ THIS
+# ---------------------------------------------------------------------------
+# app/net.py resolves "the real caller" (browser session OR device) from the
+# X-Forwarded-For header, but ONLY when the request's immediate TCP peer is
+# listed in the app's TRUSTED_PROXIES setting (.env). Get this wrong and:
+#
+#   - TRUSTED_PROXIES missing Apache's real source address: the app can
+#     never trust X-Forwarded-For, so every request looks like it comes from
+#     Apache's own address (127.0.0.1). Per-device IP allowlisting (D4) then
+#     FAILS CLOSED — every device with ip_check_enabled refuses every push,
+#     because they all appear to originate from 127.0.0.1.
+#
+#   - TRUSTED_PROXIES too wide (e.g. it includes a device's own real IP, or
+#     0.0.0.0/0): a device — or anyone — could spoof its own
+#     X-Forwarded-For and walk straight through a CIDR allowlist.
+#     Per-device IP allowlisting then FAILS OPEN.
+#
+# mod_proxy_http SETS X-Forwarded-For FOR YOU, by default, on every proxied
+# request — it appends the connecting client's address to any existing
+# X-Forwarded-For (creating the header if one isn't already present). Do NOT
+# add your own `RequestHeader set X-Forwarded-For` line below: a hand-set
+# header replaces rather than extends the chain, and app/net.py's walk
+# depends on a genuine, proxy-built chain to find the real client behind
+# Apache. This file adds nothing for X-Forwarded-For — mod_proxy_http is
+# already doing the right thing as soon as ProxyPass is configured.
+#
+# TRUSTED_PROXIES in .env must equal the address Apache's proxy connections
+# actually originate from. On the single-host topology this file assumes,
+# that is 127.0.0.1 (and ::1 if either side prefers IPv6 loopback) — which is
+# also install.py's and app/config.py's default. If Apache runs on a
+# separate host from the app (NOT what this example file sets up — you would
+# also need to stop binding the app to 127.0.0.1 only and put something
+# between the two hosts instead), TRUSTED_PROXIES must instead name that
+# host's real address.
+#
+# Verify the wiring after deploying: open the pairing window, push an
+# attendance event from a real device (or `curl https://zk.example.com/iclock/ping?SN=...`
+# from an external network), and confirm the device's real public IP — not
+# 127.0.0.1 — appears in the app log and in the device's "last seen IP" in
+# the UI.
+# ---------------------------------------------------------------------------
+
+# Redirect all plain HTTP to HTTPS. /iclock/* devices follow HTTP redirects
+# fine on next reconnect, but point devices at https:// directly where the
+# firmware supports it, to avoid the extra round trip.
+<VirtualHost *:80>
+    ServerName zk.example.com
+
+    RewriteEngine On
+    RewriteCond %{HTTPS} off
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [END,NE,R=permanent]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName zk.example.com
+
+    SSLEngine on
+    SSLCertificateFile    /etc/letsencrypt/live/zk.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/zk.example.com/privkey.pem
+    # (certbot's fullchain.pem already includes the intermediate chain — set
+    # SSLCertificateChainFile separately only if your CA gives you one apart
+    # from the leaf cert.)
+
+    # Modern cipher suite (Mozilla "Intermediate" config, TLS 1.2+ only).
+    # Regenerate from https://ssl-config.mozilla.org/ if your Apache/OpenSSL
+    # version is old enough to choke on any of these.
+    SSLProtocol           all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite        ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA256
+    SSLHonorCipherOrder   off
+    SSLSessionTickets     off
+
+    # Belt-and-braces HSTS at the edge. The app also sends its own HSTS
+    # header (app/middleware.py) but only when APP_ENV=production and never
+    # on /iclock/* (devices don't parse it and shouldn't see it) — Apache's
+    # copy applies uniformly to every browser-facing response, including the
+    # very first one before the app gets a chance to answer.
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # Required so the app knows the original request was HTTPS — its
+    # COOKIE_SECURE setting and its own HSTS header both depend on trusting
+    # this. Without it, the app has no way to tell TLS already terminated in
+    # front of it.
+    RequestHeader set X-Forwarded-Proto "https"
+
+    ProxyPreserveHost On
+    ProxyPass        / http://127.0.0.1:8000/
+    ProxyPassReverse / http://127.0.0.1:8000/
+
+    # mod_proxy_http appends the connecting client's address to
+    # X-Forwarded-For automatically — see the long comment block above this
+    # vhost for why nothing else is needed here, and what breaks if
+    # TRUSTED_PROXIES in .env doesn't match Apache's real source address.
+
+    # Device-triggered SDK actions (template pull, bulk enroll push) can run
+    # tens of seconds; give the proxy connection enough rope rather than
+    # cutting it early with the default timeout.
+    ProxyTimeout 120
+
+    ErrorLog  ${APACHE_LOG_DIR}/zkteco-sync-error.log
+    CustomLog ${APACHE_LOG_DIR}/zkteco-sync-access.log combined
+</VirtualHost>

@@ -251,6 +251,51 @@ def prompt_database():
         "DB_ODBC_DRIVER": odbc,
     }
 
+def prompt_network(dev_mode):
+    """Interactive prompts for the settings app/config.py needs to boot under
+    APP_ENV=production without hand-editing .env afterward. Returns a dict of
+    the new config keys."""
+    header("Network")
+
+    app_host = ask("Bind address", "127.0.0.1")
+    if app_host == "0.0.0.0":
+        warn("Binding to 0.0.0.0 gives this process its own public socket.")
+        info("Apache should be the only thing the internet can reach — this app is")
+        info("meant to stay on loopback and be reverse-proxied. Only override this")
+        info("if you know Apache is NOT fronting this box (not the supported setup).")
+    app_port = ask("Port", "8000")
+
+    if dev_mode:
+        info("Development mode — ALLOWED_HOSTS left unset; app/config.py falls back")
+        info("to localhost/127.0.0.1/::1 automatically, and the production fail-fast")
+        info("checks don't apply.")
+        allowed_hosts = ""
+        trusted_proxies = ""
+    else:
+        print()
+        info("ALLOWED_HOSTS: the public hostname(s) this server answers on. The app")
+        info("refuses to boot under APP_ENV=production without this set — it rejects")
+        info("any request whose Host header isn't in this list.")
+        hostname = ask("Public hostname (e.g. zk.example.com)")
+        while not hostname:
+            warn("A hostname is required for a production install.")
+            hostname = ask("Public hostname (e.g. zk.example.com)")
+        allowed_hosts = hostname
+
+        print()
+        info("TRUSTED_PROXIES: addresses the app trusts to hand it an accurate")
+        info("X-Forwarded-For. This must be the address Apache's proxy connections")
+        info("actually originate from — almost always 127.0.0.1, the default. Get")
+        info("this wrong and per-device IP allowlisting silently fails open or closed.")
+        trusted_proxies = ask("Trusted proxy addresses", "127.0.0.1")
+
+    return {
+        "app_host": app_host,
+        "app_port": app_port,
+        "allowed_hosts": allowed_hosts,
+        "trusted_proxies": trusted_proxies,
+    }
+
 def configure(env, dev_mode):
     """Interactive configuration → fresh .env. Returns False if the user kept
     an existing .env instead."""
@@ -259,15 +304,18 @@ def configure(env, dev_mode):
         warn(".env already exists.")
         if not ask_yn("Reconfigure?", default="n"):
             success("Keeping existing .env")
+            secure_env_file(env)
             return False
 
-    header("App settings")
-    app_host = ask("Bind address", "0.0.0.0")
-    app_port = ask("Port",         "8000")
+    net = prompt_network(dev_mode)
 
     db = prompt_database()
 
-    header("Admin credentials")
+    header("Admin bootstrap credentials")
+    info("These credentials seed exactly ONE administrator account the first time")
+    info("the app boots against an empty database. After that first login, the UI")
+    info("forces a password change and API_USERNAME/API_PASSWORD are never read")
+    info("again — safe (and recommended) to delete them from .env afterward.")
     api_username = ask("Username", "admin")
     while True:
         api_password = ask_secret("Password")
@@ -280,13 +328,33 @@ def configure(env, dev_mode):
 
     header("Writing .env")
     env.write(
-        f"APP_HOST={app_host}\n"
-        f"APP_PORT={app_port}\n"
+        f"APP_HOST={net['app_host']}\n"
+        f"APP_PORT={net['app_port']}\n"
         f"APP_ENV={'development' if dev_mode else 'production'}\n"
         f"\n"
+        f"# First-boot bootstrap only — seeds one admin, then ignored forever.\n"
+        f"# Safe to delete once you've logged in and changed the password.\n"
         f"API_USERNAME={api_username}\n"
         f"API_PASSWORD={api_password}\n"
         f"SECRET_KEY={secrets.token_hex(32)}\n"
+        f"\n"
+        f"# The public hostname(s) this server answers on. Required in production.\n"
+        f"ALLOWED_HOSTS={net['allowed_hosts']}\n"
+        f"# Addresses trusted to supply an accurate X-Forwarded-For — must match\n"
+        f"# Apache's real source address, or per-device IP allowlisting misbehaves.\n"
+        f"TRUSTED_PROXIES={net['trusted_proxies'] or '127.0.0.1,::1'}\n"
+        f"\n"
+        f"# Session, lockout and request-hardening defaults — app/config.py applies\n"
+        f"# these same values even if left unset. Written explicitly so this .env is\n"
+        f"# a complete, self-documenting record of a production install.\n"
+        f"COOKIE_SECURE={'false' if dev_mode else 'true'}\n"
+        f"SESSION_IDLE_MINUTES=60\n"
+        f"SESSION_ABSOLUTE_HOURS=12\n"
+        f"LOGIN_MAX_ATTEMPTS=5\n"
+        f"LOGIN_LOCKOUT_MINUTES=15\n"
+        f"ENABLE_DOCS=false\n"
+        f"MAX_REQUEST_BYTES=2097152\n"
+        f"ADMS_PAIRING_MINUTES=15\n"
         f"\n"
         f"DB_ENGINE={db['DB_ENGINE']}\n"
         f"DB_HOST={db['DB_HOST']}\n"
@@ -298,7 +366,19 @@ def configure(env, dev_mode):
     )
     success(".env written")
     info("SECRET_KEY was auto-generated.")
+    secure_env_file(env)
     return True
+
+def secure_env_file(env):
+    """.env holds DB credentials, SECRET_KEY and the bootstrap admin password —
+    restrict it to the owner. No-op on Windows, which has no POSIX chmod bits."""
+    if IS_WINDOWS or not env.exists():
+        return
+    try:
+        env.path.chmod(0o600)
+        success(".env permissions set to 600 (owner read/write only)")
+    except OSError as e:
+        warn(f"Could not chmod .env to 600: {e}")
 
 def enforce_app_env(env, dev_mode):
     """The --dev flag is authoritative even when keeping an existing .env, so
@@ -469,6 +549,15 @@ def install_linux_service():
     if not ask_yn("Install as a systemd service (runs on boot, restarts on crash)?", "y"):
         return
 
+    # Run the venv's own interpreter directly rather than `uv run python
+    # run.py`. uv itself is usually installed under the interactive user's
+    # home directory (~/.local/bin/uv), which ProtectHome=true below makes
+    # invisible to the service — going through uv at runtime would make the
+    # unit's ability to start depend on a path the sandbox just hid. The venv
+    # at {ROOT}/.venv is already inside ReadWritePaths and was just populated
+    # by `uv sync` a moment ago, so this needs nothing uv provides at runtime.
+    venv_python = ROOT / ".venv" / ("Scripts" if IS_WINDOWS else "bin") / "python"
+
     svc_body = dedent(f"""\
         [Unit]
         Description=ZKTeco Sync
@@ -478,10 +567,36 @@ def install_linux_service():
         Type=simple
         User={os.getenv('USER', 'root')}
         WorkingDirectory={ROOT}
-        ExecStart={shutil.which('uv')} run python run.py
+        ExecStart={venv_python} {ROOT / 'run.py'}
         Restart=always
         RestartSec=5
         SyslogIdentifier={SVC_NAME}
+
+        # --- Sandboxing (defense in depth) --------------------------------
+        # This app is now reachable indirectly from the public internet
+        # (behind Apache), so the service is confined beyond what a bare
+        # systemd unit gives you for free.
+        NoNewPrivileges=true
+        PrivateTmp=true
+        ProtectSystem=strict
+        ProtectHome=true
+        ReadWritePaths={ROOT}
+        ProtectKernelTunables=true
+        RestrictSUIDSGID=true
+        RestrictNamespaces=true
+        # MemoryDenyWriteExecute is deliberately NOT set. It forbids a
+        # process from ever having a memory page that is both writable and
+        # executable (blocks classic shellcode injection), but native
+        # extensions this app depends on (argon2-cffi's cffi backend,
+        # psycopg2, pyodbc's ODBC driver loading under MSSQL) can
+        # legitimately need W+X pages, and a violation doesn't degrade
+        # gracefully — the process is killed outright. This installer runs
+        # on macOS, which has no systemd, so this could not be verified
+        # against this project's actual Python 3.11 runtime and native
+        # dependencies on a real Linux box. Enable it deliberately — add
+        # `MemoryDenyWriteExecute=true` below and watch
+        # `journalctl -u {SVC_NAME}` on restart — rather than shipping it
+        # unverified.
 
         [Install]
         WantedBy=multi-user.target

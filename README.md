@@ -1,6 +1,6 @@
 # ZKTeco Sync
 
-A self-hosted LAN appliance that replaces ZKTeco BioCloud. It collects attendance from ZKTeco biometric devices over your local network and exposes a clean web UI and REST API — no cloud dependency, no per-device license.
+A self-hosted appliance that replaces ZKTeco BioCloud. It collects attendance from ZKTeco biometric devices and exposes a clean web UI and REST API — no cloud dependency, no per-device license. It can run purely on your LAN, or — behind Apache as a TLS reverse proxy — be reached from the public internet, so devices at sites without a shared network can push attendance directly. See [SECURITY.md](SECURITY.md) before doing the latter.
 
 ## How it works
 
@@ -23,7 +23,8 @@ This app runs both listeners. Devices push attendance events the moment they hap
 - **Device control** — unlock door, set clock, write LCD message, restart, queue raw commands
 - **HRM integration** — push attendance records to a third-party HRM on a configurable interval, with last-synced-ID tracking and a manual trigger
 - **Multi-database** — MariaDB, MySQL, PostgreSQL, or MSSQL (including Windows Authentication)
-- **JWT-secured API** — all endpoints require a bearer token; credentials set via `.env`
+- **DB-backed operator accounts** — Argon2id-hashed passwords, `admin`/`viewer` roles, forced password change on first login, account lockout after repeated failures. Sessions are an opaque server-side token in an `HttpOnly`, `SameSite=Strict` cookie (never a bearer token, never `localStorage`), with CSRF protection on every state-changing request. See [SECURITY.md](SECURITY.md) for the full model.
+- **Device approval queue** — an unknown device serial is refused, not auto-registered; approve it from a pending queue, or open a time-boxed pairing window while onboarding new hardware. Optional per-device source-IP allowlist.
 
 ## Requirements
 
@@ -69,6 +70,33 @@ frontend (prebuilt download on production boxes, npm build on dev boxes —
 detected from `.env`), restarts the registered service, and never touches
 `.env` or asks questions. Add `--skip-pull` to upgrade without pulling.
 
+#### Upgrading an existing (pre-hardening) install
+
+If your `.env` predates the operator-authentication and public-internet
+hardening work, `--upgrade` will not add the new keys for you — it never
+touches `.env`. After upgrading:
+
+1. Add at minimum `ALLOWED_HOSTS=<your hostname>` to `.env`. Under
+   `APP_ENV=production` the app now refuses to boot without it. Copy the
+   rest of the new keys from `.env.example` (`TRUSTED_PROXIES`,
+   `COOKIE_SECURE`, session/lockout settings, `ENABLE_DOCS`,
+   `MAX_REQUEST_BYTES`, `ADMS_PAIRING_MINUTES`) — every one has a safe
+   default if omitted, `ALLOWED_HOSTS` is the only one that's required.
+2. Restart the app. On first boot against your existing database, a
+   migration runs automatically: it adds the new `users`/`user_sessions`/
+   `audit_log` tables, and — critically — marks every **existing** device
+   row `approved` so devices already in production keep pushing without
+   interruption. Only a serial the server has never seen before lands in the
+   new pending-approval queue.
+3. On that same first boot, since `users` is empty, the app seeds one admin
+   from your existing `API_USERNAME`/`API_PASSWORD` with a forced password
+   change. Log in, change the password, then delete both lines from `.env`
+   — they are never consulted again after that first boot.
+4. If you're now also fronting the app with Apache for the first time, see
+   [Deploying behind Apache](#deploying-behind-apache-public-internet) below
+   — in particular, `TRUSTED_PROXIES` has to match Apache's real source
+   address or per-device IP allowlisting will misbehave.
+
 ### Releasing (maintainers)
 
 1. Bump `version` in `pyproject.toml` and commit
@@ -82,14 +110,14 @@ matching their checked-out `pyproject.toml` version and only fall back to the
 latest release if that tag has no build.
 
 The installer will:
-1. Prompt for database credentials, bind address, port, and admin credentials
-2. Write `.env` with an auto-generated secret key
+1. Prompt for bind address and port, the public hostname (`ALLOWED_HOSTS`) and trusted proxy addresses (`TRUSTED_PROXIES`), database credentials, and the admin bootstrap credentials
+2. Write `.env` with an auto-generated secret key, `chmod`ed to `600`
 3. Install Python dependencies
 4. Test the database connection
 5. Download the prebuilt frontend from GitHub Releases (falls back to a local npm build)
-6. Optionally register a **systemd** service (Linux) or **NSSM Windows service** (Windows) so the app starts on boot and restarts on crash
+6. Optionally register a **systemd** service (Linux, with sandboxing directives — see [Deploying behind Apache](#deploying-behind-apache-public-internet)) or **NSSM Windows service** (Windows) so the app starts on boot and restarts on crash
 
-If a `.env` already exists it will ask before overwriting.
+If a `.env` already exists it will ask before overwriting (and will still `chmod` it to `600` either way).
 
 ### Manual setup
 
@@ -99,14 +127,20 @@ If you prefer to set things up yourself:
 git clone <repo-url>
 cd zkteco-sync
 cp .env.example .env
+chmod 600 .env
 ```
 
-Edit `.env`:
+Edit `.env`. At minimum:
 
 ```env
+# First-boot bootstrap only — seeds one admin, then ignored forever. Delete
+# both lines once you've logged in and changed the password.
 API_USERNAME=admin
 API_PASSWORD=your-password
 SECRET_KEY=<python -c "import secrets; print(secrets.token_hex(32))">
+
+# Required under APP_ENV=production — the app refuses to boot without it.
+ALLOWED_HOSTS=zk.example.com
 
 DB_ENGINE=mariadb        # mariadb | mysql | postgresql | mssql
 DB_HOST=127.0.0.1
@@ -116,6 +150,10 @@ DB_USER=root
 DB_PASSWORD=
 ```
 
+See `.env.example` for the full list of keys (session lifetime, lockout
+thresholds, `TRUSTED_PROXIES`, request body cap, etc.) — every one besides
+`ALLOWED_HOSTS` has a safe default if left unset.
+
 ```bash
 uv sync
 npm install --prefix frontend
@@ -123,17 +161,70 @@ npm run build --prefix frontend
 python run.py
 ```
 
-The web UI is served at `http://<server-ip>:8000`. Database tables are created automatically on first run.
+By default the app binds to `127.0.0.1` only, so it isn't directly reachable
+over the network — that's the intended setup once Apache is in front of it
+(below). For a plain LAN deployment with no reverse proxy, set
+`APP_HOST=0.0.0.0` in `.env`; `install.py` will warn you when you choose
+this. Database tables (and any missing columns from an upgrade) are created
+automatically on first run.
 
 ## Pointing devices at this server
 
-On each ZKTeco device, set the ADMS / Cloud Server address to:
+On each ZKTeco device, set the ADMS / Cloud Server address to wherever the
+app is actually reachable — `http://<server-ip>:8000` on a LAN deployment
+with `APP_HOST=0.0.0.0`, or your public hostname over HTTPS
+(`https://zk.example.com`) behind Apache.
 
-```
-http://<server-ip>:8000
-```
+By default an unrecognized device serial is **refused, not auto-registered**
+— it must be approved before it can push anything. Two ways to get a new
+device connected:
 
-The device will begin pushing attendance records immediately. No further configuration is needed on the device side.
+- **Pairing mode (recommended for onboarding):** open a pairing window from
+  **Devices → Open pairing window** (closes automatically after
+  `ADMS_PAIRING_MINUTES`, 15 by default), then power on or reboot the
+  device. It appears in a pending-approval queue with the IP it connected
+  from; approve it there and it starts pushing normally. Close the window
+  when you're done onboarding.
+- **Manual add:** add the device directly from the Devices page with its
+  serial number — this auto-approves it, so only do this for a device you
+  already trust.
+
+An existing install upgrading into this behavior does not need to re-approve
+anything: the upgrade migration marks every device already in the database
+`approved` automatically. Only a serial the server has never seen before
+lands in the pending queue.
+
+## Deploying behind Apache (public internet)
+
+To expose this app on the public internet, put Apache in front of it as a
+TLS-terminating reverse proxy and leave the app itself on `127.0.0.1` (the
+default). A complete example vhost — TLS, HTTP→HTTPS redirect, proxy
+directives, HSTS, a modern cipher suite — is at
+[`deploy/apache/zkteco-sync.conf.example`](deploy/apache/zkteco-sync.conf.example).
+
+Two things are easy to get wrong and worth reading closely before you copy
+that file:
+
+1. **`/iclock/*` (the device-push endpoints) must stay on the same vhost as
+   the admin UI.** Device firmware only lets you configure a hostname and
+   port for its server address — there's no server-path field — so every
+   device pushes to the same origin the browser uses. Splitting them apart
+   breaks device pushes.
+2. **`TRUSTED_PROXIES` in `.env` must match Apache's real source address**
+   (almost always `127.0.0.1`, the default) for the app to resolve a
+   device's or browser's real IP from `X-Forwarded-For` correctly. Get this
+   wrong and per-device IP allowlisting either refuses every device or can
+   be walked through with a forged header — see the long comment block in
+   the example vhost, and [SECURITY.md](SECURITY.md), for the full
+   explanation.
+
+`install.py` prompts for both `ALLOWED_HOSTS` (the hostname Apache serves)
+and `TRUSTED_PROXIES` during a production install, and registers a systemd
+service with sandboxing directives (`ProtectSystem=strict`, `ProtectHome`,
+`NoNewPrivileges`, and others) suitable for a process now reachable
+indirectly from the internet. See [SECURITY.md](SECURITY.md) for the full
+threat model, the accepted residual risk around device-serial forgery, and
+incident-response steps.
 
 ## HRM Integration
 
@@ -194,23 +285,36 @@ Any device running firmware Ver 6.x on a compatible platform should work. If you
 
 ```
 app/
-  main.py           # FastAPI app, lifespan, HRM scheduler
+  main.py           # FastAPI app, lifespan, middleware wiring, HRM scheduler
+  config.py         # Validated settings from .env; fail-fast in production
+  security.py       # Argon2id hashing, session token generation/hashing
+  net.py            # Real client IP resolution (X-Forwarded-For / TRUSTED_PROXIES)
+  middleware.py      # Security headers, request body size cap
+  migrations.py      # Additive schema migrations, run on every boot
+  audit.py          # Privileged-action audit log writer
   models.py         # SQLAlchemy models
   database.py       # DB engine, UTCDateTime type decorator
   schemas.py        # Pydantic request/response schemas
-  deps.py           # Auth dependency (require_auth)
+  deps.py           # Auth dependencies (require_auth, require_admin)
   routers/
-    auth.py         # Login, password verify
-    devices.py      # Device CRUD and all SDK actions
+    auth.py         # Login/logout, session, forced password change
+    users.py        # Admin-only operator account management
+    devices.py      # Device CRUD, approval queue, pairing, SDK actions
     employees.py    # Employee read, device/template queries
     attendance.py   # Attendance list with filters
-    adms.py         # ADMS push endpoints (device-initiated)
+    adms.py         # ADMS push endpoints (device-initiated, unauthenticated)
     hrm_sync.py     # HRM config, status, manual trigger
+    audit.py        # Admin-only audit trail read
   services/
+    bootstrap.py    # First-boot admin seeding from API_USERNAME/API_PASSWORD
+    pairing.py      # Device pairing-window state
     poller.py       # SDK pull logic (employees, attendance, templates)
     hrm_sync.py     # HRM push logic and batch loop
 frontend/
   src/
-    pages/          # Devices, Employees, Attendance, Settings
-    api.js          # All API calls in one place
+    pages/          # Devices, Employees, Attendance, Users, Settings, Login, ChangePassword
+    api.js          # All API calls in one place (cookie-session + CSRF aware)
+deploy/
+  apache/
+    zkteco-sync.conf.example   # Reference reverse-proxy vhost
 ```
