@@ -3,9 +3,10 @@ import mimetypes
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 # Some Linux distros ship a system mime.types (mime-support package) that
 # files .js/.mjs under text/plain, predating ES modules. That overrides
@@ -16,7 +17,9 @@ mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("application/javascript", ".mjs")
 mimetypes.add_type("text/css", ".css")
 
+from app import config
 from app.database import Base, engine
+from app.middleware import MaxBodySizeMiddleware, SecurityHeadersMiddleware
 from app.migrations import run_migrations
 from app.routers import adms, attendance, auth, devices, employees, users
 from app.routers import hrm_sync
@@ -74,13 +77,37 @@ async def lifespan(app: FastAPI):
         _scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="ZKTeco Sync", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="ZKTeco Sync",
+    version="1.0.0",
+    lifespan=lifespan,
+    # Publicly reachable on the internet now, so the interactive API
+    # explorer is off unless an operator deliberately opts in.
+    docs_url="/docs" if config.ENABLE_DOCS else None,
+    redoc_url="/redoc" if config.ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if config.ENABLE_DOCS else None,
+)
 
+# No CORSMiddleware: the SPA is always same-origin. In production FastAPI
+# serves frontend/dist itself; in development the browser only ever talks to
+# the Vite dev server, which proxies /api to this app server-to-server, so
+# the browser never makes a cross-origin request in the first place. The
+# session cookie is also SameSite=Strict, so even a browser that did send a
+# cross-origin request wouldn't carry it. Wiring up CORS here would only add
+# a path for some other origin to be allowed in by mistake, for no benefit.
+
+# Middleware runs in the reverse of the order added below, so TrustedHost
+# (the cheapest, most important gate — reject an unrecognised Host before
+# doing anything else) ends up outermost, checked first on every request.
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(MaxBodySizeMiddleware, max_bytes=config.MAX_REQUEST_BYTES)
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    TrustedHostMiddleware,
+    # ALLOWED_HOSTS is required in production (app/config.py refuses to
+    # boot without it there). In development it is commonly left unset, so
+    # fall back to the addresses a local dev/test instance is actually
+    # reached on instead of rejecting every request.
+    allowed_hosts=config.ALLOWED_HOSTS or ["localhost", "127.0.0.1", "::1"],
 )
 
 app.include_router(auth.router)
@@ -94,4 +121,18 @@ app.include_router(users.router)
 # Serve the React build — must come last so API routes take priority.
 _dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(_dist):
+    _index_html = os.path.join(_dist, "index.html")
+
+    async def _spa_shell(request: Request):
+        return FileResponse(_index_html)
+
+    # StaticFiles(html=True) below only serves index.html for "/" itself and
+    # for on-disk directories — it has no SPA history-fallback, so a hard
+    # GET/reload of a client-side route 404s unless we hand it index.html
+    # explicitly. Only routes no API router owns are safe to add here:
+    # /devices, /employees, /attendance, /users, /auth, /hrm-sync and
+    # /iclock are all claimed by routers above and must not be shadowed.
+    for _path in ("/login", "/change-password", "/settings"):
+        app.add_api_route(_path, _spa_shell, methods=["GET"], include_in_schema=False)
+
     app.mount("/", StaticFiles(directory=_dist, html=True), name="spa")

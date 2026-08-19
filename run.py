@@ -7,7 +7,9 @@ load_dotenv()
 if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
-        host=os.getenv("APP_HOST", "0.0.0.0"),
+        # No public socket by default: Apache is the only thing that should
+        # ever reach this process, over loopback.
+        host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "8000")),
         reload=os.getenv("APP_ENV", "production") == "development",
         # Uvicorn's own proxy-header handling rewrites scope["client"] from

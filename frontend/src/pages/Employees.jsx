@@ -384,8 +384,7 @@ export default function Employees() {
 
   return (
     <div
-      className="bg-white rounded-xl border border-gray-200 overflow-hidden flex"
-      style={{ height: 'calc(100vh - 13rem)' }}
+      className="bg-white rounded-xl border border-gray-200 overflow-hidden flex h-[calc(100vh-13rem)]"
     >
       {/* Sidebar */}
       <div className="w-72 flex-shrink-0 border-r border-gray-200 flex flex-col">

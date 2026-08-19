@@ -34,7 +34,7 @@ def _get_or_create(db: Session) -> HrmIntegration:
 def _serialize(row: HrmIntegration) -> dict:
     return {
         "endpoint":          row.endpoint,
-        "secret":            row.secret,
+        "secret_set":        bool(row.secret),
         "location_id":       row.location_id,
         "interval_seconds":  row.interval_seconds,
         "timezone":          row.timezone,
@@ -55,7 +55,13 @@ def get_config(db: Session = Depends(get_db)):
 @router.put("", dependencies=[Depends(require_admin)])
 def update_config(payload: HrmConfigUpdate, db: Session = Depends(get_db)):
     row = _get_or_create(db)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    # secret is write-only: the client never sees the current value, so a
+    # blank or omitted one must mean "leave it alone", not "erase it". Only
+    # a genuinely new, non-empty secret is allowed to overwrite it.
+    if "secret" in updates and not updates["secret"]:
+        updates.pop("secret")
+    for field, value in updates.items():
         setattr(row, field, value)
     db.commit()
     db.refresh(row)

@@ -73,7 +73,10 @@ export default function Settings() {
   function startEdit() {
     setForm({
       endpoint:         cfg.endpoint || '',
-      secret:           cfg.secret || '',
+      // Write-only: the server never tells the browser what the secret is,
+      // only whether one is set (cfg.secret_set). Blank here means "leave
+      // it alone" — see handleSave.
+      secret:           '',
       location_id:      cfg.location_id || '1',
       interval_seconds: cfg.interval_seconds ?? 300,
       timezone:         cfg.timezone || 'UTC',
@@ -89,7 +92,11 @@ export default function Settings() {
     e.preventDefault()
     setSaving(true)
     try {
-      const updated = await api.hrmSync.update(form)
+      const payload = { ...form }
+      // Don't send an empty secret — the backend would ignore it anyway,
+      // but keep the intent explicit here too: blank means unchanged.
+      if (!payload.secret) delete payload.secret
+      const updated = await api.hrmSync.update(payload)
       setCfg(updated)
       setForm(null)
       showToast('Configuration saved')
@@ -127,7 +134,7 @@ export default function Settings() {
     }
   }
 
-  const isConfigured = cfg?.endpoint && cfg?.secret
+  const isConfigured = cfg?.endpoint && cfg?.secret_set
 
   return (
     <div className="max-w-xl">
@@ -183,12 +190,16 @@ export default function Settings() {
               />
             </Field>
 
-            <Field label="Secret Key">
+            <Field
+              label="Secret Key"
+              hint={cfg.secret_set ? 'leave blank to keep the current secret' : undefined}
+            >
               <input
                 type="password"
+                autoComplete="new-password"
                 value={form.secret}
                 onChange={(e) => setForm((f) => ({ ...f, secret: e.target.value }))}
-                placeholder="Shared secret configured in server.php"
+                placeholder={cfg.secret_set ? '••••••••' : 'Shared secret configured in server.php'}
                 className="input w-full text-sm"
               />
             </Field>
@@ -255,6 +266,16 @@ export default function Settings() {
         {/* Status */}
         {cfg && !form && (
           <div className="px-5">
+            <div className="flex justify-between items-center py-2.5 border-b border-gray-100 text-sm">
+              <span className="text-gray-500">Secret</span>
+              <span
+                className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                  cfg.secret_set ? 'bg-blue-50 text-blue-700' : 'bg-gray-100 text-gray-500'
+                }`}
+              >
+                {cfg.secret_set ? 'Set' : 'Not set'}
+              </span>
+            </div>
             <StatusRow
               label="Last run"
               value={cfg.last_run_at
