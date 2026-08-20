@@ -29,6 +29,14 @@ class DeviceOut(BaseModel):
     ip_check_enabled: bool = False
     allowed_cidrs: Optional[str] = None
     last_ip: Optional[str] = None
+    # Which PUSH protocol family the device speaks (D9): "att" (Attendance,
+    # the default and what every pre-existing device is) or "acc" (Security /
+    # access control). Read-only — it is set from what the device announces
+    # about itself, never from the API. `registry_code`, `session_id` and
+    # `capabilities` are deliberately absent: the first two are inputs to the
+    # device's session token and the third is a long diagnostic blob, and
+    # neither belongs in a device listing.
+    protocol: str = "att"
     # SDK comm key (D7) — deliberately no `comm_key` field here. The key is a
     # secret and this is the only shape a device is allowed to leave the
     # server in; only whether one is set is observable.

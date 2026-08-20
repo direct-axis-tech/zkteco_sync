@@ -41,6 +41,35 @@ class Device(Base):
     # connecting exactly as before this column existed.
     comm_key = Column(Integer, nullable=False, default=0)
 
+    # Which of ZKTeco's two PUSH protocol families this serial speaks. They
+    # share the /iclock/* URL space but disagree on the handshake reply, so
+    # the server has to know which one it is talking to. "att" is the default
+    # precisely so that every row which existed before this column keeps
+    # receiving the byte-for-byte legacy handshake it has always had — a
+    # serial only becomes "acc" once it has said so itself, either by sending
+    # DeviceType=acc or by calling an endpoint that exists only in the
+    # Security protocol.
+    protocol = Column(
+        Enum("att", "acc", name="device_protocol"),
+        nullable=False,
+        default="att",
+    )
+    # Opaque values the Security protocol asks the server to mint and the
+    # device folds into its own session token. Neither is validated here —
+    # the device derives a token from them and presents it back, but our
+    # trust decision is the approved-serial + CIDR allowlist, which is
+    # strictly stronger than a token computed from values we handed out in
+    # cleartext. They are persisted only so the same values survive a
+    # restart, since the device keeps using the ones it was first given.
+    registry_code = Column(String(64), nullable=True)
+    session_id = Column(String(64), nullable=True)
+    # The raw comma-separated parameter line the device pushes at registration
+    # (and again on table=options). It is a complete capability inventory in
+    # one column — FaceFunOn, MultiBioDataSupport, MachineType and the rest —
+    # and is stored verbatim rather than parsed, because nothing here needs
+    # to understand it yet and a parser would be a guess.
+    capabilities = Column(Text, nullable=True)
+
     @property
     def comm_key_set(self) -> bool:
         """The only externally-visible fact about the comm key: whether one
@@ -85,6 +114,23 @@ class AttendanceLog(Base):
     punch = Column(Integer, default=0)          # verify mode: 1=finger 3=password 4=card 15=face
     source = Column(Enum("adms_push", "sdk_pull", name="attendance_source"), nullable=False)
     created_at = Column(DateTime, default=_now)
+
+    # Provenance for rows that arrived as Security-protocol `rtlog` records.
+    # All three are deliberately opaque. Which `event` codes represent a
+    # successful verification on this firmware is not established (the
+    # protocol document's appendix is unreadable), so the value is *recorded*
+    # rather than filtered on: an abnormal event briefly counted as a punch is
+    # a visible, correctable data error, whereas a real punch dropped by a
+    # wrong guess is silent and unrecoverable. Null on every legacy ATTLOG and
+    # SDK-pull row.
+    event_code = Column(String(16), nullable=True)
+    # A string, not an int: 3.1.2 may report verification mode either as a
+    # small decimal or as a 16-character bitmask (`0000000000000010` = face),
+    # and int() would quietly turn the latter into the unrelated value 10.
+    verify_type = Column(String(32), nullable=True)
+    # The device-unique record ID from `rtlog`. Indexed because it is the
+    # dedup key for pushes from an `acc` device.
+    record_index = Column(String(32), nullable=True, index=True)
 
     __table_args__ = (
         UniqueConstraint("device_sn", "user_id", "timestamp", name="uq_attendance"),
