@@ -103,6 +103,9 @@ export const api = {
     openPairing: (minutes) => request('POST', '/devices/pairing', { minutes }),
     closePairing: () => request('DELETE', '/devices/pairing'),
     update: (sn, data) => request('PATCH', `/devices/${sn}`, data),
+    // Its own endpoint, not part of update(): changing a device's timezone
+    // relabels every attendance record it ever pushed.
+    setTimezone: (sn, timezone) => request('PATCH', `/devices/${sn}/timezone`, { timezone }),
     delete: (sn) => request('DELETE', `/devices/${sn}`),
     pull: (sn) => request('POST', `/devices/${sn}/pull`),
     pullEmployees: (sn) => request('POST', `/devices/${sn}/pull/employees`),

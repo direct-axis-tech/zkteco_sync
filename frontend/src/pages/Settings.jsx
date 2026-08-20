@@ -194,6 +194,7 @@ export default function Settings() {
   const [editId, setEditId] = useState(null)    // editing last_synced_id inline
   const [running, setRunning] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [toggling, setToggling] = useState(false)
   const [toast, setToast] = useState(null)
 
   const showToast = (msg, type = 'success') => setToast({ message: msg, type })
@@ -219,8 +220,10 @@ export default function Settings() {
       secret:           '',
       location_id:      cfg.location_id || '1',
       interval_seconds: cfg.interval_seconds ?? 300,
-      timezone:         cfg.timezone || 'UTC',
-      enabled:          cfg.enabled ?? true,
+      // `enabled` is deliberately not here. Pausing the sync is not a
+      // configuration detail to be discovered inside a form — it is the one
+      // control an operator reaches for in a hurry, so it lives in the header
+      // as its own button (see handleToggleEnabled).
     })
   }
 
@@ -244,6 +247,20 @@ export default function Settings() {
       showToast(err.message, 'error')
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function handleToggleEnabled() {
+    const next = !cfg.enabled
+    setToggling(true)
+    try {
+      const updated = await api.hrmSync.update({ enabled: next })
+      setCfg(updated)
+      showToast(next ? 'Sync resumed' : 'Sync paused')
+    } catch (err) {
+      showToast(err.message, 'error')
+    } finally {
+      setToggling(false)
     }
   }
 
@@ -301,6 +318,27 @@ export default function Settings() {
               }`}>
                 {cfg.enabled && isConfigured ? 'Active' : isConfigured ? 'Paused' : 'Not configured'}
               </span>
+            )}
+            {/* Pause/Resume is the control an operator needs to find fast —
+                it stops records leaving for the HRM. It was a checkbox buried
+                in the config form; it is now the obvious button next to the
+                status it changes. Admin-only, matching the PUT it calls. */}
+            {cfg && !form && isConfigured && user?.role === 'admin' && (
+              <button
+                onClick={handleToggleEnabled}
+                disabled={toggling}
+                data-testid="hrm-toggle"
+                title={cfg.enabled
+                  ? 'Stop pushing records to the HRM until resumed'
+                  : 'Start pushing records to the HRM again'}
+                className={`text-sm font-medium px-3 py-1.5 rounded-lg border transition-colors disabled:opacity-50 ${
+                  cfg.enabled
+                    ? 'border-amber-300 text-amber-800 hover:bg-amber-50'
+                    : 'border-green-300 text-green-800 hover:bg-green-50'
+                }`}
+              >
+                {toggling ? 'Working…' : cfg.enabled ? 'Pause' : 'Resume'}
+              </button>
             )}
             {cfg && !form && (
               <button
@@ -365,25 +403,6 @@ export default function Settings() {
               </Field>
             </div>
 
-            <Field label="Timezone" hint="e.g. Asia/Dubai, UTC, America/New_York">
-              <input
-                type="text"
-                value={form.timezone}
-                onChange={(e) => setForm((f) => ({ ...f, timezone: e.target.value }))}
-                className="input w-full text-sm"
-              />
-            </Field>
-
-            <label className="flex items-center gap-2 text-sm cursor-pointer">
-              <input
-                type="checkbox"
-                checked={form.enabled}
-                onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))}
-                className="rounded"
-              />
-              <span className="text-gray-700">Enable automatic sync</span>
-            </label>
-
             <div className="flex gap-3 pt-1">
               <button
                 type="button"
@@ -418,9 +437,10 @@ export default function Settings() {
             </div>
             <StatusRow
               label="Last run"
-              value={cfg.last_run_at
-                ? new Date(cfg.last_run_at).toLocaleString(undefined, { timeZone: cfg.timezone || 'UTC' })
-                : null}
+              // A server event, genuinely UTC, so the viewer's own locale is
+              // the right lens for it — unlike a punch time, which is the
+              // device's wall-clock and is never re-zoned.
+              value={cfg.last_run_at ? new Date(cfg.last_run_at).toLocaleString() : null}
             />
             <StatusRow
               label="Last synced ID"
@@ -458,7 +478,6 @@ export default function Settings() {
             <StatusRow label="Total records pushed" value={cfg.total_pushed?.toLocaleString()} />
             <StatusRow label="Interval" value={cfg.interval_seconds ? `${cfg.interval_seconds}s` : null} />
             <StatusRow label="Location ID" value={cfg.location_id} />
-            <StatusRow label="Timezone" value={cfg.timezone} />
             {cfg.last_error && (
               <div className="py-3 border-b border-gray-100">
                 <p className="text-xs font-medium text-red-600 mb-1">Last error</p>

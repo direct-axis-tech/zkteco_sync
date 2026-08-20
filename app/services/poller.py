@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from zk import ZK
 from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 
+from app import config
 from app.database import SessionLocal
 from app.models import AttendanceLog, Device, DeviceEmployee, Employee
 
@@ -152,6 +153,10 @@ def pull_attendance(serial_number: str) -> dict:
                     status=att.status,
                     punch=att.punch,
                     source="sdk_pull",
+                    # pyzk hands back the device's own naive wall-clock, same
+                    # as a PUSH record. Stored as-is and labelled, never
+                    # converted (D10).
+                    timezone=device.timezone or config.DEFAULT_DEVICE_TIMEZONE,
                 ))
 
             db.bulk_save_objects(new_rows)

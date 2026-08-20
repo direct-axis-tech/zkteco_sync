@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from datetime import datetime
 from typing import Literal, Optional, List
 
@@ -37,6 +37,11 @@ class DeviceOut(BaseModel):
     # device's session token and the third is a long diagnostic blob, and
     # neither belongs in a device listing.
     protocol: str = "att"
+    # What this device's clock digits mean (D10). Read-only on this shape and
+    # on DeviceUpdate: changing it relabels every historical record for the
+    # device, so it has its own endpoint (PATCH /devices/{sn}/timezone) rather
+    # than riding along with a name or IP edit.
+    timezone: Optional[str] = None
     # SDK comm key (D7) — deliberately no `comm_key` field here. The key is a
     # secret and this is the only shape a device is allowed to leave the
     # server in; only whether one is set is observable.
@@ -78,9 +83,29 @@ class AttendanceOut(BaseModel):
     punch: int
     source: str
     created_at: Optional[datetime] = None
+    # The zone those digits are in — snapshotted from the device when the
+    # record was stored. Null only for a row that predates the column and
+    # whose device is gone; the UI shows the label it is given and never
+    # invents one.
+    timezone: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+    @field_serializer("timestamp")
+    def _wall_clock(self, value: datetime) -> str:
+        """Emit the punch time as the bare wall-clock the device sent.
+
+        ``UTCDateTime`` stamps ``tzinfo=utc`` when it reads any DateTime
+        column, which is right for ``created_at``, ``last_seen`` and session
+        expiry — those really are UTC — and wrong for this one, which is the
+        device's local clock. Serialising it with an offset is what let the
+        browser "helpfully" re-convert a 14:48 punch into 18:48. So the offset
+        is dropped here, at the boundary, rather than by changing UTCDateTime
+        and disturbing every genuinely-UTC column in the app. The digits are
+        untouched; ``timezone`` above says what they mean.
+        """
+        return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
 class CommandCreate(BaseModel):
@@ -194,6 +219,15 @@ class DeviceUpdate(BaseModel):
     # SDK comm key (D7) — write-only. Omit to leave unchanged; send 0 to clear
     # it back to "no key".
     comm_key: Optional[int] = Field(default=None, ge=0)
+    # `timezone` is deliberately absent, for the same reason `status` is.
+    # Changing a device's zone relabels every attendance record it ever
+    # pushed; that is a deliberate act with its own endpoint
+    # (PATCH /devices/{sn}/timezone), not a field that can be nudged while
+    # someone is editing an IP address.
+
+
+class DeviceTimezoneUpdate(BaseModel):
+    timezone: str   # IANA name, e.g. "Asia/Dubai"; validated against zoneinfo
 
 
 # --- ADMS pairing window ---

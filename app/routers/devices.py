@@ -3,19 +3,20 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 from zk.finger import Finger
 
-from app import audit
+from app import audit, config
 from app.database import get_db
 from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate, User
 from app.deps import require_admin, require_auth
 from app.net import client_ip, valid_cidrs
 from app.schemas import (
-    BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut, DeviceUpdate,
-    EnrollRequest, FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
-    SetTimeRequest, UnlockRequest,
+    BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut,
+    DeviceTimezoneUpdate, DeviceUpdate, EnrollRequest, FingerprintTemplateOut,
+    LcdRequest, PairingOpenRequest, PairingWindowOut, SetTimeRequest, UnlockRequest,
 )
 from app.services import pairing
 from app.services.poller import pull_attendance, pull_device, pull_employees
@@ -75,6 +76,10 @@ def create_device(
         status="approved",
         approved_at=datetime.now(timezone.utc),
         approved_by=admin.username,
+        # Seeded from the configured default, exactly as an auto-registered
+        # serial is. It is not a field on this form: correcting it later is a
+        # deliberate act with its own endpoint, because it relabels history.
+        timezone=config.DEFAULT_DEVICE_TIMEZONE,
     )
     db.add(device)
     db.commit()
@@ -183,6 +188,68 @@ def update_device(
                      ip=client_ip(request), detail="; ".join(parts))
     return device
 
+
+# ---------------------------------------------------------------------------
+# Device timezone — its own endpoint, because it rewrites history's labels
+# ---------------------------------------------------------------------------
+
+@router.patch("/{sn}/timezone", response_model=DeviceOut)
+def update_device_timezone(
+    sn: str,
+    payload: DeviceTimezoneUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Change what this device's clock digits mean, and relabel its history.
+
+    Separate from PATCH /{sn} on purpose. Every other field on a device
+    affects the device; this one affects every attendance record the device
+    has ever pushed, because those rows carry a snapshot of it. Nobody should
+    be able to trigger that while renaming a door.
+
+    What this is for: a device whose zone was recorded wrongly. It corrects a
+    *label*. It is NOT a relocation tool — the stored wall-clock digits are
+    never touched, so relabelling a device that has physically moved would
+    claim its old punches happened in the new zone, which is false.
+    """
+    device = _get_device_or_404(sn, db)
+
+    new_tz = (payload.timezone or "").strip()
+    if not config.valid_timezone(new_tz):
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{new_tz}' is not a known IANA timezone name. "
+                   "Use a name from the tz database, e.g. Asia/Dubai.",
+        )
+
+    old_tz = device.timezone
+    if new_tz == old_tz:
+        return device   # nothing to relabel, nothing to audit
+
+    device.timezone = new_tz
+    db.commit()
+
+    # One statement, never a loop: a device that has been running for a year
+    # can easily own six figures of rows. Only the label column is written —
+    # `timestamp` does not appear in this UPDATE at all, which is the whole
+    # guarantee: the digits a device reported stay exactly as reported.
+    relabelled = db.execute(
+        text("UPDATE attendance_logs SET timezone = :tz WHERE device_sn = :sn"),
+        {"tz": new_tz, "sn": sn},
+    ).rowcount
+    db.commit()
+    db.refresh(device)
+
+    log.info("device %s timezone %s -> %s, relabelled %s attendance row(s)",
+             sn, old_tz, new_tz, relabelled)
+    audit.record(
+        db, admin.username, "device_timezone_change", target=sn,
+        ip=client_ip(request),
+        detail=f"timezone {old_tz or '(unset)'} -> {new_tz}; "
+               f"{relabelled} attendance record(s) relabelled; punch times unchanged",
+    )
+    return device
 
 # ---------------------------------------------------------------------------
 # Device approval

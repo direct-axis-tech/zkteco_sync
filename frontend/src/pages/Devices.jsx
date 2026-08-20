@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import DeviceFormModal from '../components/DeviceFormModal'
+import DeviceTimezoneModal from '../components/DeviceTimezoneModal'
 import DeviceSecurityDrawer from '../components/DeviceSecurityDrawer'
 import KebabMenu from '../components/KebabMenu'
 import DeviceInfoDrawer from '../components/DeviceInfoDrawer'
@@ -76,6 +77,7 @@ export default function Devices() {
   const [pairing, setPairing] = useState(null)
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
+  const [tzModal, setTzModal] = useState(null)   // device whose timezone is being changed
   const [drawer, setDrawer] = useState(null) // { type, device }
   const [pwConfirm, setPwConfirm] = useState(null) // { title, description, onConfirm }
   const [toast, setToast] = useState(null)
@@ -141,6 +143,13 @@ export default function Devices() {
       showToast('Device updated')
     }
     setModal(null)
+    loadDevices()
+  }
+
+  async function handleSaveTimezone(timezone) {
+    const updated = await api.devices.setTimezone(tzModal.serial_number, timezone)
+    showToast(`Timezone set to ${updated.timezone}`)
+    setTzModal(null)
     loadDevices()
   }
 
@@ -351,6 +360,7 @@ export default function Devices() {
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Address</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Status</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Trust</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500">Timezone</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Last Seen</th>
                 <th className="px-4 py-3" />
               </tr>
@@ -370,6 +380,24 @@ export default function Devices() {
                   <td className="px-4 py-3">
                     <TrustBadge status={device.status} ipLocked={device.ip_check_enabled} />
                   </td>
+                  <td className="px-4 py-3">
+                    {/* Read-only. Changing it relabels every record this device
+                        pushed, so it is edited only through its own modal. */}
+                    <span className="inline-flex items-center gap-2">
+                      <span className="text-gray-600 text-xs">{device.timezone || '—'}</span>
+                      {isAdmin && (
+                        <button
+                          onClick={() => setTzModal(device)}
+                          title="Change what this device's punch times mean"
+                          aria-label={`Change timezone for ${device.serial_number}`}
+                          data-testid={`edit-timezone-${device.serial_number}`}
+                          className="text-xs text-blue-500 hover:text-blue-700 underline"
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </span>
+                  </td>
                   <td className="px-4 py-3 text-gray-400 text-xs">{formatDate(device.last_seen)}</td>
                   <td className="px-4 py-3 text-right">
                     <KebabMenu items={menuItems(device)} />
@@ -387,6 +415,14 @@ export default function Devices() {
           device={modal.device}
           onSave={handleSave}
           onClose={() => setModal(null)}
+        />
+      )}
+
+      {tzModal && (
+        <DeviceTimezoneModal
+          device={tzModal}
+          onSave={handleSaveTimezone}
+          onClose={() => setTzModal(null)}
         />
       )}
 

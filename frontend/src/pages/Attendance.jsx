@@ -76,10 +76,14 @@ export default function Attendance() {
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
 
-  function formatTs(iso) {
-    return new Date(iso).toLocaleString(undefined, {
-      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-    })
+  // Rendered exactly as stored, with no Date() and no toLocaleString(). A
+  // punch time is the device's own wall-clock; the browser has no idea what
+  // zone the device is in, and converting by the viewer's locale is precisely
+  // how a 14:48 punch came to be shown as 18:48. The server sends the digits
+  // and their timezone label; both are displayed as given.
+  function formatTs(value) {
+    if (!value) return '—'
+    return String(value).replace('T', ' ').slice(0, 19)
   }
 
   function employeeName(userId) {
@@ -161,7 +165,10 @@ export default function Attendance() {
             <thead>
               <tr className="border-b border-gray-200 bg-gray-50">
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Employee</th>
-                <th className="text-left px-4 py-3 font-medium text-gray-500">Timestamp</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500">
+                  Timestamp
+                  <span className="ml-1.5 font-normal text-gray-400 text-xs">device local time</span>
+                </th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Status</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Device</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Source</th>
@@ -177,7 +184,12 @@ export default function Attendance() {
                     <p className="font-medium text-gray-900">{employeeName(row.user_id)}</p>
                     <p className="text-xs text-gray-400 font-mono">{row.user_id}</p>
                   </td>
-                  <td className="px-4 py-3 text-gray-700 tabular-nums">{formatTs(row.timestamp)}</td>
+                  <td className="px-4 py-3 text-gray-700 tabular-nums">
+                    {formatTs(row.timestamp)}
+                    <span className="ml-2 text-xs text-gray-400 tracking-normal">
+                      {row.timezone || 'unlabelled'}
+                    </span>
+                  </td>
                   <td className="px-4 py-3"><StatusBadge status={row.status} /></td>
                   <td className="px-4 py-3 text-gray-400 font-mono text-xs">{row.device_sn}</td>
                   <td className="px-4 py-3 text-gray-400 text-xs">{row.source}</td>

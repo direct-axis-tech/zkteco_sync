@@ -26,6 +26,7 @@ from sqlalchemy import Enum as SAEnum
 from sqlalchemy import inspect, text
 from sqlalchemy.schema import CreateIndex
 
+from app import config
 from app.database import Base
 
 # Importing the models is what populates Base.metadata — without it every
@@ -177,6 +178,7 @@ def _run_data_fixups(engine, added: set) -> None:
     value an operator has since chosen.
     """
     _approve_pre_existing_devices(engine, added)
+    _stamp_timezone_provenance(engine, added)
 
 
 def _approve_pre_existing_devices(engine, added: set) -> None:
@@ -202,3 +204,74 @@ def _approve_pre_existing_devices(engine, added: set) -> None:
         "newly seen serials from now on require explicit approval",
         result.rowcount,
     )
+
+
+def _stamp_timezone_provenance(engine, added: set) -> None:
+    """Give pre-existing devices and records the timezone they always had.
+
+    D10 records what a stored wall-clock time means instead of guessing at it.
+    A device that has been pushing punches for months was already in some
+    particular zone; the rows are not wrong, they are unlabelled. So on the
+    one boot that introduces each column, the label is filled in:
+
+    * every device gets DEFAULT_DEVICE_TIMEZONE — the operator's own answer to
+      "what are these clocks set to";
+    * every attendance record gets *its own device's* zone, not the global
+      default, so a multi-site install is labelled correctly, falling back to
+      the default only for rows whose device row no longer exists.
+
+    Keyed on ``added`` like every fixup here, so it fires exactly once and can
+    never later overwrite a zone an operator has since chosen. Both statements
+    are single UPDATEs — attendance_logs can hold hundreds of thousands of
+    rows and a row-by-row loop would be unusable.
+    """
+    default_tz = config.DEFAULT_DEVICE_TIMEZONE
+
+    if ("devices", "timezone") in added:
+        # The ALTER already carried DEFAULT '<zone>', which MariaDB, MySQL,
+        # PostgreSQL and MSSQL all apply to existing rows. This is the belt to
+        # that braces: it costs one statement and covers the case where the
+        # column had to be added NULL.
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE devices SET timezone = :tz "
+                    "WHERE timezone IS NULL OR timezone = ''"
+                ),
+                {"tz": default_tz},
+            )
+        log.warning(
+            "migration: labelled %s pre-existing device(s) as timezone=%s — "
+            "correct this per device in Devices if a terminal is set to another zone",
+            result.rowcount, default_tz,
+        )
+
+    if ("attendance_logs", "timezone") in added:
+        # One correlated-subquery UPDATE rather than a JOIN: UPDATE ... FROM
+        # and UPDATE ... JOIN are spelled differently on every dialect this
+        # app supports, whereas this form is portable to all four. It reads
+        # from `devices` and writes to `attendance_logs`, so MySQL's
+        # "can't-select-from-the-table-you're-updating" rule does not apply.
+        #
+        # `devices` is always there on a real install, but this module also
+        # runs against partial schemas (an install mid-upgrade, a fixture), and
+        # a backfill must never be the thing that stops a boot — so without it,
+        # fall back to the flat default rather than failing.
+        if "devices" in set(inspect(engine).get_table_names()):
+            statement = text(
+                "UPDATE attendance_logs SET timezone = COALESCE("
+                "  (SELECT d.timezone FROM devices d "
+                "   WHERE d.serial_number = attendance_logs.device_sn), :tz) "
+                "WHERE timezone IS NULL"
+            )
+        else:
+            statement = text(
+                "UPDATE attendance_logs SET timezone = :tz WHERE timezone IS NULL"
+            )
+        with engine.begin() as conn:
+            result = conn.execute(statement, {"tz": default_tz})
+        log.warning(
+            "migration: labelled %s existing attendance record(s) with their "
+            "device's timezone — no punch time was changed, only labelled",
+            result.rowcount,
+        )

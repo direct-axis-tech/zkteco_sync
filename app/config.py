@@ -7,6 +7,8 @@ half-way through a request. Later hardening units add keys to this module.
 
 import logging
 import os
+import zoneinfo
+from functools import lru_cache
 
 from dotenv import load_dotenv
 
@@ -67,6 +69,48 @@ LOGIN_LOCKOUT_MINUTES = _get_int("LOGIN_LOCKOUT_MINUTES", 15)
 ENABLE_DOCS = _get_bool("ENABLE_DOCS", False)
 MAX_REQUEST_BYTES = _get_int("MAX_REQUEST_BYTES", 2 * 1024 * 1024)
 ADMS_PAIRING_MINUTES = _get_int("ADMS_PAIRING_MINUTES", 15)
+
+
+# ---------------------------------------------------------------------------
+# Timezone provenance
+# ---------------------------------------------------------------------------
+# A ZKTeco device sends a bare wall-clock string with no offset and no zone
+# name ("time=2026-08-20 14:48:22"). The digits are correct; what is missing
+# is what they *mean*. This is the zone a newly registered device is assumed
+# to be set to, and it is stamped onto the device row, which in turn is
+# snapshotted onto every attendance record. Nothing here ever converts a
+# time — it only labels one.
+
+@lru_cache(maxsize=1)
+def _known_timezones() -> frozenset:
+    """The IANA zone names this machine's tz database knows about."""
+    return frozenset(zoneinfo.available_timezones())
+
+
+def valid_timezone(name) -> bool:
+    """True for an IANA zone name this machine can resolve, e.g. 'Asia/Dubai'."""
+    return bool(name) and name in _known_timezones()
+
+
+DEFAULT_DEVICE_TIMEZONE = _get("DEFAULT_DEVICE_TIMEZONE", "Asia/Dubai")
+
+# Unlike the checks in _problems() below, this one raises in *every*
+# environment. Those are deployment-posture questions where a development
+# machine legitimately differs; an unresolvable zone name is simply a typo,
+# and letting it through would silently stamp a meaningless label onto every
+# device and every attendance record the install goes on to collect — a data
+# error that is invisible until someone tries to interpret a punch time.
+if not valid_timezone(DEFAULT_DEVICE_TIMEZONE):
+    raise RuntimeError(
+        f"DEFAULT_DEVICE_TIMEZONE='{DEFAULT_DEVICE_TIMEZONE}' is not an IANA "
+        "timezone name this system recognises.\n"
+        "Use a name from the tz database, e.g.\n"
+        "    DEFAULT_DEVICE_TIMEZONE=Asia/Dubai\n"
+        "List the valid names with:\n"
+        "    python -c \"import zoneinfo; print('\\n'.join(sorted(zoneinfo.available_timezones())))\"\n"
+        "If that list comes back empty, this machine has no tz database — "
+        "install the 'tzdata' package."
+    )
 
 
 def _problems() -> list:

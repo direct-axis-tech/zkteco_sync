@@ -13,12 +13,18 @@ from app.services.hrm_sync import run_sync
 router = APIRouter(prefix="/hrm-sync", tags=["hrm-sync"], dependencies=[Depends(require_auth)])
 
 
+# `timezone` is gone from both this shape and the response (D10). A punch's
+# timezone is a property of the record that carries it, not of the HRM
+# connection: one global setting could only ever be right for one device, and
+# it was being applied to a digit string it had no relationship to. The
+# hrm_integration.timezone column is deliberately left in place — migrations
+# here are additive-only and dropping it would gain nothing — but nothing
+# reads it any more.
 class HrmConfigUpdate(BaseModel):
     endpoint: Optional[str] = None
     secret: Optional[str] = None
     location_id: Optional[str] = None
     interval_seconds: Optional[int] = None
-    timezone: Optional[str] = None
     enabled: Optional[bool] = None
     last_synced_id: Optional[int] = None
 
@@ -39,7 +45,6 @@ def _serialize(row: HrmIntegration) -> dict:
         "secret_set":        bool(row.secret),
         "location_id":       row.location_id,
         "interval_seconds":  row.interval_seconds,
-        "timezone":          row.timezone,
         "enabled":           row.enabled,
         "last_synced_id":    row.last_synced_id,
         "last_run_at":       row.last_run_at,

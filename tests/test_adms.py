@@ -33,6 +33,9 @@ from datetime import datetime
 # production fail-fast path regardless of what .env happens to say.
 os.environ.setdefault("APP_ENV", "development")
 os.environ.setdefault("SECRET_KEY", "x" * 48)
+# Pinned so the timezone assertions below do not depend on what the
+# operator happens to have in .env.
+os.environ.setdefault("DEFAULT_DEVICE_TIMEZONE", "Asia/Dubai")
 
 from fastapi import FastAPI                                    # noqa: E402
 from fastapi.testclient import TestClient                      # noqa: E402
@@ -40,6 +43,7 @@ from sqlalchemy import create_engine, inspect, text            # noqa: E402
 from sqlalchemy.orm import sessionmaker                        # noqa: E402
 from sqlalchemy.pool import StaticPool                         # noqa: E402
 
+from app import config                                         # noqa: E402
 from app.database import Base, get_db                          # noqa: E402
 from app.models import AdmsPairing, AttendanceLog, Device      # noqa: E402
 from app.routers import adms                                   # noqa: E402
@@ -918,6 +922,570 @@ class MigrationTests(unittest.TestCase):
         # The pre-existing row is untouched and its new columns are empty.
         self.assertEqual(row, (0, 1, None))
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 7. Timezone provenance (D10)
+# ---------------------------------------------------------------------------
+#
+# A ZKTeco device sends "time=2026-08-20 14:48:22" — no offset, no zone name.
+# The digits were always right; nothing recorded what they meant, so two
+# separate layers guessed differently and a 14:48 punch was displayed as
+# 18:48. These tests assert the thing that actually fixes that: the digits are
+# stored and pushed *unchanged*, and a label travels alongside them.
+
+class RecordTimezoneStampTests(AdmsTestCase):
+    """Every ingest path must label what it stores. Both, not one."""
+
+    def test_rtlog_stamps_the_device_timezone_on_the_record(self):
+        self.add_device(ACC_SN, protocol="acc", timezone="Asia/Dubai")
+        self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=rtlog",
+            content="time=2026-08-20 14:48:22\tpin=1001\tevent=0\t"
+                    "inoutstatus=0\tverifytype=1\tindex=501\n",
+        )
+        row = self.attendance_rows()[0]
+        self.assertEqual(row.timezone, "Asia/Dubai")
+        # And the digits are the device's own, not shifted by four hours.
+        self.assertEqual(row.timestamp.replace(tzinfo=None),
+                         datetime(2026, 8, 20, 14, 48, 22))
+
+    def test_attlog_stamps_the_device_timezone_on_the_record(self):
+        self.add_device(LEGACY_SN, timezone="Asia/Dubai")
+        self.client.post(
+            f"/iclock/cdata?SN={LEGACY_SN}&table=ATTLOG",
+            content="1001\t2026-08-20 14:48:22\t0\t1\n",
+        )
+        row = self.attendance_rows()[0]
+        self.assertEqual(row.timezone, "Asia/Dubai")
+        self.assertEqual(row.timestamp.replace(tzinfo=None),
+                         datetime(2026, 8, 20, 14, 48, 22))
+
+    def test_each_device_stamps_its_own_zone_not_a_global_one(self):
+        """Two sites, two zones — the point of a per-record snapshot."""
+        self.add_device(ACC_SN, protocol="acc", timezone="Asia/Dubai")
+        self.add_device(LEGACY_SN, timezone="Europe/London")
+        self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=rtlog",
+            content="time=2026-08-20 14:48:22\tpin=1001\tevent=0\t"
+                    "inoutstatus=0\tindex=601\n",
+        )
+        self.client.post(
+            f"/iclock/cdata?SN={LEGACY_SN}&table=ATTLOG",
+            content="2002\t2026-08-20 14:48:22\t0\t1\n",
+        )
+        by_sn = {r.device_sn: r for r in self.attendance_rows()}
+        self.assertEqual(by_sn[ACC_SN].timezone, "Asia/Dubai")
+        self.assertEqual(by_sn[LEGACY_SN].timezone, "Europe/London")
+        # Same wall-clock digits, different meanings — which is exactly the
+        # information that used to be lost.
+        self.assertEqual(by_sn[ACC_SN].timestamp.replace(tzinfo=None),
+                         by_sn[LEGACY_SN].timestamp.replace(tzinfo=None))
+
+    def test_device_with_no_zone_falls_back_to_the_configured_default(self):
+        """A row that slipped through must never be stored unlabelled."""
+        self.add_device(ACC_SN, protocol="acc", timezone=None)
+        self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=rtlog",
+            content="time=2026-08-20 14:48:22\tpin=1001\tevent=0\t"
+                    "inoutstatus=0\tindex=701\n",
+        )
+        self.assertEqual(self.attendance_rows()[0].timezone,
+                         config.DEFAULT_DEVICE_TIMEZONE)
+
+    def test_auto_registered_device_is_seeded_with_the_default_zone(self):
+        db = self.Session()
+        try:
+            db.add(AdmsPairing(id=1, open_until=datetime(2099, 1, 1)))
+            db.commit()
+        finally:
+            db.close()
+
+        self.client.get("/iclock/cdata?SN=D10SEEDTEST01&options=all")
+        device = self.get_device("D10SEEDTEST01")
+        self.assertIsNotNone(device)
+        self.assertEqual(device.timezone, config.DEFAULT_DEVICE_TIMEZONE)
+
+
+class TimezoneRelabelTests(unittest.TestCase):
+    """The bulk relabel: labels change, punch times never do.
+
+    This is the operation with teeth — one call rewrites a column on every
+    historical row for a device — so the assertions read the raw stored
+    timestamp text before and after and require it byte-identical.
+    """
+
+    OTHER_SN = "D10OTHERDEV01"
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+
+        from app.deps import require_admin, require_auth
+        from app.models import User
+        from app.routers import devices as devices_router
+
+        app = FastAPI()
+        app.include_router(devices_router.router)
+
+        def _override_get_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        # A signed-in admin is a precondition of this endpoint, not the
+        # subject of this test — D1/D6 own that. Stubbed so these tests stay
+        # about the relabel.
+        admin = User(id=1, username="tester", role="admin", password_hash="x")
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[require_auth] = lambda: admin
+        app.dependency_overrides[require_admin] = lambda: admin
+        self.client = TestClient(app, client=("203.0.113.10", 40000))
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=ACC_SN, ip_address="203.0.113.10", port=4370,
+                          name="Main Door", status="approved", timezone="UTC"))
+            db.add(Device(serial_number=self.OTHER_SN, ip_address="203.0.113.11", port=4370,
+                          name="Other Site", status="approved", timezone="Europe/London"))
+            for i, moment in enumerate([
+                datetime(2026, 8, 20, 14, 48, 22),
+                datetime(2026, 8, 20, 17, 2, 0),
+                datetime(2026, 8, 21, 8, 30, 15),
+            ]):
+                db.add(AttendanceLog(device_sn=ACC_SN, user_id=f"100{i}", timestamp=moment,
+                                     status=0, punch=1, source="adms_push", timezone="UTC"))
+            db.add(AttendanceLog(device_sn=self.OTHER_SN, user_id="2001",
+                                 timestamp=datetime(2026, 8, 20, 9, 0, 0),
+                                 status=0, punch=1, source="adms_push",
+                                 timezone="Europe/London"))
+            db.commit()
+        finally:
+            db.close()
+
+    def tearDown(self):
+        self.client.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def raw_rows(self, sn):
+        """(timestamp, timezone) straight from SQLite, as stored text."""
+        with self.engine.connect() as conn:
+            return conn.execute(
+                text("SELECT timestamp, timezone FROM attendance_logs "
+                     "WHERE device_sn = :sn ORDER BY id"),
+                {"sn": sn},
+            ).fetchall()
+
+    def test_relabel_updates_every_record_and_leaves_digits_identical(self):
+        before = self.raw_rows(ACC_SN)
+
+        response = self.client.patch(f"/devices/{ACC_SN}/timezone",
+                                     json={"timezone": "Asia/Dubai"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["timezone"], "Asia/Dubai")
+
+        after = self.raw_rows(ACC_SN)
+        self.assertEqual(len(after), 3)
+        # Every label changed...
+        self.assertEqual([r[1] for r in after], ["Asia/Dubai"] * 3)
+        # ...and not one digit of any punch time did.
+        self.assertEqual([r[0] for r in before], [r[0] for r in after])
+
+    def test_relabel_does_not_touch_another_devices_rows(self):
+        before_other = self.raw_rows(self.OTHER_SN)
+        self.client.patch(f"/devices/{ACC_SN}/timezone", json={"timezone": "Asia/Dubai"})
+        self.assertEqual(self.raw_rows(self.OTHER_SN), before_other)
+
+    def test_relabel_is_audited_with_the_row_count(self):
+        from app.models import AuditLog
+
+        self.client.patch(f"/devices/{ACC_SN}/timezone", json={"timezone": "Asia/Dubai"})
+        db = self.Session()
+        try:
+            entry = db.query(AuditLog).filter_by(action="device_timezone_change").first()
+        finally:
+            db.close()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.target, ACC_SN)
+        self.assertEqual(entry.actor, "tester")
+        self.assertIn("UTC -> Asia/Dubai", entry.detail)
+        self.assertIn("3 attendance record(s) relabelled", entry.detail)
+
+    def test_an_unknown_zone_is_refused_and_changes_nothing(self):
+        before = self.raw_rows(ACC_SN)
+        response = self.client.patch(f"/devices/{ACC_SN}/timezone",
+                                     json={"timezone": "Asia/Dubaii"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not a known IANA timezone", response.json()["detail"])
+        self.assertEqual(self.raw_rows(ACC_SN), before)
+
+    def test_setting_the_same_zone_is_a_no_op(self):
+        before = self.raw_rows(ACC_SN)
+        response = self.client.patch(f"/devices/{ACC_SN}/timezone",
+                                     json={"timezone": "UTC"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.raw_rows(ACC_SN), before)
+
+        from app.models import AuditLog
+        db = self.Session()
+        try:
+            self.assertEqual(
+                db.query(AuditLog).filter_by(action="device_timezone_change").count(), 0
+            )
+        finally:
+            db.close()
+
+    def test_the_generic_device_patch_cannot_change_the_timezone(self):
+        """No if/else dance: one deliberate action, one endpoint."""
+        response = self.client.patch(f"/devices/{ACC_SN}",
+                                     json={"name": "Renamed", "timezone": "Asia/Dubai"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["name"], "Renamed")
+        self.assertEqual(response.json()["timezone"], "UTC")
+        self.assertEqual([r[1] for r in self.raw_rows(ACC_SN)], ["UTC"] * 3)
+
+
+class HrmMappingTests(unittest.TestCase):
+    """What actually leaves the building. The HRM has been damaged once by a
+    bad push, so this asserts the payload field by field."""
+
+    def _map(self, record, device=None):
+        from app.services.hrm_sync import _map
+        dev_cache = {device.serial_number: device} if device is not None else {}
+        return _map(record, {}, dev_cache, "1")
+
+    def test_the_records_own_timezone_is_sent_with_unchanged_digits(self):
+        record = AttendanceLog(
+            id=7, device_sn=ACC_SN, user_id="1001",
+            timestamp=datetime(2026, 8, 20, 14, 48, 22),
+            status=0, punch=1, source="adms_push", timezone="Asia/Dubai",
+        )
+        device = Device(serial_number=ACC_SN, ip_address="203.0.113.10",
+                        name="Main Door", timezone="Asia/Dubai")
+        payload = self._map(record, device)
+
+        self.assertEqual(payload["timezone"], "Asia/Dubai")
+        # Byte-for-byte what the device reported. No +04:00, no shift to 10:48.
+        self.assertEqual(payload["authdatetime"], "2026-08-20 14:48:22")
+        self.assertEqual(payload["authdate"], "2026-08-20")
+        self.assertEqual(payload["authtime"], "14:48:22")
+
+    def test_a_records_own_label_wins_over_the_devices_current_one(self):
+        """A device relabelled after the fact must not silently re-mean rows
+        that were never relabelled with it."""
+        record = AttendanceLog(
+            id=8, device_sn=ACC_SN, user_id="1001",
+            timestamp=datetime(2026, 8, 20, 14, 48, 22),
+            status=0, punch=1, source="adms_push", timezone="Europe/London",
+        )
+        device = Device(serial_number=ACC_SN, ip_address="203.0.113.10",
+                        timezone="Asia/Dubai")
+        self.assertEqual(self._map(record, device)["timezone"], "Europe/London")
+
+    def test_a_null_record_timezone_falls_back_to_the_device(self):
+        record = AttendanceLog(
+            id=9, device_sn=ACC_SN, user_id="1001",
+            timestamp=datetime(2026, 8, 20, 14, 48, 22),
+            status=0, punch=1, source="adms_push", timezone=None,
+        )
+        device = Device(serial_number=ACC_SN, ip_address="203.0.113.10",
+                        timezone="Europe/London")
+        payload = self._map(record, device)
+        self.assertEqual(payload["timezone"], "Europe/London")
+        self.assertEqual(payload["authdatetime"], "2026-08-20 14:48:22")
+
+    def test_a_null_record_and_missing_device_fall_back_to_the_default(self):
+        """Never blank, never a crash — the push must still go out labelled."""
+        record = AttendanceLog(
+            id=10, device_sn="GONE", user_id="1001",
+            timestamp=datetime(2026, 8, 20, 14, 48, 22),
+            status=0, punch=1, source="adms_push", timezone=None,
+        )
+        payload = self._map(record)
+        self.assertEqual(payload["timezone"], config.DEFAULT_DEVICE_TIMEZONE)
+        self.assertTrue(payload["timezone"])
+        self.assertEqual(payload["authdatetime"], "2026-08-20 14:48:22")
+
+    def test_the_hrm_config_timezone_is_no_longer_part_of_the_api(self):
+        from app.routers.hrm_sync import HrmConfigUpdate, _serialize
+        from app.models import HrmIntegration
+
+        self.assertNotIn("timezone", HrmConfigUpdate.model_fields)
+        # The column stays (migrations are additive-only) but nothing reads it.
+        row = HrmIntegration(id=1, endpoint="http://example.invalid", secret="s",
+                             location_id="1", timezone="America/New_York")
+        self.assertNotIn("timezone", _serialize(row))
+
+
+class TimezoneMigrationTests(unittest.TestCase):
+    """An upgraded install must come up labelled, with no manual step."""
+
+    LEGACY_DEVICES = (
+        "CREATE TABLE devices ("
+        " id INTEGER PRIMARY KEY,"
+        " serial_number VARCHAR(50) NOT NULL,"
+        " ip_address VARCHAR(50) NOT NULL,"
+        " port INTEGER,"
+        " name VARCHAR(100),"
+        " last_seen DATETIME,"
+        " is_online BOOLEAN,"
+        " created_at DATETIME"
+        "{extra})"
+    )
+    LEGACY_ATTENDANCE = (
+        "CREATE TABLE attendance_logs ("
+        " id INTEGER PRIMARY KEY,"
+        " device_sn VARCHAR(50) NOT NULL,"
+        " user_id VARCHAR(24) NOT NULL,"
+        " timestamp DATETIME NOT NULL,"
+        " status INTEGER NOT NULL,"
+        " punch INTEGER,"
+        " source VARCHAR(10) NOT NULL,"
+        " created_at DATETIME"
+        ")"
+    )
+
+    def _engine(self, devices_extra=""):
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        with engine.begin() as conn:
+            conn.execute(text(self.LEGACY_DEVICES.format(extra=devices_extra)))
+            conn.execute(text(self.LEGACY_ATTENDANCE))
+        return engine
+
+    def test_existing_devices_and_records_are_labelled_with_the_default(self):
+        from app.migrations import run_migrations
+
+        engine = self._engine()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO devices (serial_number, ip_address, port)"
+                " VALUES ('ESY4241100079', '10.0.0.5', 4370)"
+            ))
+            conn.execute(text(
+                "INSERT INTO attendance_logs"
+                " (device_sn, user_id, timestamp, status, punch, source)"
+                " VALUES ('ESY4241100079', '1001', '2026-08-01 09:00:00', 0, 1, 'adms_push')"
+            ))
+
+        run_migrations(engine)
+
+        with engine.connect() as conn:
+            device_tz = conn.execute(text("SELECT timezone FROM devices")).scalar()
+            stamp, record_tz = conn.execute(text(
+                "SELECT timestamp, timezone FROM attendance_logs"
+            )).fetchone()
+        self.assertEqual(device_tz, config.DEFAULT_DEVICE_TIMEZONE)
+        self.assertEqual(record_tz, config.DEFAULT_DEVICE_TIMEZONE)
+        # The backfill labels. It does not rewrite a single punch time.
+        self.assertEqual(stamp, "2026-08-01 09:00:00")
+        engine.dispose()
+
+    def test_records_inherit_their_own_devices_zone_not_a_global_one(self):
+        """The half-migrated case: devices already labelled, records not yet.
+
+        A multi-site install must not have every historical row stamped with
+        one global answer — each row takes its own device's zone, and only a
+        row whose device is gone falls back to the default.
+        """
+        from app.migrations import run_migrations
+
+        engine = self._engine(devices_extra=", timezone VARCHAR(64)")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO devices (serial_number, ip_address, port, timezone)"
+                " VALUES ('ESY4241100079', '10.0.0.5', 4370, 'Europe/London')"
+            ))
+            conn.execute(text(
+                "INSERT INTO attendance_logs"
+                " (device_sn, user_id, timestamp, status, punch, source) VALUES"
+                " ('ESY4241100079', '1001', '2026-08-01 09:00:00', 0, 1, 'adms_push'),"
+                " ('DECOMMISSIONED', '2002', '2026-08-01 10:00:00', 0, 1, 'adms_push')"
+            ))
+
+        run_migrations(engine)
+
+        with engine.connect() as conn:
+            rows = dict(conn.execute(text(
+                "SELECT device_sn, timezone FROM attendance_logs"
+            )).fetchall())
+        self.assertEqual(rows["ESY4241100079"], "Europe/London")
+        self.assertEqual(rows["DECOMMISSIONED"], config.DEFAULT_DEVICE_TIMEZONE)
+        engine.dispose()
+
+    def test_the_backfill_does_not_re_run_and_overwrite_an_operators_choice(self):
+        from app.migrations import run_migrations
+
+        engine = self._engine()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO devices (serial_number, ip_address, port)"
+                " VALUES ('ESY4241100079', '10.0.0.5', 4370)"
+            ))
+            conn.execute(text(
+                "INSERT INTO attendance_logs"
+                " (device_sn, user_id, timestamp, status, punch, source)"
+                " VALUES ('ESY4241100079', '1001', '2026-08-01 09:00:00', 0, 1, 'adms_push')"
+            ))
+        run_migrations(engine)
+
+        # The operator corrects the zone, then the app restarts.
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE devices SET timezone = 'Europe/London'"))
+            conn.execute(text("UPDATE attendance_logs SET timezone = 'Europe/London'"))
+        run_migrations(engine)
+
+        with engine.connect() as conn:
+            self.assertEqual(
+                conn.execute(text("SELECT timezone FROM devices")).scalar(),
+                "Europe/London")
+            self.assertEqual(
+                conn.execute(text("SELECT timezone FROM attendance_logs")).scalar(),
+                "Europe/London")
+        engine.dispose()
+
+
+class AttendanceSerialisationTests(unittest.TestCase):
+    """What the browser is given. It must be the stored digits, full stop."""
+
+    def test_the_punch_time_is_serialised_with_no_offset_to_convert(self):
+        from app.schemas import AttendanceOut
+
+        record = AttendanceLog(
+            id=1, device_sn=ACC_SN, user_id="1001",
+            timestamp=datetime(2026, 8, 20, 14, 48, 22),
+            status=0, punch=1, source="adms_push", timezone="Asia/Dubai",
+        )
+        payload = AttendanceOut.model_validate(record).model_dump()
+        self.assertEqual(payload["timestamp"], "2026-08-20 14:48:22")
+        self.assertEqual(payload["timezone"], "Asia/Dubai")
+        # No "Z", no "+00:00" — nothing for new Date() to re-zone into 18:48.
+        self.assertNotIn("+", payload["timestamp"])
+        self.assertNotIn("Z", payload["timestamp"])
+        self.assertNotIn("T", payload["timestamp"])
+
+    def test_a_utc_stamped_read_still_serialises_the_stored_digits(self):
+        """UTCDateTime labels every DateTime column it reads as UTC. That is
+        right for created_at and wrong for a punch time, so the offset is
+        dropped here rather than by changing UTCDateTime and disturbing the
+        columns that genuinely are UTC."""
+        from datetime import timezone as dt_timezone
+        from app.schemas import AttendanceOut
+
+        record = AttendanceLog(
+            id=2, device_sn=ACC_SN, user_id="1001",
+            timestamp=datetime(2026, 8, 20, 14, 48, 22, tzinfo=dt_timezone.utc),
+            status=0, punch=1, source="adms_push", timezone="Asia/Dubai",
+        )
+        payload = AttendanceOut.model_validate(record).model_dump()
+        self.assertEqual(payload["timestamp"], "2026-08-20 14:48:22")
+
+
+class TimezoneConfigTests(unittest.TestCase):
+
+    def test_only_real_iana_names_are_accepted(self):
+        self.assertTrue(config.valid_timezone("Asia/Dubai"))
+        self.assertTrue(config.valid_timezone("UTC"))
+        self.assertFalse(config.valid_timezone("Asia/Dubaii"))
+        self.assertFalse(config.valid_timezone("GMT+4"))
+        self.assertFalse(config.valid_timezone(""))
+        self.assertFalse(config.valid_timezone(None))
+
+    def test_the_configured_default_is_itself_valid(self):
+        self.assertTrue(config.valid_timezone(config.DEFAULT_DEVICE_TIMEZONE))
+
+
+class AttendanceListFallbackTests(unittest.TestCase):
+    """A null label must never reach the screen as a blank.
+
+    The rows that predate the column are the *majority* on an upgraded
+    install, so the list endpoint resolves them the same way the HRM push
+    does — record, then device, then configured default.
+    """
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+
+        from app.deps import require_auth
+        from app.models import User
+        from app.routers import attendance as attendance_router
+
+        app = FastAPI()
+        app.include_router(attendance_router.router)
+
+        def _override_get_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        viewer = User(id=1, username="tester", role="viewer", password_hash="x")
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[require_auth] = lambda: viewer
+        self.client = TestClient(app, client=("203.0.113.10", 40000))
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=ACC_SN, ip_address="203.0.113.10", port=4370,
+                          status="approved", timezone="Europe/London"))
+            # Stamped at ingest.
+            db.add(AttendanceLog(device_sn=ACC_SN, user_id="1001",
+                                 timestamp=datetime(2026, 8, 20, 14, 48, 22),
+                                 status=0, punch=1, source="adms_push",
+                                 timezone="Asia/Dubai"))
+            # Predates the column; its device is still here.
+            db.add(AttendanceLog(device_sn=ACC_SN, user_id="1002",
+                                 timestamp=datetime(2026, 8, 20, 15, 0, 0),
+                                 status=0, punch=1, source="adms_push",
+                                 timezone=None))
+            # Predates the column; its device is gone.
+            db.add(AttendanceLog(device_sn="DECOMMISSIONED", user_id="1003",
+                                 timestamp=datetime(2026, 8, 20, 16, 0, 0),
+                                 status=0, punch=1, source="adms_push",
+                                 timezone=None))
+            db.commit()
+        finally:
+            db.close()
+
+    def tearDown(self):
+        self.client.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def test_every_row_comes_back_labelled_and_unconverted(self):
+        items = self.client.get("/attendance").json()["items"]
+        by_user = {i["user_id"]: i for i in items}
+
+        self.assertEqual(by_user["1001"]["timezone"], "Asia/Dubai")
+        self.assertEqual(by_user["1002"]["timezone"], "Europe/London")
+        self.assertEqual(by_user["1003"]["timezone"], config.DEFAULT_DEVICE_TIMEZONE)
+
+        # Not one of them is blank, and not one has an offset the browser
+        # could act on.
+        for item in items:
+            self.assertTrue(item["timezone"])
+            self.assertNotIn("+", item["timestamp"])
+            self.assertNotIn("Z", item["timestamp"])
+
+        self.assertEqual(by_user["1001"]["timestamp"], "2026-08-20 14:48:22")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app import config
 from app.database import SessionLocal
 from app.models import AttendanceLog, Device, Employee, HrmIntegration
 
@@ -58,7 +59,7 @@ def run_sync() -> dict:
         emp_cache = {e.user_id: e for e in db.query(Employee).all()}
         dev_cache = {d.serial_number: d for d in db.query(Device).all()}
 
-        data = [_map(r, emp_cache, dev_cache, cfg.location_id, cfg.timezone) for r in rows]
+        data = [_map(r, emp_cache, dev_cache, cfg.location_id) for r in rows]
 
         total_pushed = 0
         for i in range(0, len(data), BATCH_SIZE):
@@ -105,17 +106,35 @@ def run_sync() -> dict:
         db.close()
 
 
-def _map(r: AttendanceLog, emp_cache, dev_cache, loc, tz) -> dict:
+def _record_timezone(r: AttendanceLog, dev) -> str:
+    """What this record's digits mean, in order of authority.
+
+    The record's own snapshot first — it is the only value that was true at
+    the moment the punch was stored. Then the device's current zone, for a row
+    that predates the column. Then the configured default, so the HRM never
+    receives a blank or missing timezone for a punch time that has no offset
+    of its own: a silently unlabelled record is exactly the ambiguity that put
+    punches four hours out in the first place.
+    """
+    return r.timezone or (dev.timezone if dev is not None else None) or config.DEFAULT_DEVICE_TIMEZONE
+
+
+def _map(r: AttendanceLog, emp_cache, dev_cache, loc) -> dict:
     emp = emp_cache.get(r.user_id)
     dev = dev_cache.get(r.device_sn)
     return {
         "id":             r.id,
         "loc":            loc,
         "empid":          r.user_id,
+        # No conversion, here or anywhere: these are the digits the device
+        # reported, formatted and sent unchanged. What changed in D10 is only
+        # where `timezone` comes from — the record's own snapshot instead of a
+        # single global setting on the HRM config, which was a guess that
+        # applied one answer to every device.
         "authdatetime":   r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
         "authdate":       r.timestamp.strftime("%Y-%m-%d"),
         "authtime":       r.timestamp.strftime("%H:%M:%S"),
-        "timezone":       tz,
+        "timezone":       _record_timezone(r, dev),
         "status":         r.status,
         "devicename":     dev.name if dev and dev.name else r.device_sn,
         "deviceserialno": r.device_sn,

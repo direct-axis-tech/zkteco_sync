@@ -33,7 +33,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
-from app import audit
+from app import audit, config
 from app.database import get_db
 from app.models import AttendanceLog, Device, DeviceCommand
 from app.net import client_ip, ip_in_cidrs
@@ -149,6 +149,10 @@ def _authorise(
             name="Unknown Device",
             status="pending",
             last_ip=ip,
+            # Seeded, not guessed: a device sends bare wall-clock times, so
+            # something has to say what they mean from the first punch. The
+            # operator corrects it per device if this serial sits elsewhere.
+            timezone=config.DEFAULT_DEVICE_TIMEZONE,
         ))
         db.commit()
         log.warning(
@@ -171,6 +175,17 @@ def _authorise(
         return refuse("source address outside the device allowlist")
 
     return device, None
+
+
+def _device_timezone(device: Device) -> str:
+    """The zone label to stamp on rows arriving from this device.
+
+    Falls back to the configured default rather than storing nothing: an
+    unlabelled punch time is exactly the ambiguity D10 exists to remove, so a
+    device row that somehow has no zone still yields a definite answer.
+    """
+    return (device.timezone if device is not None and device.timezone
+            else config.DEFAULT_DEVICE_TIMEZONE)
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +414,7 @@ async def adms_receive(
     if name == "ATTLOG":
         raw = await request.body()
         body = raw.decode("utf-8", errors="ignore")
-        _store_attlog(db, SN, body)
+        _store_attlog(db, SN, body, _device_timezone(device))
         _touch(db, device, request)
         # An ATTLOG push is proof this serial speaks Attendance PUSH, whatever
         # a stale `protocol` column says. It is the mirror of DeviceType=acc,
@@ -421,7 +436,7 @@ async def adms_receive(
     if name == "rtlog":
         raw = await request.body()
         body = raw.decode("utf-8", errors="ignore")
-        _store_rtlog(db, SN, body, client_ip(request))
+        _store_rtlog(db, SN, body, client_ip(request), _device_timezone(device))
         _touch(db, device, request)
         return PlainTextResponse(content="OK")
 
@@ -484,8 +499,12 @@ async def adms_receive(
 # Table parsers
 # ---------------------------------------------------------------------------
 
-def _store_attlog(db: Session, sn: str, body: str) -> None:
-    """Attendance PUSH punches: positional TSV. Unchanged from the original."""
+def _store_attlog(db: Session, sn: str, body: str, tz: str) -> None:
+    """Attendance PUSH punches: positional TSV.
+
+    The parse is unchanged from the original — ``parts[1]`` is stored exactly
+    as the device typed it, never converted. ``tz`` is the label for those
+    digits, snapshotted onto each row (D10)."""
     for line in body.strip().splitlines():
         line = line.strip()
         if not line or "\t" not in line or line.startswith("TableName"):
@@ -514,6 +533,9 @@ def _store_attlog(db: Session, sn: str, body: str) -> None:
                 status=status,
                 punch=punch,
                 source="adms_push",
+                # The device's own wall-clock digits, kept verbatim, plus what
+                # they mean at the moment of the punch.
+                timezone=tz,
             ))
 
     db.commit()
@@ -576,7 +598,7 @@ def _is_person(pin: str) -> bool:
         return True       # a non-numeric PIN is still a person
 
 
-def _store_rtlog(db: Session, sn: str, body: str, ip: str) -> None:
+def _store_rtlog(db: Session, sn: str, body: str, ip: str, tz: str) -> None:
     """Security PUSH access events: keyed TSV, deduped on ``(device_sn, index)``."""
     # Logged verbatim, at INFO, one line per push. This log is the evidence
     # that closes the open question about event codes: correlate it against
@@ -668,6 +690,9 @@ def _store_rtlog(db: Session, sn: str, body: str, ip: str) -> None:
             event_code=fields.get("event", "")[:16] or None,
             verify_type=verify_raw[:32] or None,
             record_index=record_index or None,
+            # `time=` above arrives with no offset and no zone name. It is
+            # stored exactly as sent; this is the label that says what it means.
+            timezone=tz,
         ))
         stored += 1
 

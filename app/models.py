@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import Column, Integer, String, Boolean, UniqueConstraint, Enum, Text
+from app import config
 from app.database import Base, UTCDateTime as DateTime
 
 _now = lambda: datetime.now(timezone.utc)
@@ -70,6 +71,17 @@ class Device(Base):
     # to understand it yet and a parser would be a guess.
     capabilities = Column(Text, nullable=True)
 
+    # What the digits on this device's clock mean. The device sends a bare
+    # wall-clock string with no offset, so without this column the server is
+    # guessing — and it guessed UTC, which is how a 14:48 punch came to be
+    # displayed as 18:48. Seeded from DEFAULT_DEVICE_TIMEZONE at registration
+    # and changed only through the dedicated timezone endpoint, because
+    # changing it relabels every historical record for the device.
+    # A scalar default (not a callable) on purpose: app/migrations.py compiles
+    # it into the ALTER TABLE as a server DEFAULT, so existing rows on an
+    # upgraded install get a value from the database itself.
+    timezone = Column(String(64), nullable=False, default=config.DEFAULT_DEVICE_TIMEZONE)
+
     @property
     def comm_key_set(self) -> bool:
         """The only externally-visible fact about the comm key: whether one
@@ -131,6 +143,19 @@ class AttendanceLog(Base):
     # The device-unique record ID from `rtlog`. Indexed because it is the
     # dedup key for pushes from an `acc` device.
     record_index = Column(String(32), nullable=True, index=True)
+
+    # What `timestamp`'s digits mean: a snapshot of the device's timezone
+    # taken at insert. Snapshotted rather than joined so a record keeps its
+    # own meaning even if the device row is later edited or deleted, and so
+    # two devices in different zones can be read side by side without every
+    # consumer having to resolve the device first.
+    #
+    # Nullable on purpose. Rows that predate this column are backfilled by
+    # app/migrations.py from their device, but a null must never be fatal:
+    # every reader falls back to the device's zone and then to
+    # DEFAULT_DEVICE_TIMEZONE. `timestamp` itself is never rewritten by
+    # anything — not on ingest, not on relabel, not on push.
+    timezone = Column(String(64), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("device_sn", "user_id", "timestamp", name="uq_attendance"),
