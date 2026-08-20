@@ -253,20 +253,39 @@ def _set_protocol(db: Session, device: Device, protocol: str, reason: str, ip: s
     This fires at most a handful of times in a device's life, so it is worth
     an audit row: it records the moment the server changed how it talks to a
     physical door controller, and why.
+
+    Interaction with a manual override (E6, ``Device.protocol_pinned``): every
+    call site below is the device itself producing strong, on-the-wire
+    evidence of which protocol it speaks — ``DeviceType=acc`` on a handshake,
+    an ``ATTLOG`` push, or a call to an endpoint that exists only in one
+    protocol. That evidence is never suppressed, even for a device an operator
+    has just pinned: a genuinely reconfigured terminal must still self-heal,
+    exactly as D9 intended, or the pin would trap it on the wrong protocol
+    forever. What changes is visibility — a pinned device that gets
+    reclassified this way has its pin cleared *and* the audit row says so
+    explicitly, so this never reads as a silent revert of an operator's
+    choice. An unpinned device behaves exactly as before E6.
     """
     if device is None or device.protocol == protocol:
         return
     previous = device.protocol
+    was_pinned = device.protocol_pinned
     device.protocol = protocol
+    if was_pinned:
+        device.protocol_pinned = False
     db.commit()
     log.warning(
-        "ADMS: device %s protocol %s -> %s (%s)",
+        "ADMS: device %s protocol %s -> %s (%s)%s",
         device.serial_number, previous, protocol, reason,
+        " — this OVERRIDES an operator's manual pin, now cleared" if was_pinned else "",
     )
+    detail = f"{previous} -> {protocol} ({reason})"
+    if was_pinned:
+        detail += "; overriding manual pin, pin cleared"
     audit.record(
         db, "device", "adms_protocol_change",
         target=device.serial_number, ip=ip,
-        detail=f"{previous} -> {protocol} ({reason})",
+        detail=detail,
     )
 
 

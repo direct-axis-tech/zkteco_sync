@@ -106,6 +106,9 @@ export const api = {
     // Its own endpoint, not part of update(): changing a device's timezone
     // relabels every attendance record it ever pushed.
     setTimezone: (sn, timezone) => request('PATCH', `/devices/${sn}/timezone`, { timezone }),
+    // Its own endpoint too: correcting the PUSH protocol family pins it
+    // against the automatic DeviceType/ATTLOG classification in adms.py.
+    setProtocol: (sn, protocol) => request('PATCH', `/devices/${sn}/protocol`, { protocol }),
     delete: (sn) => request('DELETE', `/devices/${sn}`),
     pull: (sn) => request('POST', `/devices/${sn}/pull`),
     pullEmployees: (sn) => request('POST', `/devices/${sn}/pull/employees`),

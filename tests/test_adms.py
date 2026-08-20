@@ -1751,6 +1751,265 @@ class TimezoneRelabelTests(unittest.TestCase):
         self.assertEqual([r[1] for r in self.raw_rows(ACC_SN)], ["UTC"] * 3)
 
 
+class ProtocolCorrectionTests(unittest.TestCase):
+    """PATCH /devices/{sn}/protocol — the operator-facing correction (E6).
+
+    Both routers are mounted in this app, unlike TimezoneRelabelTests: the one
+    behaviour that actually needs proving here is how a manual correction
+    interacts with the ADMS module's own automatic classification, so this
+    class exercises the devices endpoint AND real /iclock/* traffic against
+    the same database.
+    """
+
+    SN = "E6PROTOTEST01"
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+
+        from app.deps import require_admin, require_auth
+        from app.models import User
+        from app.routers import devices as devices_router
+
+        app = FastAPI()
+        app.include_router(devices_router.router)
+        app.include_router(adms.router)
+
+        def _override_get_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        admin = User(id=1, username="tester", role="admin", password_hash="x")
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[require_auth] = lambda: admin
+        app.dependency_overrides[require_admin] = lambda: admin
+        self.client = TestClient(app, client=("203.0.113.10", 40000))
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=self.SN, ip_address="203.0.113.10", port=4370,
+                          name="Front Door", status="approved", protocol="att"))
+            db.commit()
+        finally:
+            db.close()
+
+    def tearDown(self):
+        self.client.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def device(self):
+        db = self.Session()
+        try:
+            return db.query(Device).filter_by(serial_number=self.SN).first()
+        finally:
+            db.close()
+
+    def audit_rows(self, action):
+        from app.models import AuditLog
+        db = self.Session()
+        try:
+            return db.query(AuditLog).filter_by(action=action).order_by(AuditLog.id).all()
+        finally:
+            db.close()
+
+    # -- 1. invalid value rejected -----------------------------------------
+
+    def test_an_invalid_protocol_value_is_rejected(self):
+        response = self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "bogus"})
+        self.assertEqual(response.status_code, 422)
+        # Nothing changed: still the seeded default, still unpinned.
+        device = self.device()
+        self.assertEqual(device.protocol, "att")
+        self.assertFalse(device.protocol_pinned)
+
+    def test_a_missing_protocol_field_is_rejected(self):
+        response = self.client.patch(f"/devices/{self.SN}/protocol", json={})
+        self.assertEqual(response.status_code, 422)
+
+    # -- 2. a valid change persists and is audited ---------------------------
+
+    def test_a_valid_change_persists_pins_and_is_audited(self):
+        response = self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "acc"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["protocol"], "acc")
+        self.assertTrue(response.json()["protocol_pinned"])
+
+        device = self.device()
+        self.assertEqual(device.protocol, "acc")
+        self.assertTrue(device.protocol_pinned)
+
+        entries = self.audit_rows("device_protocol_change")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].actor, "tester")
+        self.assertEqual(entries[0].target, self.SN)
+        self.assertIn("att -> acc", entries[0].detail)
+        self.assertIn("manual", entries[0].detail.lower())
+
+    def test_setting_the_same_already_pinned_value_is_a_no_op(self):
+        self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "acc"})
+        before = len(self.audit_rows("device_protocol_change"))
+
+        response = self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "acc"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.audit_rows("device_protocol_change")), before)
+
+    # -- 3. the generic PATCH cannot touch protocol --------------------------
+
+    def test_the_generic_device_patch_cannot_change_protocol(self):
+        """protocol is deliberately absent from DeviceUpdate — prove it."""
+        response = self.client.patch(f"/devices/{self.SN}",
+                                     json={"name": "Renamed", "protocol": "acc"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["name"], "Renamed")
+        # Ignored, not rejected: the field simply is not part of the schema.
+        self.assertEqual(response.json()["protocol"], "att")
+        self.assertFalse(response.json()["protocol_pinned"])
+
+        device = self.device()
+        self.assertEqual(device.protocol, "att")
+        self.assertFalse(device.protocol_pinned)
+        self.assertEqual(self.audit_rows("device_protocol_change"), [])
+
+    # -- 4. the interaction rule, pinned by a test ---------------------------
+    #
+    # Chosen rule: "manual wins until contradicted by strong evidence." A
+    # manual PATCH takes effect immediately and pins the value; automatic
+    # classification in adms.py keeps working exactly as D9 built it — a
+    # device that actually proves it speaks the other protocol still gets
+    # reclassified, because trapping a genuinely reconfigured terminal on the
+    # wrong protocol forever would be worse than the problem this unit
+    # exists to fix. What changes is that the override is never silent: the
+    # pin is cleared and the audit trail says explicitly that it overrode an
+    # operator's manual choice.
+
+    def test_manual_pin_survives_when_no_contradicting_evidence_arrives(self):
+        """The whole point of pinning: nothing flips it on its own."""
+        self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "acc"})
+
+        # An unrelated request that carries no protocol evidence at all.
+        self.client.get(f"/iclock/ping?SN={self.SN}")
+
+        device = self.device()
+        self.assertEqual(device.protocol, "acc")
+        self.assertTrue(device.protocol_pinned)
+
+    def test_attlog_from_a_manually_pinned_acc_device_still_demotes_it(self):
+        """The self-healing case: the pin must not trap a real T&A terminal."""
+        self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "acc"})
+        self.assertTrue(self.device().protocol_pinned)
+
+        response = self.client.post(
+            f"/iclock/cdata?SN={self.SN}&table=ATTLOG",
+            content="1001\t2026-08-20 09:15:00\t0\t1\n",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        device = self.device()
+        # Reclassified by real evidence, exactly as an unpinned device would be...
+        self.assertEqual(device.protocol, "att")
+        # ...and the pin is gone, not left dangling on a value that no longer
+        # reflects an operator's intent.
+        self.assertFalse(device.protocol_pinned)
+
+    def test_the_override_of_a_manual_pin_is_audited_distinctly(self):
+        """A pinned device flipped by device evidence must never read as a
+        silent revert — this is the visibility requirement E6 exists to meet.
+
+        The manual PATCH and the automatic override write to two different
+        audit actions on purpose (`device_protocol_change` vs
+        `adms_protocol_change`, matching the pre-existing convention for
+        operator-driven vs device-driven changes) — that split is itself part
+        of what makes an override distinguishable from a manual set.
+        """
+        self.client.patch(f"/devices/{self.SN}/protocol", json={"protocol": "acc"})
+        self.assertEqual(len(self.audit_rows("device_protocol_change")), 1)
+        self.assertEqual(len(self.audit_rows("adms_protocol_change")), 0)
+
+        self.client.post(
+            f"/iclock/cdata?SN={self.SN}&table=ATTLOG",
+            content="1001\t2026-08-20 09:15:00\t0\t1\n",
+        )
+
+        # The manual row is untouched...
+        self.assertEqual(len(self.audit_rows("device_protocol_change")), 1)
+        # ...and the override is its own row, worded so it cannot be mistaken
+        # for an ordinary automatic transition.
+        entries = self.audit_rows("adms_protocol_change")
+        self.assertEqual(len(entries), 1)
+        override_entry = entries[-1]
+        self.assertEqual(override_entry.actor, "device")
+        self.assertIn("acc -> att", override_entry.detail)
+        self.assertIn("overriding manual pin", override_entry.detail.lower())
+        self.assertIn("pin cleared", override_entry.detail.lower())
+
+    def test_an_unpinned_device_still_reclassifies_silently_as_before(self):
+        """Regression guard: E6 must not change behaviour for devices an
+        operator has never touched — no pin, no special audit wording."""
+        db = self.Session()
+        try:
+            db.query(Device).filter_by(serial_number=self.SN).update({"protocol": "acc"})
+            db.commit()
+        finally:
+            db.close()
+        self.assertFalse(self.device().protocol_pinned)
+
+        self.client.post(
+            f"/iclock/cdata?SN={self.SN}&table=ATTLOG",
+            content="1001\t2026-08-20 09:15:00\t0\t1\n",
+        )
+
+        device = self.device()
+        self.assertEqual(device.protocol, "att")
+        self.assertFalse(device.protocol_pinned)
+
+        entry = self.audit_rows("adms_protocol_change")[-1]
+        self.assertNotIn("overriding manual pin", entry.detail.lower())
+        self.assertNotIn("pin cleared", entry.detail.lower())
+
+    def test_pin_check_is_load_bearing_not_incidental(self):
+        """Pins _set_protocol's actual override-and-clear behaviour directly,
+        so a future refactor of that function cannot silently drop the check
+        that makes the override visible (the failure mode this unit exists to
+        avoid) while still passing the end-to-end tests above by accident."""
+        db = self.Session()
+        try:
+            device = Device(serial_number="E6DIRECTTEST1", ip_address="203.0.113.20",
+                            status="approved", protocol="acc", protocol_pinned=True)
+            db.add(device)
+            db.commit()
+            db.refresh(device)
+
+            adms._set_protocol(db, device, "att", "unit test evidence", "203.0.113.20")
+
+            self.assertEqual(device.protocol, "att")
+            self.assertFalse(
+                device.protocol_pinned,
+                "a pinned device that receives contradicting evidence must have "
+                "its pin cleared, or a later PATCH /protocol would look like it "
+                "did nothing",
+            )
+            from app.models import AuditLog
+            entry = (
+                db.query(AuditLog)
+                .filter_by(action="adms_protocol_change", target="E6DIRECTTEST1")
+                .order_by(AuditLog.id.desc())
+                .first()
+            )
+            self.assertIsNotNone(entry)
+            self.assertIn("overriding manual pin", entry.detail.lower())
+        finally:
+            db.close()
+
+
 class HrmMappingTests(unittest.TestCase):
     """What actually leaves the building. The HRM has been damaged once by a
     bad push, so this asserts the payload field by field."""

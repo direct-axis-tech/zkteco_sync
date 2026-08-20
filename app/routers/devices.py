@@ -15,8 +15,9 @@ from app.deps import require_admin, require_auth
 from app.net import client_ip, valid_cidrs
 from app.schemas import (
     BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut,
-    DeviceTimezoneUpdate, DeviceUpdate, EnrollRequest, FingerprintTemplateOut,
-    LcdRequest, PairingOpenRequest, PairingWindowOut, SetTimeRequest, UnlockRequest,
+    DeviceProtocolUpdate, DeviceTimezoneUpdate, DeviceUpdate, EnrollRequest,
+    FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
+    SetTimeRequest, UnlockRequest,
 )
 from app.services import pairing
 from app.services.poller import pull_attendance, pull_device, pull_employees
@@ -250,6 +251,59 @@ def update_device_timezone(
                f"{relabelled} attendance record(s) relabelled; punch times unchanged",
     )
     return device
+
+
+# ---------------------------------------------------------------------------
+# Device protocol — its own endpoint, because it is a correction, not a field
+# ---------------------------------------------------------------------------
+
+@router.patch("/{sn}/protocol", response_model=DeviceOut)
+def update_device_protocol(
+    sn: str,
+    payload: DeviceProtocolUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Correct which PUSH protocol family a device is treated as speaking.
+
+    Separate from PATCH /{sn} on purpose, matching the timezone endpoint's
+    precedent: `app/routers/adms.py` sets `Device.protocol` automatically from
+    what the device itself announces (`DeviceType=acc` on a handshake, an
+    ATTLOG push, or a call to /iclock/registry or /iclock/push), and that must
+    stay the normal path. This endpoint exists for the moment automatic
+    classification is stale — a terminal that has just been switched between
+    cloud and local server modes, before it has said so on the wire again.
+
+    Interaction with the automatic rules (E6's design question): the value set
+    here is authoritative — and used immediately by outbound transport
+    routing — until the device itself produces evidence that contradicts it.
+    That is `_set_protocol`'s job, not this one: it flips the value AND clears
+    `protocol_pinned` AND audits the moment distinctly, so a later
+    "correction" a device makes on its own is never a silent revert. See
+    `Device.protocol_pinned` and `app.routers.adms._set_protocol`.
+    """
+    device = _get_device_or_404(sn, db)
+
+    new_protocol = payload.protocol
+    old_protocol = device.protocol
+    if new_protocol == old_protocol and device.protocol_pinned:
+        return device   # already this value, already pinned — nothing to do
+
+    device.protocol = new_protocol
+    device.protocol_pinned = True
+    db.commit()
+    db.refresh(device)
+
+    log.warning("device %s protocol %s -> %s (manual, pinned by %s)",
+                sn, old_protocol, new_protocol, admin.username)
+    audit.record(
+        db, admin.username, "device_protocol_change", target=sn,
+        ip=client_ip(request),
+        detail=f"{old_protocol} -> {new_protocol} (manual override, pinned)",
+    )
+    return device
+
 
 # ---------------------------------------------------------------------------
 # Device approval

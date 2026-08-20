@@ -31,12 +31,19 @@ class DeviceOut(BaseModel):
     last_ip: Optional[str] = None
     # Which PUSH protocol family the device speaks (D9): "att" (Attendance,
     # the default and what every pre-existing device is) or "acc" (Security /
-    # access control). Read-only — it is set from what the device announces
-    # about itself, never from the API. `registry_code`, `session_id` and
-    # `capabilities` are deliberately absent: the first two are inputs to the
-    # device's session token and the third is a long diagnostic blob, and
-    # neither belongs in a device listing.
+    # access control). Read-only on this shape — normally set automatically
+    # from what the device announces about itself, but an operator can correct
+    # it directly via PATCH /devices/{sn}/protocol (E6) when a terminal is
+    # reconfigured between cloud and local server modes. `registry_code`,
+    # `session_id` and `capabilities` are deliberately absent: the first two
+    # are inputs to the device's session token and the third is a long
+    # diagnostic blob, and neither belongs in a device listing.
     protocol: str = "att"
+    # True when the current `protocol` value came from that manual PATCH
+    # rather than from device traffic — the UI's answer to "why is this the
+    # value it is". Cleared automatically, and audited, the moment the device
+    # itself produces contradicting evidence (see Device.protocol_pinned).
+    protocol_pinned: bool = False
     # What this device's clock digits mean (D10). Read-only on this shape and
     # on DeviceUpdate: changing it relabels every historical record for the
     # device, so it has its own endpoint (PATCH /devices/{sn}/timezone) rather
@@ -224,10 +231,22 @@ class DeviceUpdate(BaseModel):
     # pushed; that is a deliberate act with its own endpoint
     # (PATCH /devices/{sn}/timezone), not a field that can be nudged while
     # someone is editing an IP address.
+    # `protocol` is deliberately absent, for the same reason. Correcting it is
+    # a decision with real consequences elsewhere (which PUSH handshake reply
+    # a device receives, which outbound transport E7 picks) and must go
+    # through PATCH /devices/{sn}/protocol, which pins the value against
+    # automatic drift and audits the change — not this generic PATCH.
 
 
 class DeviceTimezoneUpdate(BaseModel):
     timezone: str   # IANA name, e.g. "Asia/Dubai"; validated against zoneinfo
+
+
+class DeviceProtocolUpdate(BaseModel):
+    # Literal, not str: the wire value is exactly "att" or "acc" (D9), so a
+    # bad value is a 422 from FastAPI's own validation before the handler
+    # ever runs, matching the model's own Enum.
+    protocol: Literal["att", "acc"]
 
 
 # --- ADMS pairing window ---

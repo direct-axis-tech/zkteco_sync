@@ -3,6 +3,7 @@ import { api } from '../api'
 import { useAuth } from '../auth'
 import DeviceFormModal from '../components/DeviceFormModal'
 import DeviceTimezoneModal from '../components/DeviceTimezoneModal'
+import DeviceProtocolModal from '../components/DeviceProtocolModal'
 import DeviceSecurityDrawer from '../components/DeviceSecurityDrawer'
 import KebabMenu from '../components/KebabMenu'
 import DeviceInfoDrawer from '../components/DeviceInfoDrawer'
@@ -78,6 +79,7 @@ export default function Devices() {
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
   const [tzModal, setTzModal] = useState(null)   // device whose timezone is being changed
+  const [protoModal, setProtoModal] = useState(null)   // device whose protocol is being changed
   const [drawer, setDrawer] = useState(null) // { type, device }
   const [pwConfirm, setPwConfirm] = useState(null) // { title, description, onConfirm }
   const [toast, setToast] = useState(null)
@@ -150,6 +152,13 @@ export default function Devices() {
     const updated = await api.devices.setTimezone(tzModal.serial_number, timezone)
     showToast(`Timezone set to ${updated.timezone}`)
     setTzModal(null)
+    loadDevices()
+  }
+
+  async function handleSaveProtocol(protocol) {
+    const updated = await api.devices.setProtocol(protoModal.serial_number, protocol)
+    showToast(`Protocol set to ${updated.protocol}`)
+    setProtoModal(null)
     loadDevices()
   }
 
@@ -361,6 +370,7 @@ export default function Devices() {
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Status</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Trust</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Timezone</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500">Protocol</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Last Seen</th>
                 <th className="px-4 py-3" />
               </tr>
@@ -398,6 +408,35 @@ export default function Devices() {
                       )}
                     </span>
                   </td>
+                  <td className="px-4 py-3">
+                    {/* Read-only. Normally set automatically from what the
+                        device announces (D9); an operator corrects it only
+                        through its own modal, which pins the value. */}
+                    <span className="inline-flex items-center gap-2">
+                      <span className="text-gray-600 text-xs">
+                        {device.protocol || 'att'}
+                        {device.protocol_pinned && (
+                          <span
+                            title="Manually set — pinned against automatic reclassification until the device sends contradicting evidence"
+                            className="ml-1 text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 py-0.5"
+                          >
+                            pinned
+                          </span>
+                        )}
+                      </span>
+                      {isAdmin && (
+                        <button
+                          onClick={() => setProtoModal(device)}
+                          title="Correct which PUSH protocol this device is treated as speaking"
+                          aria-label={`Change protocol for ${device.serial_number}`}
+                          data-testid={`edit-protocol-${device.serial_number}`}
+                          className="text-xs text-blue-500 hover:text-blue-700 underline"
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </span>
+                  </td>
                   <td className="px-4 py-3 text-gray-400 text-xs">{formatDate(device.last_seen)}</td>
                   <td className="px-4 py-3 text-right">
                     <KebabMenu items={menuItems(device)} />
@@ -423,6 +462,14 @@ export default function Devices() {
           device={tzModal}
           onSave={handleSaveTimezone}
           onClose={() => setTzModal(null)}
+        />
+      )}
+
+      {protoModal && (
+        <DeviceProtocolModal
+          device={protoModal}
+          onSave={handleSaveProtocol}
+          onClose={() => setProtoModal(null)}
         />
       )}
 

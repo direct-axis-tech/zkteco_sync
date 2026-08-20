@@ -55,6 +55,19 @@ class Device(Base):
         nullable=False,
         default="att",
     )
+    # Set by PATCH /devices/{sn}/protocol (E6) — an operator correcting the
+    # protocol directly, for a terminal switched between cloud and local
+    # server modes. True from the moment of that call until the device itself
+    # produces evidence that contradicts it (DeviceType=acc on a handshake, an
+    # ATTLOG push, or a call to /iclock/registry or /iclock/push — the same
+    # signals `_set_protocol` has always acted on). While pinned, that
+    # automatic reclassification is not silently applied: it still happens,
+    # because a genuinely reconfigured device must self-heal exactly as D9
+    # intended, but `_set_protocol` clears the pin and audits the moment
+    # distinctly (`adms_protocol_change` with "overriding manual pin" in
+    # `detail`) so an operator can see the value did not just drift back on
+    # its own. Not pinned == the column is fully automatic, as it always was.
+    protocol_pinned = Column(Boolean, nullable=False, default=False)
     # Opaque values the Security protocol asks the server to mint and the
     # device folds into its own session token. Neither is validated here —
     # the device derives a token from them and presents it back, but our
