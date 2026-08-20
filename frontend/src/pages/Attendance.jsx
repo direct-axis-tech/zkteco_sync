@@ -125,7 +125,7 @@ export default function Attendance() {
             <option value="">All employees</option>
             {employees.map((e) => (
               <option key={e.user_id} value={e.user_id}>
-                {e.name}
+                {e.name || e.user_id}
               </option>
             ))}
           </select>

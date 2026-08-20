@@ -45,8 +45,11 @@ from sqlalchemy.pool import StaticPool                         # noqa: E402
 
 from app import config                                         # noqa: E402
 from app.database import Base, get_db                          # noqa: E402
-from app.models import AdmsPairing, AttendanceLog, Device      # noqa: E402
+from app.models import (                                       # noqa: E402
+    AdmsPairing, AttendanceLog, Device, DeviceEmployee, Employee,
+)
 from app.routers import adms                                   # noqa: E402
+from app.services import employee_sync                         # noqa: E402
 
 
 # The legacy Attendance PUSH handshake reply, recovered from
@@ -144,6 +147,34 @@ class AdmsTestCase(unittest.TestCase):
         db = self.Session()
         try:
             return db.query(AttendanceLog).order_by(AttendanceLog.id).all()
+        finally:
+            db.close()
+
+    def employees(self):
+        db = self.Session()
+        try:
+            return {e.user_id: e for e in db.query(Employee).all()}
+        finally:
+            db.close()
+
+    def device_links(self, serial):
+        db = self.Session()
+        try:
+            return {
+                d.user_id: d
+                for d in db.query(DeviceEmployee).filter_by(device_sn=serial).all()
+            }
+        finally:
+            db.close()
+
+    def add_employee(self, user_id, **kwargs):
+        """A pre-existing employee row — an operator-entered one, typically."""
+        fields = dict(user_id=user_id, name="", privilege=0, card="0")
+        fields.update(kwargs)
+        db = self.Session()
+        try:
+            db.add(Employee(**fields))
+            db.commit()
         finally:
             db.close()
 
@@ -757,6 +788,359 @@ class TableDispatchTests(AdmsTestCase):
             content="errcode=5\terrmsg=whatever\n",
         )
         self.assertEqual(response.text, "errorlog=1")
+
+
+# ---------------------------------------------------------------------------
+# 4b. `tabledata&tablename=user` — employees arriving from the terminal
+# ---------------------------------------------------------------------------
+
+# The three records the operator's BioFace A1 actually sent, recovered from
+# /Users/mufeedbinismail/Documents/zkteco-sync.log around 2026-08-20 10:39:50.
+# The log had expanded every TAB to eight spaces and syslog had split the body
+# on its LFs; both are undone here, so this constant is the wire bytes.
+#
+# Note what is in it: every `name=` is empty and every `cardno=` is empty. This
+# is the normal shape of a user upload, not a degenerate one, and it is the
+# case the merge rule exists for.
+CAPTURED_USER_UPLOAD = (
+    "user uid=1\tcardno=\tpin=1\tpassword=\tgroup=1\tstarttime=0\tendtime=0\t"
+    "name=\tprivilege=14\tdisable=0\tverify=0\n"
+    "user uid=2\tcardno=\tpin=2\tpassword=\tgroup=1\tstarttime=0\tendtime=0\t"
+    "name=\tprivilege=14\tdisable=0\tverify=0\n"
+    "user uid=3\tcardno=\tpin=3\tpassword=\tgroup=1\tstarttime=0\tendtime=0\t"
+    "name=\tprivilege=0\tdisable=0\tverify=0\n"
+)
+
+
+class UserTableUploadTests(AdmsTestCase):
+    """The ingest that makes an employee list appear from a NATted device."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_device(ACC_SN, protocol="acc")
+
+    def post_users(self, body, count=None, serial=ACC_SN):
+        url = f"/iclock/cdata?SN={serial}&table=tabledata&tablename=user"
+        if count is not None:
+            url += f"&count={count}"
+        return self.client.post(url, content=body)
+
+    # -- the captured payload -------------------------------------------
+
+    def test_the_captured_upload_creates_every_record_it_declared(self):
+        """count=3 means three employees, not one. The log kept one because
+        _clip cut the body; the parser must not repeat that mistake."""
+        response = self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        self.assertEqual(response.status_code, 200)
+
+        employees = self.employees()
+        self.assertEqual(sorted(employees), ["1", "2", "3"])
+        self.assertEqual(
+            [employees[p].privilege for p in ("1", "2", "3")], [14, 14, 0]
+        )
+
+    def test_the_acknowledgement_is_still_byte_exact(self):
+        """The device retries the upload forever without this exact string,
+        so ingesting must not have changed a byte of it."""
+        response = self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        self.assertEqual(response.content, b"user=3")
+        self.assertTrue(
+            response.headers["content-type"].startswith("text/plain")
+        )
+
+    def test_the_acknowledgement_echoes_the_declared_count_not_the_stored_one(self):
+        """`count` is the device's claim about its own upload. Echoing back
+        what we managed to store instead would make a device that sent one
+        unparseable record retry the whole batch indefinitely."""
+        body = CAPTURED_USER_UPLOAD + "this is not a record\n"
+        response = self.post_users(body, count=4)
+        self.assertEqual(response.text, "user=4")
+        self.assertEqual(len(self.employees()), 3)
+
+    def test_a_device_link_is_recorded_with_the_device_local_uid(self):
+        """Same shape the SDK pull writes: keyed on (device_sn, user_id),
+        carrying the terminal's own slot number."""
+        self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        links = self.device_links(ACC_SN)
+        self.assertEqual(sorted(links), ["1", "2", "3"])
+        self.assertEqual([links[p].uid for p in ("1", "2", "3")], [1, 2, 3])
+
+    def test_an_unnamed_enrolment_is_stored_blank_not_invented(self):
+        """The UI falls back to the PIN for an empty name. A placeholder that
+        looked like a name would be a fact the device never reported."""
+        self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        self.assertEqual(self.employees()["1"].name, "")
+
+    # -- the merge rule ---------------------------------------------------
+
+    def test_an_empty_incoming_name_does_not_clobber_an_existing_one(self):
+        """The whole reason this ingest needs a merge rule rather than an
+        overwrite: the operator types the names, and every upload the device
+        sends carries `name=`."""
+        self.add_employee("1", name="Aisha Rahman", card="0012345678", privilege=0)
+        self.post_users(CAPTURED_USER_UPLOAD, count=3)
+
+        emp = self.employees()["1"]
+        self.assertEqual(emp.name, "Aisha Rahman")
+        self.assertEqual(emp.card, "0012345678")
+        # ...but a field the device *did* report still lands.
+        self.assertEqual(emp.privilege, 14)
+
+    def test_a_name_the_device_does_send_is_written(self):
+        """The rule is fill-in-never-empty-out, not never-write."""
+        self.add_employee("1", name="")
+        self.post_users("user uid=1\tpin=1\tname=Yusuf Haddad\tprivilege=0\n", count=1)
+        self.assertEqual(self.employees()["1"].name, "Yusuf Haddad")
+
+    def test_a_card_number_reaches_the_row_for_the_hrm(self):
+        self.post_users("user uid=4\tpin=4\tcardno=0012345678\tname=Lina\n", count=1)
+        self.assertEqual(self.employees()["4"].card, "0012345678")
+
+    def test_a_zero_card_does_not_erase_a_real_one(self):
+        """`cardno=0` and `cardno=` are both "no card", and Employee.card
+        defaults to "0" — none of the three may overwrite a card number."""
+        self.add_employee("4", name="Lina", card="0012345678")
+        self.post_users("user uid=4\tpin=4\tcardno=0\tname=\n", count=1)
+        self.assertEqual(self.employees()["4"].card, "0012345678")
+
+    def test_a_repeat_upload_is_idempotent(self):
+        """Devices re-send their whole user list on reconnect. A replay must
+        not duplicate rows, and must not even touch a row it cannot change."""
+        self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        first = self.employees()
+        stamps = {p: first[p].updated_at for p in first}
+
+        response = self.post_users(CAPTURED_USER_UPLOAD, count=3)
+
+        self.assertEqual(response.text, "user=3")
+        again = self.employees()
+        self.assertEqual(sorted(again), ["1", "2", "3"])
+        self.assertEqual(len(self.device_links(ACC_SN)), 3)
+        for pin, stamp in stamps.items():
+            self.assertEqual(again[pin].updated_at, stamp, f"pin {pin} was rewritten")
+
+    def test_the_same_pin_twice_in_one_batch_merges_rather_than_duplicating(self):
+        body = (
+            "user uid=9\tpin=9\tname=\tcardno=555\n"
+            "user uid=9\tpin=9\tname=Omar Said\tcardno=\n"
+        )
+        self.post_users(body, count=2)
+        employees = self.employees()
+        self.assertEqual(sorted(employees), ["9"])
+        self.assertEqual(employees["9"].name, "Omar Said")
+        self.assertEqual(employees["9"].card, "555")
+
+    # -- parsing ----------------------------------------------------------
+
+    def test_fields_are_read_by_key_and_never_by_position(self):
+        """Field order and field count vary across firmware revisions. A
+        positional parse would put a card number in the name column."""
+        body = (
+            "user name=Sara Nasser\tprivilege=14\tpin=11\tcardno=778899\t"
+            "uid=11\tsomethingnew=42\n"
+        )
+        self.post_users(body, count=1)
+        emp = self.employees()["11"]
+        self.assertEqual(emp.name, "Sara Nasser")
+        self.assertEqual(emp.card, "778899")
+        self.assertEqual(emp.privilege, 14)
+
+    def test_the_table_name_prefix_is_optional(self):
+        """Present on every captured record, but stripping it must not be the
+        only way a record parses."""
+        self.post_users("pin=12\tuid=12\tname=Noor\n", count=1)
+        self.assertEqual(self.employees()["12"].name, "Noor")
+
+    def test_a_malformed_record_is_skipped_and_logged_without_dropping_the_batch(self):
+        body = (
+            "user uid=1\tpin=1\tname=Aisha\n"
+            "total garbage with no equals sign at all\n"
+            "user uid=2\tname=Nobody\tprivilege=0\n"          # no pin
+            "user uid=3\tpin=3\tname=Yusuf\n"
+        )
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            response = self.post_users(body, count=4)
+
+        self.assertEqual(response.text, "user=4")
+        employees = self.employees()
+        self.assertEqual(sorted(employees), ["1", "3"])
+        self.assertEqual(employees["3"].name, "Yusuf")
+        joined = "\n".join(captured.output)
+        self.assertIn("total garbage", joined)
+
+    def test_a_record_for_pin_zero_is_not_made_an_employee(self):
+        """pin=0 is the device talking about itself, the same convention
+        rtlog uses for door and tamper events."""
+        with self.assertLogs("app.routers.adms", level="WARNING"):
+            self.post_users("user uid=0\tpin=0\tname=\n", count=1)
+        self.assertEqual(self.employees(), {})
+
+    def test_an_empty_upload_is_acknowledged_and_stores_nothing(self):
+        response = self.post_users("", count=0)
+        self.assertEqual(response.text, "user=0")
+        self.assertEqual(self.employees(), {})
+
+    def test_two_devices_holding_the_same_person_share_one_employee_row(self):
+        """user_id is the key, uid is per-device. Two terminals that both hold
+        PIN 1 are two links to one person, not two people."""
+        self.add_device("SECONDACC00001", protocol="acc")
+        self.post_users("user uid=1\tpin=1\tname=Aisha\n", count=1)
+        self.post_users("user uid=57\tpin=1\tname=\n", count=1, serial="SECONDACC00001")
+
+        self.assertEqual(sorted(self.employees()), ["1"])
+        self.assertEqual(self.employees()["1"].name, "Aisha")
+        self.assertEqual(self.device_links(ACC_SN)["1"].uid, 1)
+        self.assertEqual(self.device_links("SECONDACC00001")["1"].uid, 57)
+
+    # -- what must NOT be ingested ---------------------------------------
+
+    def test_biodata_is_still_acknowledged_without_being_stored(self):
+        """E2's table, not this one. It must keep behaving exactly as before."""
+        response = self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=biodata&count=2",
+            content="biodata pin=1\tno=5\ttype=1\ttmp=apUBEBgEfAQBAA0AAVH4AAg\n",
+        )
+        self.assertEqual(response.text, "biodata=2")
+        self.assertEqual(self.employees(), {})
+        self.assertEqual(self.device_links(ACC_SN), {})
+
+    def test_a_base64_table_is_summarised_in_the_log_rather_than_dumped(self):
+        """A biophoto push is ~100 KB per record. The journal is not a blob
+        store, and the operator still needs to see that it arrived."""
+        blob = "A" * 40000
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.client.post(
+                f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=biophoto&count=1",
+                content=f"biophoto pin=1\tfilename=1.jpg\tcontent={blob}\n",
+            )
+        joined = "\n".join(captured.output)
+        self.assertIn("not logged", joined)
+        self.assertNotIn(blob, joined)
+
+    def test_a_small_keyed_table_is_kept_whole_in_the_log(self):
+        """The opposite failure: the captured `user` push was truncated to its
+        first record, which is why nobody could tell whether names ever
+        arrive. All three records must now reach the log."""
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        joined = "\n".join(captured.output)
+        self.assertIn("uid=1", joined)
+        self.assertIn("uid=2", joined)
+        self.assertIn("uid=3", joined)
+
+    # -- failure containment ---------------------------------------------
+
+    def test_a_storage_failure_still_acknowledges_so_the_device_stops_retrying(self):
+        """An ingest bug must not turn into a device stuck in an upload loop."""
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated storage failure")
+
+        original = adms._store_user_table
+        adms._store_user_table = boom
+        try:
+            with self.assertLogs("app.routers.adms", level="ERROR"):
+                response = self.post_users(CAPTURED_USER_UPLOAD, count=3)
+        finally:
+            adms._store_user_table = original
+
+        self.assertEqual(response.content, b"user=3")
+
+    def test_an_unapproved_serial_cannot_inject_employees(self):
+        """The ingest sits behind _authorise like every other table."""
+        response = self.post_users(CAPTURED_USER_UPLOAD, count=3, serial="NOTAPPROVED01")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.employees(), {})
+
+
+class SdkAndPushAgreeTests(AdmsTestCase):
+    """The two transports write the same tables. They must converge.
+
+    The SDK pull reaches a device over TCP 4370; the ADMS upload arrives over
+    HTTP. A LAN device can be reachable both ways, and before this unit the
+    poller wrote `employees` inline with its own overwrite-everything rule. If
+    that had been left alone, a name would appear on one path and be erased on
+    the other on the next poll, forever.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.add_device(ACC_SN, protocol="acc")
+
+    def sdk_pull(self, serial, user_id, uid, name, privilege, card):
+        """What poller.pull_employees now does per user from conn.get_users().
+
+        pyzk hands back name="" and card=0 for an unnamed, card-less user —
+        the same "nothing to say" the wire expresses as `name=` / `cardno=`.
+        """
+        db = self.Session()
+        try:
+            employee_sync.record_device_user(
+                db, serial, user_id, uid=uid, name=name, privilege=privilege, card=card
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def test_the_poller_calls_the_same_writer_as_the_push_ingest(self):
+        """Not a behavioural assertion — a structural one. If someone adds a
+        second writer to poller.py, this fails."""
+        import inspect as _inspect
+        from app.services import poller
+        source = _inspect.getsource(poller.pull_employees)
+        self.assertIn("employee_sync.record_device_user", source)
+        self.assertNotIn("db.add(Employee(", source)
+        self.assertNotIn("db.add(DeviceEmployee(", source)
+
+    def test_an_sdk_pull_does_not_erase_a_name_the_push_ingest_stored(self):
+        self.post = None
+        self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=user&count=1",
+            content="user uid=1\tpin=1\tname=Aisha Rahman\tcardno=778899\n",
+        )
+        self.sdk_pull(ACC_SN, "1", uid=1, name="", privilege=14, card=0)
+
+        emp = self.employees()["1"]
+        self.assertEqual(emp.name, "Aisha Rahman")
+        self.assertEqual(emp.card, "778899")
+        self.assertEqual(emp.privilege, 14)
+
+    def test_a_push_ingest_does_not_erase_a_name_the_sdk_pull_stored(self):
+        self.sdk_pull(ACC_SN, "1", uid=1, name="Aisha Rahman", privilege=14, card=778899)
+        self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=user&count=1",
+            content="user uid=1\tpin=1\tname=\tcardno=\tprivilege=14\n",
+        )
+        emp = self.employees()["1"]
+        self.assertEqual(emp.name, "Aisha Rahman")
+        self.assertEqual(emp.card, "778899")
+
+    def test_alternating_transports_reach_a_fixed_point(self):
+        """The flip-flop test. Ten alternations, one final state."""
+        for _ in range(5):
+            self.client.post(
+                f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=user&count=1",
+                content="user uid=1\tpin=1\tname=\tcardno=\tprivilege=14\n",
+            )
+            self.sdk_pull(ACC_SN, "1", uid=1, name="", privilege=14, card=0)
+
+        employees = self.employees()
+        self.assertEqual(sorted(employees), ["1"])
+        self.assertEqual(len(self.device_links(ACC_SN)), 1)
+        self.assertEqual(employees["1"].privilege, 14)
+
+    def test_neither_transport_creates_a_second_device_link(self):
+        self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=user&count=1",
+            content="user uid=1\tpin=1\tname=Aisha\n",
+        )
+        self.sdk_pull(ACC_SN, "1", uid=1, name="Aisha", privilege=0, card=0)
+
+        db = self.Session()
+        try:
+            self.assertEqual(db.query(DeviceEmployee).count(), 1)
+            self.assertEqual(db.query(Employee).count(), 1)
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------

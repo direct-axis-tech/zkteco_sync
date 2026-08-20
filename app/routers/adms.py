@@ -37,7 +37,7 @@ from app import audit, config
 from app.database import get_db
 from app.models import AttendanceLog, Device, DeviceCommand
 from app.net import client_ip, ip_in_cidrs
-from app.services import pairing
+from app.services import employee_sync, pairing
 
 router = APIRouter(tags=["adms"])
 
@@ -60,6 +60,26 @@ _REGISTRY_REFUSAL_STATUS = 406
 # capped at MAX_REQUEST_BYTES by middleware; this is about keeping one strange
 # upload from flooding the operator's log file.
 _LOG_BODY_LIMIT = 2000
+
+# `tabledata` gets its own, much larger limit. 2000 characters is the right
+# size for a log *line*; it is the wrong size for the only record we will ever
+# have of what a bulk upload contained. The BioFace A1's first `user` push
+# declared count=3 and the log kept one record — the two that were cut are
+# exactly the two that would have told us whether real names ever arrive.
+# 20 KB holds roughly 160 `user` records at the ~125 bytes each one measures on
+# the wire, which covers any terminal this server is pointed at, and a 20 KB
+# log line is large but bounded.
+_TABLEDATA_LOG_LIMIT = 20000
+
+# ...except for the tables whose payload is base64 blob. One `biophoto` record
+# is ~100 KB and a push may carry dozens; a journal is not a blob store. These
+# are summarised by size and record count instead, which is what an operator
+# and the units that will parse them (E2, E5) actually need from the log.
+# Lowercased for comparison — `ATTPHOTO` is the one table the vendor spells in
+# capitals.
+_BLOB_TABLES = frozenset({
+    "biodata", "biophoto", "userpic", "identitycard", "templatev10", "attphoto",
+})
 
 # How much of a device's raw capability line is kept on its row. The real ones
 # run to about 2 KB; the cap exists so a malformed push cannot fill the column.
@@ -470,14 +490,40 @@ async def adms_receive(
         if not tablename:
             log.warning("ADMS tabledata from %s with no tablename: %s", SN, _clip(body))
             return PlainTextResponse(content="OK")
+
+        records = len([ln for ln in body.splitlines() if ln.strip()])
         if not count:
             # Fall back to counting records so the acknowledgement is still
             # well-formed if the device omits the parameter.
-            count = str(len([ln for ln in body.splitlines() if ln.strip()]))
-        log.info(
-            "ADMS tabledata from %s: tablename=%s count=%s (not stored) body=%s",
-            SN, tablename, count, _clip(body),
-        )
+            count = str(records)
+
+        low = tablename.lower()
+        if low in _BLOB_TABLES:
+            log.info(
+                "ADMS tabledata from %s: tablename=%s count=%s (not stored) "
+                "body=%d bytes in %d record(s) [base64, not logged]",
+                SN, tablename, count, len(raw), records,
+            )
+        else:
+            log.info(
+                "ADMS tabledata from %s: tablename=%s count=%s body=%s",
+                SN, tablename, count, _clip(body, _TABLEDATA_LOG_LIMIT),
+            )
+
+        if low == "user":
+            try:
+                _store_user_table(db, SN, body)
+            except Exception:
+                # The acknowledgement below matters more than the ingest. A
+                # device that does not see `<tablename>=<count>` is documented
+                # to retry the upload forever, so a parse or database fault
+                # here has to be loud in the log and invisible on the wire.
+                log.exception(
+                    "ADMS tabledata from %s: user upload could not be stored; "
+                    "acknowledging anyway so the device does not retry forever", SN,
+                )
+                db.rollback()
+
         _touch(db, device, request)
         return PlainTextResponse(content=f"{tablename}={count}")
 
@@ -700,6 +746,95 @@ def _store_rtlog(db: Session, sn: str, body: str, ip: str, tz: str) -> None:
     log.info(
         "ADMS rtlog from %s: %d punch(es) stored, %d device event(s) ignored",
         sn, stored, ignored,
+    )
+
+
+def _tabledata_fields(line: str, tablename: str) -> dict:
+    """One bulk-upload record → a dict. Keyed ``key=value`` pairs, TAB-separated.
+
+    Every record repeats the table name at its own head, separated from the
+    first pair by a single SPACE, with TAB between the pairs after that.
+    Verbatim from VGU6254600603, tabs shown as ``\\t``::
+
+        user uid=1\\tcardno=\\tpin=1\\tpassword=\\tgroup=1\\tstarttime=0\\t
+        endtime=0\\tname=\\tprivilege=14\\tdisable=0\\tverify=0
+
+    The prefix is stripped when present, and a line without it parses
+    identically — a firmware that omits it, or repeats it only on the first
+    record, still reads correctly.
+
+    Same discipline as ``_rtlog_fields``: by key, never by position. ZKTeco has
+    added columns to this table across firmware revisions, and a positional
+    parse maps a card number onto a name the first time a vendor inserts one —
+    silently, and into the employee table.
+    """
+    text = line.strip()
+    prefix = f"{tablename} "
+    if text[:len(prefix)].lower() == prefix.lower():
+        text = text[len(prefix):]
+
+    fields = {}
+    for pair in text.split("\t"):
+        key, sep, value = pair.partition("=")
+        if not sep:
+            continue
+        fields[key.strip().lower()] = value.strip()
+    return fields
+
+
+def _store_user_table(db: Session, sn: str, body: str) -> None:
+    """``tabledata&tablename=user`` — the terminal's own user list.
+
+    This is how employees arrive from a device that sits behind NAT, where the
+    SDK pull on TCP 4370 can never reach. The write itself is delegated to
+    ``employee_sync``, which the SDK pull also calls, so the two transports
+    cannot disagree about a shared row; in particular the "fill in, never empty
+    out" rule lives there, and it is what keeps an operator-entered name alive
+    through an upload like the captured one, where every record has ``name=``.
+
+    ``password``, ``group``, ``starttime``, ``endtime``, ``disable`` and
+    ``verify`` have nowhere to go in the current schema. They are dropped
+    rather than guessed at — the log line above keeps the raw record if they
+    ever turn out to matter.
+    """
+    stored = set()
+    skipped = 0
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        fields = _tabledata_fields(line, "user")
+        pin = fields.get("pin", "")
+
+        if not fields or not _is_person(pin):
+            # One unreadable record must not cost the rest of the batch: the
+            # device has already been told the whole upload was accepted and
+            # will not send it again. Logged rather than dropped silently, for
+            # the same reason every other unknown thing here is.
+            log.warning(
+                "ADMS user upload from %s: skipping unusable record %r", sn, _clip(line, 300)
+            )
+            skipped += 1
+            continue
+
+        # No dedupe-and-skip within the batch. If a device sends the same PIN
+        # twice, letting both run means a second record can fill in a field the
+        # first left empty, and the merge rule guarantees it cannot undo one.
+        employee_sync.record_device_user(
+            db, sn, pin,
+            uid=fields.get("uid"),
+            name=fields.get("name"),
+            privilege=fields.get("privilege"),
+            card=fields.get("cardno"),
+        )
+        stored.add(pin.strip())
+
+    db.commit()
+    log.info(
+        "ADMS user upload from %s: %d user(s) stored, %d record(s) skipped",
+        sn, len(stored), skipped,
     )
 
 

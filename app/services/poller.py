@@ -5,7 +5,8 @@ from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 
 from app import config
 from app.database import SessionLocal
-from app.models import AttendanceLog, Device, DeviceEmployee, Employee
+from app.models import AttendanceLog, Device
+from app.services import employee_sync
 
 log = logging.getLogger(__name__)
 
@@ -41,33 +42,23 @@ def pull_employees(serial_number: str) -> dict:
             conn.disable_device()
 
             for user in conn.get_users():
-                emp = db.query(Employee).filter_by(user_id=str(user.user_id)).first()
-                if emp:
-                    emp.name = user.name
-                    emp.privilege = user.privilege
-                    emp.card = str(user.card)
-                    emp.updated_at = datetime.now(timezone.utc)
-                else:
-                    emp = Employee(
-                        user_id=str(user.user_id),
-                        name=user.name,
-                        privilege=user.privilege,
-                        card=str(user.card),
-                    )
-                    db.add(emp)
-
-                de = db.query(DeviceEmployee).filter_by(
-                    device_sn=serial_number, user_id=str(user.user_id)
-                ).first()
-                if de:
-                    de.uid = user.uid
-                    de.synced_at = datetime.now(timezone.utc)
-                else:
-                    db.add(DeviceEmployee(
-                        device_sn=serial_number,
-                        user_id=str(user.user_id),
-                        uid=user.uid,
-                    ))
+                # Deliberately the same writer the ADMS `tabledata&tablename=user`
+                # upload uses (app/services/employee_sync.py). A device on the
+                # LAN can be reachable over both TCP 4370 and the PUSH channel,
+                # and two writers with different ideas of what an empty field
+                # means would make the row flip-flop between them. The visible
+                # change from the previous inline version: pyzk reports an
+                # unnamed user as "" and a card-less user as 0, and neither now
+                # overwrites a name or card that is already on the row.
+                employee_sync.record_device_user(
+                    db,
+                    serial_number,
+                    user.user_id,
+                    uid=user.uid,
+                    name=user.name,
+                    privilege=user.privilege,
+                    card=user.card,
+                )
                 result["users_synced"] += 1
 
             db.commit()

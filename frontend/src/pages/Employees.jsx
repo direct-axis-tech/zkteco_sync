@@ -3,6 +3,12 @@ import { api } from '../api'
 
 const PRIVILEGE_LABELS = { 0: 'User', 2: 'Enroller', 14: 'Admin' }
 
+// A terminal may enrol somebody with no name at all — every record in the
+// BioFace A1 capture arrived as `name=`. The ingest stores that as an empty
+// string rather than inventing a plausible-looking name, so the PIN is what
+// there is to show. Attendance.jsx already falls back the same way.
+const displayName = (e) => (e && e.name) || e?.user_id || ''
+
 const FINGER_NAMES = [
   'Left Little', 'Left Ring', 'Left Middle', 'Left Index', 'Left Thumb',
   'Right Thumb', 'Right Index', 'Right Middle', 'Right Ring', 'Right Little',
@@ -173,9 +179,9 @@ function DetailPanel({ employee, allDevices }) {
       {/* Header */}
       <div className="mb-6">
         <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-semibold text-lg mb-3">
-          {employee.name.charAt(0).toUpperCase()}
+          {displayName(employee).charAt(0).toUpperCase()}
         </div>
-        <h2 className="text-lg font-semibold text-gray-900">{employee.name}</h2>
+        <h2 className="text-lg font-semibold text-gray-900">{displayName(employee)}</h2>
         <p className="text-sm text-gray-400 font-mono">{employee.user_id}</p>
       </div>
 
@@ -183,7 +189,7 @@ function DetailPanel({ employee, allDevices }) {
       <Section title="Profile">
         <div className="bg-gray-50 rounded-lg px-4 divide-y divide-gray-100">
           {[
-            ['Name', employee.name],
+            ['Name', employee.name || '—'],
             ['User ID', <span key="uid" className="font-mono text-xs">{employee.user_id}</span>],
             ['Card', employee.card && employee.card !== '0' ? employee.card : '—'],
             ['Privilege', <PrivilegeBadge key="priv" privilege={employee.privilege} />],
@@ -378,7 +384,7 @@ export default function Employees() {
 
   const filtered = employees.filter(
     (e) =>
-      e.name.toLowerCase().includes(search.toLowerCase()) ||
+      (e.name || '').toLowerCase().includes(search.toLowerCase()) ||
       e.user_id.includes(search)
   )
 
@@ -414,7 +420,7 @@ export default function Employees() {
                     : ''
                 }`}
               >
-                <p className="text-sm font-medium text-gray-900 truncate">{emp.name}</p>
+                <p className="text-sm font-medium text-gray-900 truncate">{displayName(emp)}</p>
                 <p className="text-xs text-gray-400 font-mono mt-0.5">{emp.user_id}</p>
               </button>
             ))
