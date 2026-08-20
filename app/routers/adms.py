@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 
 from app import audit, config
 from app.database import get_db
-from app.models import AttendanceLog, Device, DeviceCommand
+from app.models import AttendanceLog, BiometricTemplate, Device, DeviceCommand
 from app.net import client_ip, ip_in_cidrs
 from app.services import employee_sync, pairing
 
@@ -499,10 +499,14 @@ async def adms_receive(
 
         low = tablename.lower()
         if low in _BLOB_TABLES:
+            # `biodata` (E2) is stored below; every other blob table
+            # (biophoto, userpic, identitycard, templatev10, attphoto) is
+            # still out of scope and genuinely discarded after this summary.
+            stored_note = "stored" if low == "biodata" else "not stored"
             log.info(
-                "ADMS tabledata from %s: tablename=%s count=%s (not stored) "
+                "ADMS tabledata from %s: tablename=%s count=%s (%s) "
                 "body=%d bytes in %d record(s) [base64, not logged]",
-                SN, tablename, count, len(raw), records,
+                SN, tablename, count, stored_note, len(raw), records,
             )
         else:
             log.info(
@@ -520,6 +524,18 @@ async def adms_receive(
                 # here has to be loud in the log and invisible on the wire.
                 log.exception(
                     "ADMS tabledata from %s: user upload could not be stored; "
+                    "acknowledging anyway so the device does not retry forever", SN,
+                )
+                db.rollback()
+        elif low == "biodata":
+            try:
+                _store_biodata_table(db, SN, body)
+            except Exception:
+                # Same rule as the user upload above: the ack must go out
+                # regardless, or the device retries a multi-KB template
+                # upload forever.
+                log.exception(
+                    "ADMS tabledata from %s: biodata upload could not be stored; "
                     "acknowledging anyway so the device does not retry forever", SN,
                 )
                 db.rollback()
@@ -834,6 +850,80 @@ def _store_user_table(db: Session, sn: str, body: str) -> None:
     db.commit()
     log.info(
         "ADMS user upload from %s: %d user(s) stored, %d record(s) skipped",
+        sn, len(stored), skipped,
+    )
+
+
+def _store_biodata_table(db: Session, sn: str, body: str) -> None:
+    """``tabledata&tablename=biodata`` — biometric templates (fingerprint,
+    face, or any other modality ``type`` turns out to carry) pushed by a
+    Security PUSH terminal.
+
+    Stored in ``BiometricTemplate`` (see ``app/models.py`` for why that is a
+    new table and not ``FingerprintTemplate``), keyed on ``(user_id, type,
+    no)`` and upserted — a re-upload of the same template updates the
+    existing row rather than duplicating it, so a device that resends its
+    whole set on reconnect converges instead of accumulating.
+
+    Every field survives verbatim, including ``duress``, ``index``,
+    ``majorver``, ``minorver`` and ``format`` — none of them are understood
+    or acted on here, only carried, because E4 needs the exact values to
+    reconstruct a ``DATA UPDATE BIODATA`` command later. ``tmp`` is stored as
+    the base64 text the device sent, never decoded.
+
+    ``pin``, ``type`` and ``no`` are the identity of a record — without a
+    usable value for each there is nowhere to upsert to — so a record missing
+    any of them, or with no ``tmp`` at all, is skipped rather than guessed at,
+    the same discipline ``_store_user_table`` uses for ``pin``.
+    """
+    stored = set()
+    skipped = 0
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        fields = _tabledata_fields(line, "biodata")
+        pin = fields.get("pin", "").strip()[:24]
+        type_value = _to_int(fields.get("type"), default=None)
+        no_value = _to_int(fields.get("no"), default=None)
+        tmp = fields.get("tmp", "").strip()
+
+        if not pin or type_value is None or no_value is None or not tmp:
+            log.warning(
+                "ADMS biodata upload from %s: skipping unusable record %r", sn, _clip(line, 300)
+            )
+            skipped += 1
+            continue
+
+        row = (
+            db.query(BiometricTemplate)
+            .filter_by(user_id=pin, type=type_value, no=no_value)
+            .first()
+        )
+        if row is None:
+            row = BiometricTemplate(user_id=pin, type=type_value, no=no_value)
+            db.add(row)
+
+        row.record_index = _to_int(fields.get("index"))
+        row.valid = _to_int(fields.get("valid"))
+        row.duress = _to_int(fields.get("duress"))
+        row.majorver = _to_int(fields.get("majorver"))
+        row.minorver = _to_int(fields.get("minorver"))
+        row.format = _to_int(fields.get("format"))
+        row.tmp = tmp
+        row.source_device_sn = sn
+
+        # Same reason as _store_user_table: makes the row visible to the next
+        # line in this same batch, so two records for the same key merge
+        # instead of racing the unique constraint.
+        db.flush()
+        stored.add((pin, type_value, no_value))
+
+    db.commit()
+    log.info(
+        "ADMS biodata upload from %s: %d template(s) stored, %d record(s) skipped",
         sn, len(stored), skipped,
     )
 

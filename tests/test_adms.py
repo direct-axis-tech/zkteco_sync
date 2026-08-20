@@ -46,7 +46,7 @@ from sqlalchemy.pool import StaticPool                         # noqa: E402
 from app import config                                         # noqa: E402
 from app.database import Base, get_db                          # noqa: E402
 from app.models import (                                       # noqa: E402
-    AdmsPairing, AttendanceLog, Device, DeviceEmployee, Employee,
+    AdmsPairing, AttendanceLog, BiometricTemplate, Device, DeviceEmployee, Employee,
 )
 from app.routers import adms                                   # noqa: E402
 from app.services import employee_sync                         # noqa: E402
@@ -154,6 +154,17 @@ class AdmsTestCase(unittest.TestCase):
         db = self.Session()
         try:
             return {e.user_id: e for e in db.query(Employee).all()}
+        finally:
+            db.close()
+
+    def templates(self):
+        """All BiometricTemplate rows, keyed the same way the table is."""
+        db = self.Session()
+        try:
+            return {
+                (t.user_id, t.type, t.no): t
+                for t in db.query(BiometricTemplate).all()
+            }
         finally:
             db.close()
 
@@ -994,8 +1005,10 @@ class UserTableUploadTests(AdmsTestCase):
 
     # -- what must NOT be ingested ---------------------------------------
 
-    def test_biodata_is_still_acknowledged_without_being_stored(self):
-        """E2's table, not this one. It must keep behaving exactly as before."""
+    def test_biodata_does_not_create_an_employee_or_a_device_link(self):
+        """`biodata` is E2's table (BiometricTemplate, see BiodataTableUploadTests
+        below) — it must not become a second, implicit writer of `employees`
+        or `device_employees`."""
         response = self.client.post(
             f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=biodata&count=2",
             content="biodata pin=1\tno=5\ttype=1\ttmp=apUBEBgEfAQBAA0AAVH4AAg\n",
@@ -1050,6 +1063,207 @@ class UserTableUploadTests(AdmsTestCase):
         response = self.post_users(CAPTURED_USER_UPLOAD, count=3, serial="NOTAPPROVED01")
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.employees(), {})
+
+
+# ---------------------------------------------------------------------------
+# 4c. `tabledata&tablename=biodata` — biometric templates arriving verbatim
+# ---------------------------------------------------------------------------
+
+# The two records the operator's BioFace A1 actually sent for pin=1, recovered
+# from /Users/mufeedbinismail/Documents/zkteco-sync.log around 2026-08-20
+# 10:39:50 (`tmp` truncated here — the real one runs to a few KB of base64;
+# only its exact survival across storage is being tested, not its content).
+CAPTURED_BIODATA_UPLOAD = (
+    "biodata pin=1\tno=5\tindex=0\tvalid=1\tduress=0\ttype=1\tmajorver=13\t"
+    "minorver=0\tformat=0\ttmp=apUBEBgEfAQBAA0AAVH4AAgJCgs42CmiExIxE2A4o0xKdg==\n"
+    "biodata pin=1\tno=0\tindex=0\tvalid=1\tduress=0\ttype=9\tmajorver=40\t"
+    "minorver=1\tformat=0\ttmp=apUBFjYCAABuuOlOCQAoAQFM+ZoWAGJobX4kJSYnGSkqKw==\n"
+)
+
+
+class BiodataTableUploadTests(AdmsTestCase):
+    """Biometric templates stored verbatim so E4 can later replay them."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_device(ACC_SN, protocol="acc")
+
+    def post_biodata(self, body, count=None, serial=ACC_SN):
+        url = f"/iclock/cdata?SN={serial}&table=tabledata&tablename=biodata"
+        if count is not None:
+            url += f"&count={count}"
+        return self.client.post(url, content=body)
+
+    # -- the captured payload ---------------------------------------------
+
+    def test_the_captured_upload_stores_every_record(self):
+        response = self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        self.assertEqual(response.status_code, 200)
+
+        templates = self.templates()
+        self.assertEqual(sorted(templates), [("1", 1, 5), ("1", 9, 0)])
+
+    def test_the_acknowledgement_is_byte_exact(self):
+        """The device retries a multi-KB template upload forever without this
+        exact string."""
+        response = self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        self.assertEqual(response.content, b"biodata=6")
+        self.assertTrue(response.headers["content-type"].startswith("text/plain"))
+
+    def test_the_acknowledgement_echoes_the_declared_count_not_the_stored_one(self):
+        """count=6 was declared by the real device though only 2 records
+        survived the log — the ack must reflect what was declared, not what
+        this batch happened to contain."""
+        response = self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        self.assertEqual(response.text, "biodata=6")
+        self.assertEqual(len(self.templates()), 2)
+
+    # -- verbatim round-trip ------------------------------------------------
+
+    def test_every_field_survives_verbatim_including_the_unused_ones(self):
+        """duress, index, majorver, minorver and format have no use today —
+        they still must reach the row exactly as sent, because E4 rebuilds
+        `DATA UPDATE BIODATA` from these columns and nothing else."""
+        body = (
+            "biodata pin=7\tno=3\tindex=9\tvalid=1\tduress=1\ttype=1\t"
+            "majorver=13\tminorver=2\tformat=1\ttmp=QUJDREVGRw==\n"
+        )
+        self.post_biodata(body, count=1)
+
+        row = self.templates()[("7", 1, 3)]
+        self.assertEqual(row.record_index, 9)
+        self.assertEqual(row.valid, 1)
+        self.assertEqual(row.duress, 1)
+        self.assertEqual(row.majorver, 13)
+        self.assertEqual(row.minorver, 2)
+        self.assertEqual(row.format, 1)
+        self.assertEqual(row.tmp, "QUJDREVGRw==")
+        self.assertEqual(row.source_device_sn, ACC_SN)
+
+        # Enough to reconstruct §3.8's DATA UPDATE BIODATA command, field for
+        # field, from what is on the row.
+        reconstructed = (
+            f"Pin={row.user_id}\tNo={row.no}\tIndex={row.record_index}\t"
+            f"Valid={row.valid}\tDuress={row.duress}\tType={row.type}\t"
+            f"MajorVer={row.majorver}\tMinorVer={row.minorver}\t"
+            f"Format={row.format}\tTmp={row.tmp}"
+        )
+        self.assertEqual(
+            reconstructed,
+            "Pin=7\tNo=3\tIndex=9\tValid=1\tDuress=1\tType=1\t"
+            "MajorVer=13\tMinorVer=2\tFormat=1\tTmp=QUJDREVGRw==",
+        )
+
+    def test_fields_are_read_by_key_and_never_by_position(self):
+        body = (
+            "biodata tmp=WFla\tformat=0\tpin=21\tminorver=1\tno=2\ttype=9\t"
+            "majorver=40\tvalid=1\tduress=0\tindex=0\n"
+        )
+        self.post_biodata(body, count=1)
+        row = self.templates()[("21", 9, 2)]
+        self.assertEqual(row.tmp, "WFla")
+        self.assertEqual(row.majorver, 40)
+
+    # -- upsert semantics -----------------------------------------------
+
+    def test_a_repeat_upload_is_idempotent(self):
+        """Devices resend their whole template set on reconnect. A replay
+        must converge on the same rows, not accumulate duplicates."""
+        self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        first = self.templates()
+
+        response = self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+
+        self.assertEqual(response.text, "biodata=6")
+        again = self.templates()
+        self.assertEqual(sorted(again), sorted(first))
+        self.assertEqual(len(again), 2)
+
+    def test_a_changed_tmp_on_reupload_updates_the_row_not_a_new_one(self):
+        """Re-enrolling the same finger changes the template content but not
+        its identity — the row must update in place."""
+        self.post_biodata(
+            "biodata pin=1\tno=5\ttype=1\ttmp=AAAA\n", count=1,
+        )
+        self.post_biodata(
+            "biodata pin=1\tno=5\ttype=1\ttmp=BBBB\n", count=1,
+        )
+        templates = self.templates()
+        self.assertEqual(len(templates), 1)
+        self.assertEqual(templates[("1", 1, 5)].tmp, "BBBB")
+
+    def test_the_same_record_twice_in_one_batch_merges_rather_than_duplicating(self):
+        body = (
+            "biodata pin=3\tno=1\ttype=1\ttmp=AAAA\n"
+            "biodata pin=3\tno=1\ttype=1\ttmp=BBBB\n"
+        )
+        self.post_biodata(body, count=2)
+        templates = self.templates()
+        self.assertEqual(len(templates), 1)
+        self.assertEqual(templates[("3", 1, 1)].tmp, "BBBB")
+
+    # -- two modalities coexist -------------------------------------------
+
+    def test_two_modalities_for_one_pin_coexist(self):
+        """pin=1 in the real capture carries both a fingerprint (type=1,
+        no=5) and a face (type=9, no=0) record — confirming (user_id, type,
+        no) does not collide across modalities."""
+        self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        templates = self.templates()
+
+        fingerprint = templates[("1", 1, 5)]
+        face = templates[("1", 9, 0)]
+        self.assertNotEqual(fingerprint.tmp, face.tmp)
+        self.assertEqual(fingerprint.majorver, 13)
+        self.assertEqual(face.majorver, 40)
+
+    # -- malformed records ---------------------------------------------
+
+    def test_a_malformed_record_is_skipped_and_logged_without_dropping_the_batch(self):
+        body = (
+            "biodata pin=1\tno=5\ttype=1\ttmp=AAAA\n"
+            "total garbage with no equals sign at all\n"
+            "biodata pin=2\tno=0\ttmp=BBBB\n"          # no type
+            "biodata pin=\tno=0\ttype=1\ttmp=CCCC\n"    # no pin
+            "biodata pin=4\tno=1\ttype=1\ttmp=\n"       # no tmp
+            "biodata pin=5\tno=2\ttype=9\ttmp=DDDD\n"
+        )
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            response = self.post_biodata(body, count=6)
+
+        self.assertEqual(response.text, "biodata=6")
+        templates = self.templates()
+        self.assertEqual(sorted(templates), [("1", 1, 5), ("5", 9, 2)])
+        joined = "\n".join(captured.output)
+        self.assertIn("total garbage", joined)
+
+    def test_an_unapproved_serial_cannot_inject_templates(self):
+        response = self.post_biodata(
+            CAPTURED_BIODATA_UPLOAD, count=6, serial="NOTAPPROVED01",
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.templates(), {})
+
+    def test_a_storage_failure_still_acknowledges_so_the_device_stops_retrying(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated storage failure")
+
+        original = adms._store_biodata_table
+        adms._store_biodata_table = boom
+        try:
+            with self.assertLogs("app.routers.adms", level="ERROR"):
+                response = self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        finally:
+            adms._store_biodata_table = original
+
+        self.assertEqual(response.content, b"biodata=6")
+
+    def test_biodata_upload_does_not_touch_employees_or_device_links(self):
+        """Collision guard: this table must not become a second writer of
+        `employees` or `device_employees`."""
+        self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
+        self.assertEqual(self.employees(), {})
+        self.assertEqual(self.device_links(ACC_SN), {})
 
 
 class SdkAndPushAgreeTests(AdmsTestCase):

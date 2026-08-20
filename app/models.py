@@ -189,6 +189,70 @@ class FingerprintTemplate(Base):
     )
 
 
+class BiometricTemplate(Base):
+    """Biometric templates from Security PUSH's `tabledata&tablename=biodata`
+    bulk upload — ZKTeco's own "unified/hybrid" table, holding fingerprint
+    (`type=1`) and face (`type=9`) templates side by side, and possibly other
+    modalities `type` has not been observed to carry yet. That interpretation
+    of `type` is evidence, not a rule this table enforces: it is stored as
+    plain data, never branched on here.
+
+    Deliberately NOT `fingerprint_templates`. That table is SDK-sourced
+    (pyzk `get_templates()` over TCP 4370), keyed on `finger_id`, and stores a
+    hex-packed pyzk-specific blob — a different provenance and a different
+    field set. Folding `biodata` into it would corrupt both.
+
+    Every field the device sent is kept verbatim, including ones with no use
+    today (`duress`, `record_index`, `majorver`, `minorver`, `format`): E4
+    (template push-down) must reconstruct
+
+        DATA UPDATE BIODATA Pin=..\tNo=..\tIndex=..\tValid=..\tDuress=..\t
+        Type=..\tMajorVer=..\tMinorVer=..\tFormat=..\tTmp=..
+
+    from exactly these columns, and anything normalised away here is data it
+    cannot send. The command's field names are CamelCase (`Index`, `Type`,
+    `Format`...) while the upload's are lowercase (`index`, `type`,
+    `format`...) — a documented asymmetry between §3.7 and §3.8 of the
+    protocol spec, not a mismatch to "fix" by renaming.
+
+    `index` itself is a reserved word in the SQL dialects this project must
+    stay portable across (MariaDB/MySQL, PostgreSQL, MSSQL), so the column
+    that holds the wire's `index=` value is named `record_index` — the same
+    rename `AttendanceLog.record_index` already uses for the analogous field
+    on `rtlog`. The value round-trips unchanged; only the column identifier
+    differs from the wire.
+
+    `tmp` is base64 text of a few KB, stored as-is and never decoded — the
+    server has no need to understand the template, only to hold and later
+    replay it.
+
+    Keyed on `(user_id, type, no)`, confirmed unique against the operator's
+    real capture (VGU6254600603, 2026-08-20): pin=1 carries a fingerprint
+    record (`type=1, no=5`) and a face record (`type=9, no=0`) — two rows,
+    two distinct keys, one person.
+    """
+    __tablename__ = "biometric_templates"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(24), nullable=False, index=True)   # the device's `pin`
+    no = Column(Integer, nullable=False, default=0)
+    record_index = Column(Integer, nullable=False, default=0)  # wire field `index`
+    valid = Column(Integer, nullable=False, default=1)
+    duress = Column(Integer, nullable=False, default=0)
+    type = Column(Integer, nullable=False)                     # modality: data, not a branch taken here
+    majorver = Column(Integer, nullable=False, default=0)
+    minorver = Column(Integer, nullable=False, default=0)
+    format = Column(Integer, nullable=False, default=0)
+    tmp = Column(Text, nullable=False)                          # base64, verbatim, never decoded
+    source_device_sn = Column(String(50), nullable=False)       # so E4 can avoid pushing a template back to its own source
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "type", "no", name="uq_biometric_template"),
+    )
+
+
 class HrmIntegration(Base):
     """Single-row table — config and sync state for the HRM push integration."""
     __tablename__ = "hrm_integration"
