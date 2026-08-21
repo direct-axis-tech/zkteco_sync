@@ -72,6 +72,57 @@ ADMS_PAIRING_MINUTES = _get_int("ADMS_PAIRING_MINUTES", 15)
 
 
 # ---------------------------------------------------------------------------
+# Device command delivery (E7)
+# ---------------------------------------------------------------------------
+# A command is queued into device_command_outbox and handed to the device on
+# its next /iclock/getrequest poll. The device acknowledges it with
+# ID=<id>&Return=<code>&CMD=<name>. Everything below governs what happens when
+# that acknowledgement does not arrive.
+#
+# The distinction that matters: a command sitting `pending` because the device
+# has not polled is NOT a failure — it is the queue doing its job, and it is
+# what let the operator recover a weekend of missed punches. Only the
+# sent-but-never-acknowledged case consumes an attempt.
+
+# How many times one command may be handed to a device without ever being
+# acknowledged before it is given up on. Deliveries, not seconds: a device
+# that never polls never consumes one.
+COMMAND_MAX_ATTEMPTS = max(1, _get_int("COMMAND_MAX_ATTEMPTS", 5))
+
+# Delay before a delivered-but-unacknowledged command is offered again, one
+# entry per attempt. The last entry repeats if attempts outlive the list, so
+# the schedule is bounded no matter how the two values are set.
+# Default: 1m, 5m, 15m, 1h, 1h — a device that is merely slow gets several
+# quick chances; one that is ignoring us is retried lazily.
+COMMAND_BACKOFF_SECONDS = [
+    max(1, int(v))
+    for v in _get_list("COMMAND_BACKOFF_SECONDS", "60,300,900,3600")
+    if v.lstrip("-").isdigit()
+] or [60, 300, 900, 3600]
+
+# Absolute age at which an outstanding command is abandoned, counted from when
+# it was queued. Deliberately long and deliberately separate from
+# COMMAND_MAX_ATTEMPTS: this is the answer to "a command queued for a device
+# that never came back", not to "the device refused us". Set to 0 to disable.
+COMMAND_PENDING_EXPIRY_DAYS = _get_int("COMMAND_PENDING_EXPIRY_DAYS", 30)
+
+# How long concluded commands stay in device_command_log before the sweep
+# prunes them. Set to 0 to keep history forever.
+COMMAND_LOG_RETENTION_DAYS = _get_int("COMMAND_LOG_RETENTION_DAYS", 90)
+
+# How often the retry/expiry/prune sweep runs on the existing scheduler.
+COMMAND_SWEEP_MINUTES = max(1, _get_int("COMMAND_SWEEP_MINUTES", 15))
+
+# How many commands one getrequest poll may carry. The protocol allows several
+# LF-separated commands in one reply (§3.8), but no device in this install has
+# ever been sent a command at all, so the ack behaviour for a batch is
+# unobserved — and mis-acknowledging is precisely the bug this unit fixes.
+# Default 1 is provably correct; raise it once a real terminal has been seen
+# acknowledging a multi-command reply.
+COMMAND_BATCH_SIZE = max(1, _get_int("COMMAND_BATCH_SIZE", 1))
+
+
+# ---------------------------------------------------------------------------
 # Timezone provenance
 # ---------------------------------------------------------------------------
 # A ZKTeco device sends a bare wall-clock string with no offset and no zone

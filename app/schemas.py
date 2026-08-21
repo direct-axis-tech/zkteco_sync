@@ -119,6 +119,49 @@ class CommandCreate(BaseModel):
     command: str
 
 
+class CommandOut(BaseModel):
+    """One outstanding command — a row of device_command_outbox.
+
+    ``attempts=0`` with ``status='pending'`` is a command waiting for a device
+    that has not polled yet. Nothing is wrong with it; do not present it as an
+    error.
+    """
+
+    id: int
+    device_sn: str
+    command: str
+    status: str
+    attempts: int
+    next_attempt_at: Optional[datetime] = None
+    created_at: datetime
+    sent_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CommandLogOut(BaseModel):
+    """One concluded command — a row of device_command_log.
+
+    ``outcome='failed'`` with a ``return_code`` means the device refused it;
+    with no code, it means we gave up (``last_error`` says why).
+    """
+
+    id: int
+    device_sn: str
+    command: str
+    outcome: str
+    attempts: int
+    return_code: Optional[int] = None
+    last_error: Optional[str] = None
+    created_at: datetime
+    sent_at: Optional[datetime] = None
+    concluded_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # --- Device info ---
 
 class DeviceSizesOut(BaseModel):

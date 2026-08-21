@@ -59,13 +59,45 @@ def _hrm_tick():
     run_sync()
 
 
+def _command_sweep_tick():
+    """Retry/expiry/prune for the device command outbox and log (E7).
+
+    Deliberately low-frequency and deliberately on the *existing* scheduler:
+    none of this is time-critical and a second scheduler would be a second
+    thing to leak. The retry itself does not happen here — a command is only
+    ever re-offered when the device polls — so this job exists to conclude the
+    commands no poll will ever resolve, and to keep history from growing
+    without bound.
+    """
+    from app.services import commands
+
+    db = SessionLocal()
+    try:
+        commands.sweep(db)
+    except Exception:
+        # A failed sweep must never take the scheduler thread down with it;
+        # the next tick will try again.
+        log.exception("command sweep failed")
+    finally:
+        db.close()
+
+
 def _start_scheduler():
     global _scheduler
     from apscheduler.schedulers.background import BackgroundScheduler
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(_hrm_tick, "interval", seconds=60, id="hrm_tick")
+    _scheduler.add_job(
+        _command_sweep_tick,
+        "interval",
+        minutes=config.COMMAND_SWEEP_MINUTES,
+        id="command_sweep",
+    )
     _scheduler.start()
-    log.info("HRM sync scheduler started (60s tick)")
+    log.info(
+        "Scheduler started: HRM sync (60s tick), command sweep (%sm tick)",
+        config.COMMAND_SWEEP_MINUTES,
+    )
 
 
 @asynccontextmanager

@@ -10,16 +10,20 @@ from zk.finger import Finger
 
 from app import audit, config
 from app.database import get_db
-from app.models import Device, DeviceCommand, DeviceEmployee, Employee, FingerprintTemplate, User
+from app.models import (
+    Device, DeviceCommandLog, DeviceCommandOutbox, DeviceEmployee, Employee,
+    FingerprintTemplate, User,
+)
 from app.deps import require_admin, require_auth
 from app.net import client_ip, valid_cidrs
 from app.schemas import (
-    BulkPushRequest, CommandCreate, DeviceCreate, DeviceInfoOut, DeviceOut,
+    BulkPushRequest, CommandCreate, CommandLogOut, CommandOut, DeviceCreate,
+    DeviceInfoOut, DeviceOut,
     DeviceProtocolUpdate, DeviceTimezoneUpdate, DeviceUpdate, EnrollRequest,
     FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
     SetTimeRequest, UnlockRequest,
 )
-from app.services import pairing
+from app.services import commands, pairing
 from app.services.poller import pull_attendance, pull_device, pull_employees
 from app.services.sdk import device_connection, enroll_user_task
 
@@ -387,12 +391,52 @@ def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks, db: Sess
 
 @router.post("/{sn}/commands", status_code=201, dependencies=[Depends(require_admin)])
 def queue_command(sn: str, payload: CommandCreate, db: Session = Depends(get_db)):
+    """Queue one command for delivery on the device's next poll.
+
+    201 means queued, not delivered — there is no synchronous path to an ADMS
+    device, so this cannot report whether the device accepted it. Read the
+    outcome from the two GETs below.
+    """
     _get_device_or_404(sn, db)
-    cmd = DeviceCommand(device_sn=sn, command=payload.command)
-    db.add(cmd)
-    db.commit()
-    db.refresh(cmd)
-    return {"id": cmd.id, "device_sn": sn, "command": cmd.command, "status": cmd.status}
+    row = commands.queue(db, sn, payload.command)
+    return CommandOut.model_validate(row)
+
+
+@router.get("/{sn}/commands", response_model=list[CommandOut],
+            dependencies=[Depends(require_admin)])
+def list_outstanding_commands(sn: str, db: Session = Depends(get_db)):
+    """What this device still owes us — the whole outbox, oldest first.
+
+    A row here with attempts=0 has not failed at anything; it is waiting for
+    the device to poll. That is the ordinary state of a queue for a terminal
+    that is switched off, and is exactly what makes the queue useful.
+    """
+    _get_device_or_404(sn, db)
+    return (
+        db.query(DeviceCommandOutbox)
+        .filter_by(device_sn=sn)
+        .order_by(DeviceCommandOutbox.created_at, DeviceCommandOutbox.id)
+        .all()
+    )
+
+
+@router.get("/{sn}/commands/history", response_model=list[CommandLogOut],
+            dependencies=[Depends(require_admin)])
+def list_concluded_commands(sn: str, limit: int = 100, db: Session = Depends(get_db)):
+    """Commands that are over, most recent first — how each one ended.
+
+    ``outcome='failed'`` with a ``return_code`` is the device having refused
+    the command; ``failed`` with a null code and a ``last_error`` is us having
+    given up on it.
+    """
+    _get_device_or_404(sn, db)
+    return (
+        db.query(DeviceCommandLog)
+        .filter_by(device_sn=sn)
+        .order_by(DeviceCommandLog.concluded_at.desc(), DeviceCommandLog.id.desc())
+        .limit(max(1, min(limit, 1000)))
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------------

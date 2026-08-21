@@ -25,7 +25,7 @@ configuration row.
 import hashlib
 import os
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # Set before importing anything from `app`: app.config and app.database both
 # call load_dotenv(), which does NOT override variables that are already set,
@@ -2343,6 +2343,1023 @@ class AttendanceListFallbackTests(unittest.TestCase):
             self.assertNotIn("Z", item["timestamp"])
 
         self.assertEqual(by_user["1001"]["timestamp"], "2026-08-20 14:48:22")
+
+
+# ---------------------------------------------------------------------------
+# 12. Command delivery: the outbox, the log, and the move between them (E7)
+# ---------------------------------------------------------------------------
+
+class CommandDeliveryTestCase(unittest.TestCase):
+    """Both routers against one database.
+
+    The queue is only meaningful end to end: an operator queues through
+    /devices/{sn}/commands, the device collects through /iclock/getrequest and
+    reports back through /iclock/devicecmd. Splitting those across fixtures
+    would test three halves of a mechanism and none of the mechanism.
+    """
+
+    SN = "E7CMDTEST0001"
+    OTHER_SN = "E7CMDTEST0002"
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+
+        from app.deps import require_admin, require_auth
+        from app.models import User
+        from app.routers import devices as devices_router
+
+        app = FastAPI()
+        app.include_router(devices_router.router)
+        app.include_router(adms.router)
+
+        def _override_get_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        admin = User(id=1, username="tester", role="admin", password_hash="x")
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[require_auth] = lambda: admin
+        app.dependency_overrides[require_admin] = lambda: admin
+        self.client = TestClient(app, client=("203.0.113.10", 40000))
+
+        db = self.Session()
+        try:
+            for serial in (self.SN, self.OTHER_SN):
+                db.add(Device(serial_number=serial, ip_address="203.0.113.10",
+                              port=4370, name="Terminal", status="approved",
+                              protocol="acc"))
+            db.commit()
+        finally:
+            db.close()
+
+    def tearDown(self):
+        self.client.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    # -- helpers ---------------------------------------------------------
+
+    def session(self):
+        return self.Session()
+
+    def outbox(self, sn=None):
+        from app.models import DeviceCommandOutbox
+        db = self.Session()
+        try:
+            query = db.query(DeviceCommandOutbox)
+            if sn:
+                query = query.filter_by(device_sn=sn)
+            return query.order_by(DeviceCommandOutbox.id).all()
+        finally:
+            db.close()
+
+    def history(self, sn=None):
+        from app.models import DeviceCommandLog
+        db = self.Session()
+        try:
+            query = db.query(DeviceCommandLog)
+            if sn:
+                query = query.filter_by(device_sn=sn)
+            return query.order_by(DeviceCommandLog.id).all()
+        finally:
+            db.close()
+
+    def queue(self, command="DATA UPDATE user Pin=1\tName=Aisha", sn=None):
+        """Queue through the real operator endpoint and return the new id."""
+        response = self.client.post(f"/devices/{sn or self.SN}/commands",
+                                    json={"command": command})
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["id"]
+
+    def poll(self, sn=None):
+        """One /iclock/getrequest, as the device makes it."""
+        return self.client.get(f"/iclock/getrequest?SN={sn or self.SN}").text
+
+    def ack(self, command_id, return_code=0, cmd="DATA UPDATE", sn=None, in_query=False):
+        """One /iclock/devicecmd, in the body (§3.9) or the query (§3.8)."""
+        serial = sn or self.SN
+        if in_query:
+            return self.client.post(
+                f"/iclock/devicecmd?SN={serial}&ID={command_id}"
+                f"&Return={return_code}&CMD={cmd}",
+                content="",
+            )
+        return self.client.post(
+            f"/iclock/devicecmd?SN={serial}",
+            content=f"ID={command_id}&Return={return_code}&CMD={cmd}&SN={serial}",
+        )
+
+    def rewind_backoff(self, command_id, seconds=1):
+        """Pretend the retry window has elapsed, without sleeping through it."""
+        from app.models import DeviceCommandOutbox
+        db = self.Session()
+        try:
+            row = db.query(DeviceCommandOutbox).filter_by(id=command_id).first()
+            row.next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+            db.commit()
+        finally:
+            db.close()
+
+    def assert_exactly_one_home(self, command, sn=None):
+        """The invariant: outstanding XOR concluded, never both, never neither.
+
+        Matched on the command text rather than the id, because the two tables
+        have independent id sequences — the log row is a new row, not the same
+        row relabelled."""
+        serial = sn or self.SN
+        outstanding = [r for r in self.outbox(serial) if r.command == command]
+        concluded = [r for r in self.history(serial) if r.command == command]
+        self.assertEqual(
+            len(outstanding) + len(concluded), 1,
+            f"command {command!r} is in {len(outstanding)} outbox row(s) and "
+            f"{len(concluded)} log row(s) — it must be in exactly one",
+        )
+
+
+class CommandDispatchTests(CommandDeliveryTestCase):
+    """Queueing, and what a device is handed when it polls."""
+
+    def test_a_queued_command_is_handed_out_once_and_marked_sent(self):
+        command_id = self.queue()
+
+        # Queued but not yet delivered: nothing has been attempted.
+        row = self.outbox()[0]
+        self.assertEqual(row.status, "pending")
+        self.assertEqual(row.attempts, 0)
+        self.assertIsNone(row.sent_at)
+        self.assertIsNone(row.next_attempt_at)
+
+        body = self.poll()
+        self.assertEqual(body, f"C:{command_id}:DATA UPDATE user Pin=1\tName=Aisha")
+
+        row = self.outbox()[0]
+        self.assertEqual(row.status, "sent")
+        self.assertEqual(row.attempts, 1)
+        self.assertIsNotNone(row.sent_at)
+        self.assertIsNotNone(row.next_attempt_at)
+
+        # Handed out ONCE: the next poll, inside the backoff window, gets the
+        # idle reply rather than the same command again.
+        self.assertEqual(self.poll(), "OK")
+        self.assertEqual(self.outbox()[0].attempts, 1)
+
+    def test_the_wire_format_carries_the_id_the_device_must_quote_back(self):
+        """Without the C:<id>: envelope there is no id for the device to
+        report, and matching an acknowledgement becomes impossible."""
+        command_id = self.queue("DATA DELETE user Pin=7")
+        self.assertEqual(self.poll(), f"C:{command_id}:DATA DELETE user Pin=7")
+
+    def test_an_id_envelope_supplied_by_the_caller_is_not_nested(self):
+        """A caller that helpfully pre-formats the command must not produce
+        C:12:C:99:… — the device would quote back an id we never issued."""
+        command_id = self.queue("C:99:DATA UPDATE user Pin=3")
+        self.assertEqual(self.outbox()[0].command, "DATA UPDATE user Pin=3")
+        self.assertEqual(self.poll(), f"C:{command_id}:DATA UPDATE user Pin=3")
+
+    def test_an_idle_queue_still_answers_the_heartbeat(self):
+        self.assertEqual(self.poll(), "OK")
+
+    def test_commands_are_handed_out_oldest_first(self):
+        first = self.queue("DATA UPDATE user Pin=1")
+        second = self.queue("DATA UPDATE user Pin=2")
+
+        self.assertEqual(self.poll(), f"C:{first}:DATA UPDATE user Pin=1")
+        self.ack(first)
+        self.assertEqual(self.poll(), f"C:{second}:DATA UPDATE user Pin=2")
+
+    def test_one_devices_queue_is_never_handed_to_another(self):
+        mine = self.queue("DATA UPDATE user Pin=1", sn=self.SN)
+        self.queue("DATA UPDATE user Pin=2", sn=self.OTHER_SN)
+
+        self.assertEqual(self.poll(self.SN), f"C:{mine}:DATA UPDATE user Pin=1")
+        self.assertEqual(len(self.outbox(self.OTHER_SN)), 1)
+        self.assertEqual(self.outbox(self.OTHER_SN)[0].attempts, 0)
+
+    def test_a_batch_is_lf_separated_when_the_batch_size_allows_it(self):
+        """§3.8 allows several commands in one reply. The default is 1 because
+        no real terminal here has ever been sent a command, but the mechanism
+        is built and must be correct when an operator raises the setting."""
+        from unittest import mock
+        first = self.queue("DATA UPDATE user Pin=1")
+        second = self.queue("DATA UPDATE user Pin=2")
+
+        with mock.patch.object(config, "COMMAND_BATCH_SIZE", 3):
+            body = self.poll()
+
+        self.assertEqual(
+            body,
+            f"C:{first}:DATA UPDATE user Pin=1\nC:{second}:DATA UPDATE user Pin=2",
+        )
+        # Each is independently tracked, so a partial acknowledgement works.
+        self.assertEqual([r.attempts for r in self.outbox()], [1, 1])
+
+    def test_an_unapproved_serial_cannot_drain_a_queue(self):
+        self.queue()
+        db = self.Session()
+        try:
+            db.query(Device).filter_by(serial_number=self.SN).first().status = "pending"
+            db.commit()
+        finally:
+            db.close()
+
+        self.assertEqual(self.client.get(f"/iclock/getrequest?SN={self.SN}").status_code, 401)
+        self.assertEqual(self.outbox()[0].attempts, 0)
+
+
+class CommandAcknowledgementTests(CommandDeliveryTestCase):
+    """The bug this unit exists to fix, and the semantics around it."""
+
+    def test_a_matching_ack_moves_the_command_to_history(self):
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+
+        response = self.ack(command_id, return_code=0)
+        self.assertEqual(response.text, "OK")
+
+        self.assertEqual(self.outbox(), [])
+        concluded = self.history()
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "acknowledged")
+        self.assertEqual(concluded[0].return_code, 0)
+        self.assertEqual(concluded[0].command, "DATA UPDATE user Pin=1")
+        self.assertEqual(concluded[0].attempts, 1)
+        self.assertIsNotNone(concluded[0].sent_at)
+        self.assertIsNotNone(concluded[0].concluded_at)
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+    # -- THE REGRESSION TEST -------------------------------------------------
+
+    def test_an_ack_for_one_command_does_not_conclude_a_different_one(self):
+        """The pre-existing bug, precisely.
+
+        adms_devicecmd used to take the OLDEST `sent` command for the serial
+        and mark it acknowledged, ignoring the id the device reported and
+        discarding Return= entirely. With two commands in flight it therefore
+        closed the wrong one every time — reporting a success the device never
+        gave, and leaving the command that actually ran to be retried until it
+        was declared failed.
+        """
+        from unittest import mock
+
+        first = self.queue("DATA UPDATE user Pin=1")
+        second = self.queue("DATA UPDATE user Pin=2")
+
+        # Both delivered, so both are `sent` and the old code had a choice to
+        # get wrong. `first` is the oldest — the one the bug would have taken.
+        with mock.patch.object(config, "COMMAND_BATCH_SIZE", 2):
+            self.poll()
+        self.assertEqual([r.status for r in self.outbox()], ["sent", "sent"])
+
+        # The device reports on the SECOND one.
+        self.ack(second, return_code=0)
+
+        remaining = self.outbox()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(
+            remaining[0].id, first,
+            "the wrong command was concluded — the ack was matched by "
+            "position, not by the id the device reported",
+        )
+        self.assertEqual(remaining[0].command, "DATA UPDATE user Pin=1")
+
+        concluded = self.history()
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].command, "DATA UPDATE user Pin=2")
+
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+        self.assert_exactly_one_home("DATA UPDATE user Pin=2")
+
+    def test_an_ack_naming_another_devices_command_concludes_nothing(self):
+        """Serial and id must BOTH match: an id is only unique to us, and a
+        device must never be able to close another device's work."""
+        mine = self.queue("DATA UPDATE user Pin=1", sn=self.SN)
+        self.poll(self.SN)
+
+        with self.assertLogs("app.services.commands", level="WARNING"):
+            response = self.ack(mine, return_code=0, sn=self.OTHER_SN)
+
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(len(self.outbox(self.SN)), 1)
+        self.assertEqual(self.history(), [])
+
+    def test_an_ack_for_an_unknown_id_concludes_nothing_and_still_says_ok(self):
+        command_id = self.queue()
+        self.poll()
+
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            response = self.ack(command_id + 4242, return_code=0)
+
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(len(self.outbox()), 1)
+        self.assertEqual(self.history(), [])
+        self.assertIn("not outstanding", "\n".join(captured.output))
+
+    def test_a_repeated_ack_does_not_write_a_second_history_row(self):
+        command_id = self.queue()
+        self.poll()
+        self.ack(command_id)
+
+        with self.assertLogs("app.services.commands", level="WARNING"):
+            self.ack(command_id)
+
+        self.assertEqual(len(self.history()), 1)
+        self.assertEqual(self.outbox(), [])
+
+    # -- Return= semantics ---------------------------------------------------
+
+    def test_a_non_zero_return_fails_permanently_and_is_never_retried(self):
+        """A non-zero Return is the device REFUSING the command. It received
+        it, understood it and declined. Retrying earns the same refusal while
+        occupying the queue, so it is concluded immediately."""
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            self.ack(command_id, return_code=-14, cmd="DATA UPDATE")
+
+        self.assertEqual(self.outbox(), [], "a refused command must not stay queued")
+        concluded = self.history()
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "failed")
+        self.assertEqual(concluded[0].return_code, -14)
+        self.assertIn("Return=-14", concluded[0].last_error)
+        self.assertEqual(concluded[0].attempts, 1,
+                         "a refusal must not consume the retry budget — it ends it")
+        self.assertIn("rejected", "\n".join(captured.output))
+
+        # And there is nothing left to hand out on the next poll.
+        self.assertEqual(self.poll(), "OK")
+
+    def test_a_positive_non_zero_return_is_a_refusal_too(self):
+        command_id = self.queue()
+        self.poll()
+        with self.assertLogs("app.services.commands", level="WARNING"):
+            self.ack(command_id, return_code=1)
+        self.assertEqual(self.history()[0].outcome, "failed")
+        self.assertEqual(self.history()[0].return_code, 1)
+
+    def test_an_ack_with_no_return_code_leaves_the_command_outstanding(self):
+        """Absence is not success. Nothing is concluded on a guess; the
+        ordinary retry path gets another chance at it."""
+        command_id = self.queue()
+        self.poll()
+
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            response = self.client.post(
+                f"/iclock/devicecmd?SN={self.SN}",
+                content=f"ID={command_id}&CMD=DATA UPDATE",
+            )
+
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(len(self.outbox()), 1)
+        self.assertEqual(self.history(), [])
+        self.assertIn("no Return=", "\n".join(captured.output))
+
+    # -- what the device actually sends --------------------------------------
+
+    def test_the_ack_is_read_from_the_body_as_the_spec_specifies(self):
+        command_id = self.queue()
+        self.poll()
+        response = self.client.post(
+            f"/iclock/devicecmd?SN={self.SN}",
+            content=f"ID={command_id}&Return=0&CMD=DATA UPDATE&SN={self.SN}",
+        )
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(self.history()[0].outcome, "acknowledged")
+
+    def test_the_ack_is_also_read_from_the_query_string(self):
+        """§3.9 puts these in the body; §3.8's own example writes them as a
+        query string, and no capture from the operator's terminal contains a
+        devicecmd request at all — the device has been polling a queue that
+        was never given anything. So both forms are accepted rather than
+        betting on one."""
+        command_id = self.queue()
+        self.poll()
+        response = self.ack(command_id, return_code=0, in_query=True)
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(self.history()[0].outcome, "acknowledged")
+
+    def test_a_command_name_containing_a_space_is_parsed(self):
+        """CMD=DATA UPDATE arrives unencoded, which a strict form parser
+        handles but a naive split on whitespace does not."""
+        parsed = adms._parse_devicecmd("ID=295&Return=0&CMD=DATA UPDATE&SN=X")
+        self.assertEqual(parsed, [{"id": 295, "return_code": 0, "cmd": "DATA UPDATE"}])
+
+    def test_several_results_in_one_post_are_each_parsed(self):
+        parsed = adms._parse_devicecmd(
+            "ID=1&Return=0&CMD=DATA UPDATE\nID=2&Return=-14&CMD=DATA DELETE\n"
+        )
+        self.assertEqual([p["id"] for p in parsed], [1, 2])
+        self.assertEqual([p["return_code"] for p in parsed], [0, -14])
+
+    def test_several_results_in_one_post_are_each_concluded(self):
+        from unittest import mock
+        first = self.queue("DATA UPDATE user Pin=1")
+        second = self.queue("DATA UPDATE user Pin=2")
+        with mock.patch.object(config, "COMMAND_BATCH_SIZE", 2):
+            self.poll()
+
+        with self.assertLogs("app.services.commands", level="WARNING"):
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.SN}",
+                content=f"ID={first}&Return=0&CMD=DATA UPDATE\n"
+                        f"ID={second}&Return=-14&CMD=DATA UPDATE",
+            )
+
+        self.assertEqual(self.outbox(), [])
+        outcomes = {r.command: r.outcome for r in self.history()}
+        self.assertEqual(outcomes, {
+            "DATA UPDATE user Pin=1": "acknowledged",
+            "DATA UPDATE user Pin=2": "failed",
+        })
+
+    def test_a_junk_body_concludes_nothing_and_never_500s(self):
+        self.queue()
+        self.poll()
+        with self.assertLogs("app.routers.adms", level="WARNING"):
+            response = self.client.post(f"/iclock/devicecmd?SN={self.SN}",
+                                        content="something went wrong")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(len(self.outbox()), 1)
+        self.assertEqual(self.history(), [])
+
+    def test_an_empty_body_concludes_nothing(self):
+        """The catch-all suite already posts an empty devicecmd; with a real
+        queue behind it that must still touch nothing."""
+        self.queue()
+        self.poll()
+        with self.assertLogs("app.routers.adms", level="WARNING"):
+            response = self.client.post(f"/iclock/devicecmd?SN={self.SN}", content="")
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(len(self.outbox()), 1)
+
+
+class CommandRetryTests(CommandDeliveryTestCase):
+    """Silence, backoff, and the bounded end of it."""
+
+    def test_a_sent_but_unacked_command_is_offered_again_after_its_backoff(self):
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.assertEqual(self.poll(), f"C:{command_id}:DATA UPDATE user Pin=1")
+
+        # Inside the backoff window: not offered, not counted.
+        self.assertEqual(self.poll(), "OK")
+        self.assertEqual(self.outbox()[0].attempts, 1)
+
+        self.rewind_backoff(command_id)
+
+        self.assertEqual(self.poll(), f"C:{command_id}:DATA UPDATE user Pin=1")
+        row = self.outbox()[0]
+        self.assertEqual(row.attempts, 2)
+        self.assertEqual(row.status, "sent")
+
+        # And an ack for it still works after a retry.
+        self.ack(command_id)
+        self.assertEqual(self.history()[0].outcome, "acknowledged")
+        self.assertEqual(self.history()[0].attempts, 2)
+
+    def test_the_backoff_lengthens_and_is_bounded_by_the_last_entry(self):
+        from app.services import commands as command_service
+        from unittest import mock
+
+        with mock.patch.object(config, "COMMAND_BACKOFF_SECONDS", [60, 300, 900]):
+            waits = [command_service.backoff_for(n).total_seconds() for n in range(1, 7)]
+
+        self.assertEqual(waits, [60, 300, 900, 900, 900, 900],
+                         "the schedule must lengthen and then hold, never grow "
+                         "without bound and never fall back to the start")
+
+    def test_attempts_exhaust_to_a_visible_failure(self):
+        from unittest import mock
+
+        with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 3):
+            command_id = self.queue("DATA UPDATE user Pin=1")
+
+            for expected in (1, 2, 3):
+                self.assertEqual(self.poll(), f"C:{command_id}:DATA UPDATE user Pin=1")
+                self.assertEqual(self.outbox()[0].attempts, expected)
+                self.rewind_backoff(command_id)
+
+            # Fourth eligible poll: nothing left to try.
+            with self.assertLogs("app.services.commands", level="WARNING") as captured:
+                self.assertEqual(self.poll(), "OK")
+
+        self.assertEqual(self.outbox(), [])
+        concluded = self.history()
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "failed")
+        self.assertEqual(concluded[0].attempts, 3)
+        self.assertIsNone(concluded[0].return_code,
+                          "no code: the device never answered at all")
+        self.assertIn("no acknowledgement after 3 attempts", concluded[0].last_error)
+        self.assertIn("never acknowledged", "\n".join(captured.output))
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+    def test_a_failure_is_reported_with_a_reason_an_operator_can_read(self):
+        """'Visibly fail' means the reason survives to the API, not just a log."""
+        from unittest import mock
+        with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 1):
+            command_id = self.queue("DATA UPDATE user Pin=1")
+            self.poll()
+            self.rewind_backoff(command_id)
+            with self.assertLogs("app.services.commands", level="WARNING"):
+                self.poll()
+
+        items = self.client.get(f"/devices/{self.SN}/commands/history").json()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["outcome"], "failed")
+        self.assertEqual(items[0]["attempts"], 1)
+        self.assertIn("no acknowledgement", items[0]["last_error"])
+        self.assertEqual(self.client.get(f"/devices/{self.SN}/commands").json(), [])
+
+
+class OfflineIsNotFailureTests(CommandDeliveryTestCase):
+    """The distinction the operator cares about most.
+
+    A command waiting for a device that has not polled is the queue doing its
+    job — it is what recovered a weekend of missing punches. It must not be
+    counted as an attempt, and a device that comes back after days away must
+    find its work waiting, not a pile of failures it never had a chance at.
+    """
+
+    def test_a_device_that_never_polls_accrues_no_attempts_and_no_failures(self):
+        from app.services import commands as command_service
+        from unittest import mock
+
+        self.queue("DATA UPDATE user Pin=1")
+
+        # Days pass. The sweep runs many times. The device never polls.
+        now = datetime.now(timezone.utc)
+        db = self.Session()
+        try:
+            with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 1):
+                for day in range(1, 6):
+                    command_service.sweep(db, now=now + timedelta(days=day))
+        finally:
+            db.close()
+
+        rows = self.outbox()
+        self.assertEqual(len(rows), 1, "the command must still be queued")
+        self.assertEqual(rows[0].status, "pending")
+        self.assertEqual(rows[0].attempts, 0,
+                         "not polling is not an attempt")
+        self.assertEqual(self.history(), [],
+                         "an offline device must not produce failures")
+
+    def test_the_command_is_still_delivered_when_the_device_finally_returns(self):
+        """The whole point: the queue holds the work until the device comes
+        back, however long that takes."""
+        from app.services import commands as command_service
+
+        command_id = self.queue("DATA UPDATE user Pin=1")
+
+        now = datetime.now(timezone.utc)
+        db = self.Session()
+        try:
+            for day in range(1, 4):
+                command_service.sweep(db, now=now + timedelta(days=day))
+        finally:
+            db.close()
+
+        self.assertEqual(self.poll(), f"C:{command_id}:DATA UPDATE user Pin=1")
+        self.ack(command_id)
+        self.assertEqual(self.history()[0].outcome, "acknowledged")
+
+    def test_a_pending_command_is_untouched_by_the_sweep_within_its_expiry(self):
+        from app.services import commands as command_service
+
+        self.queue()
+        db = self.Session()
+        try:
+            result = command_service.sweep(db)
+        finally:
+            db.close()
+
+        self.assertEqual(result, {"exhausted": 0, "expired": 0, "pruned": 0})
+        self.assertEqual(len(self.outbox()), 1)
+
+    def test_the_absolute_expiry_is_a_separate_much_longer_clock(self):
+        """A command queued for a terminal that was decommissioned should not
+        sit in the queue forever — but the clock that gives up on it is
+        measured in weeks and is nothing to do with the retry count."""
+        from app.services import commands as command_service
+        from unittest import mock
+
+        self.queue("DATA UPDATE user Pin=1")
+
+        db = self.Session()
+        try:
+            with mock.patch.object(config, "COMMAND_PENDING_EXPIRY_DAYS", 30):
+                # Day 29: still waiting, still fine.
+                inside = command_service.sweep(
+                    db, now=datetime.now(timezone.utc) + timedelta(days=29))
+                self.assertEqual(inside["expired"], 0)
+                self.assertEqual(len(self.outbox()), 1)
+
+                # Day 31: given up on, with the reason recorded.
+                beyond = command_service.sweep(
+                    db, now=datetime.now(timezone.utc) + timedelta(days=31))
+        finally:
+            db.close()
+
+        self.assertEqual(beyond["expired"], 1)
+        self.assertEqual(self.outbox(), [])
+        concluded = self.history()
+        self.assertEqual(concluded[0].outcome, "failed")
+        self.assertEqual(concluded[0].attempts, 0)
+        self.assertIn("without the device ever polling", concluded[0].last_error)
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+    def test_the_absolute_expiry_can_be_switched_off_entirely(self):
+        from app.services import commands as command_service
+        from unittest import mock
+
+        self.queue()
+        db = self.Session()
+        try:
+            with mock.patch.object(config, "COMMAND_PENDING_EXPIRY_DAYS", 0):
+                result = command_service.sweep(
+                    db, now=datetime.now(timezone.utc) + timedelta(days=3650))
+        finally:
+            db.close()
+
+        self.assertEqual(result["expired"], 0)
+        self.assertEqual(len(self.outbox()), 1)
+
+
+class CommandSweepTests(CommandDeliveryTestCase):
+    """The scheduled job: conclude the hopeless, prune the history."""
+
+    def test_a_device_that_stops_polling_mid_retry_still_fails_on_a_timer(self):
+        """getrequest concludes an exhausted command on the next poll — but a
+        device that has gone silent will never poll again, so the failure has
+        to surface some other way."""
+        from app.services import commands as command_service
+        from unittest import mock
+
+        with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 2):
+            command_id = self.queue("DATA UPDATE user Pin=1")
+            self.poll()
+            self.rewind_backoff(command_id)
+            self.poll()
+            self.assertEqual(self.outbox()[0].attempts, 2)
+            self.rewind_backoff(command_id)
+
+            db = self.Session()
+            try:
+                result = command_service.sweep(db)
+            finally:
+                db.close()
+
+        self.assertEqual(result["exhausted"], 1)
+        self.assertEqual(self.outbox(), [])
+        self.assertEqual(self.history()[0].outcome, "failed")
+        self.assertEqual(self.history()[0].attempts, 2)
+
+    def test_the_sweep_does_not_touch_a_command_still_inside_its_backoff(self):
+        from app.services import commands as command_service
+        from unittest import mock
+
+        with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 1):
+            self.queue()
+            self.poll()          # attempts=1, next_attempt_at in the future
+
+            db = self.Session()
+            try:
+                result = command_service.sweep(db)
+            finally:
+                db.close()
+
+        self.assertEqual(result["exhausted"], 0)
+        self.assertEqual(len(self.outbox()), 1,
+                         "its retry window has not elapsed yet")
+
+    def test_cleanup_prunes_only_concluded_history(self):
+        from app.models import DeviceCommandLog
+        from app.services import commands as command_service
+        from unittest import mock
+
+        # One command still outstanding, queued long ago.
+        self.queue("DATA UPDATE user Pin=1")
+        # One concluded a long time ago, one concluded just now.
+        self.queue("DATA UPDATE user Pin=2")
+        recent = self.queue("DATA UPDATE user Pin=3")
+
+        db = self.Session()
+        try:
+            old = self.outbox()[1]
+            command_service.conclude(db, db.merge(old), "acknowledged", return_code=0)
+            row = db.query(DeviceCommandLog).order_by(DeviceCommandLog.id.desc()).first()
+            row.concluded_at = datetime.now(timezone.utc) - timedelta(days=200)
+            db.commit()
+        finally:
+            db.close()
+
+        self.poll()
+        self.ack(recent)
+
+        self.assertEqual(len(self.history()), 2)
+
+        db = self.Session()
+        try:
+            with mock.patch.object(config, "COMMAND_LOG_RETENTION_DAYS", 90):
+                result = command_service.sweep(db)
+        finally:
+            db.close()
+
+        self.assertEqual(result["pruned"], 1)
+
+        remaining = self.history()
+        self.assertEqual([r.command for r in remaining], ["DATA UPDATE user Pin=3"])
+
+        # The live queue is untouched: cleanup prunes history, never work.
+        self.assertEqual([r.command for r in self.outbox()], ["DATA UPDATE user Pin=1"])
+
+    def test_history_retention_can_be_switched_off(self):
+        from app.models import DeviceCommandLog
+        from app.services import commands as command_service
+        from unittest import mock
+
+        command_id = self.queue()
+        self.poll()
+        self.ack(command_id)
+
+        db = self.Session()
+        try:
+            db.query(DeviceCommandLog).first().concluded_at = (
+                datetime.now(timezone.utc) - timedelta(days=3650))
+            db.commit()
+            with mock.patch.object(config, "COMMAND_LOG_RETENTION_DAYS", 0):
+                result = command_service.sweep(db)
+        finally:
+            db.close()
+
+        self.assertEqual(result["pruned"], 0)
+        self.assertEqual(len(self.history()), 1)
+
+    def test_the_sweep_is_registered_on_the_existing_scheduler(self):
+        """One scheduler, not two — a second would be a second thing to leak."""
+        import inspect as _inspect
+        from app import main as app_main
+
+        source = _inspect.getsource(app_main._start_scheduler)
+        self.assertEqual(source.count("BackgroundScheduler()"), 1)
+        self.assertIn("command_sweep", source)
+        self.assertIn("hrm_tick", source)
+
+
+class CommandAtomicityTests(CommandDeliveryTestCase):
+    """A command is outstanding or concluded. Never both. Never neither."""
+
+    def test_the_invariant_holds_at_every_step_of_a_normal_life(self):
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+        self.poll()
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+        self.rewind_backoff(command_id)
+        self.poll()
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+        self.ack(command_id)
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+    def test_a_failed_history_write_leaves_the_command_outstanding(self):
+        """The move is one transaction, so a log row that cannot be written
+        must take the outbox delete down with it. The alternative — a command
+        deleted from the queue with no record of it anywhere — is the one
+        outcome this design must never produce."""
+        from unittest import mock
+        from app.services import commands as command_service
+
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+
+        db = self.Session()
+        try:
+            with mock.patch.object(command_service, "DeviceCommandLog",
+                                   side_effect=RuntimeError("history write failed")):
+                with self.assertRaises(RuntimeError):
+                    command_service.acknowledge(db, self.SN, command_id, 0)
+            # What a request-scoped session does on the way out.
+            db.rollback()
+        finally:
+            db.close()
+
+        self.assertEqual(len(self.outbox()), 1,
+                         "the command vanished — deleted from the queue with "
+                         "no history row to show for it")
+        self.assertEqual(self.history(), [])
+        self.assert_exactly_one_home("DATA UPDATE user Pin=1")
+
+        # And it is still deliverable afterwards, having lost nothing.
+        self.rewind_backoff(command_id)
+        self.assertEqual(self.poll(), f"C:{command_id}:DATA UPDATE user Pin=1")
+
+    def test_two_acks_racing_for_one_command_produce_exactly_one_log_row(self):
+        """The DELETE's row count is the arbiter, not the read that precedes
+        it, so the loser writes nothing."""
+        from app.services import commands as command_service
+
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+
+        first_db = self.Session()
+        second_db = self.Session()
+        try:
+            # Both sessions read the row while it is still outstanding.
+            row_a = first_db.query(command_service.DeviceCommandOutbox).get(command_id)
+            row_b = second_db.query(command_service.DeviceCommandOutbox).get(command_id)
+            self.assertIsNotNone(row_a)
+            self.assertIsNotNone(row_b)
+
+            self.assertTrue(command_service.conclude(first_db, row_a, "acknowledged", return_code=0))
+            with self.assertLogs("app.services.commands", level="WARNING"):
+                self.assertFalse(
+                    command_service.conclude(second_db, row_b, "failed",
+                                             last_error="racing loser"))
+        finally:
+            first_db.close()
+            second_db.close()
+
+        concluded = self.history()
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "acknowledged")
+        self.assertEqual(self.outbox(), [])
+
+
+class CommandVisibilityTests(CommandDeliveryTestCase):
+    """How an operator inspects the queue. API-only by deliberate choice."""
+
+    def test_the_outbox_is_readable_and_shows_pending_as_pending(self):
+        self.queue("DATA UPDATE user Pin=1")
+
+        items = self.client.get(f"/devices/{self.SN}/commands").json()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["status"], "pending")
+        self.assertEqual(items[0]["attempts"], 0)
+        self.assertIsNone(items[0]["sent_at"])
+        self.assertIsNone(items[0]["next_attempt_at"])
+        self.assertEqual(items[0]["command"], "DATA UPDATE user Pin=1")
+
+    def test_the_outbox_shows_a_delivery_in_flight(self):
+        self.queue()
+        self.poll()
+        items = self.client.get(f"/devices/{self.SN}/commands").json()
+        self.assertEqual(items[0]["status"], "sent")
+        self.assertEqual(items[0]["attempts"], 1)
+        self.assertIsNotNone(items[0]["sent_at"])
+        self.assertIsNotNone(items[0]["next_attempt_at"])
+
+    def test_history_distinguishes_a_refusal_from_a_giving_up(self):
+        refused = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+        with self.assertLogs("app.services.commands", level="WARNING"):
+            self.ack(refused, return_code=-14)
+
+        from unittest import mock
+        with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 1):
+            given_up = self.queue("DATA UPDATE user Pin=2")
+            self.poll()
+            self.rewind_backoff(given_up)
+            with self.assertLogs("app.services.commands", level="WARNING"):
+                self.poll()
+
+        by_command = {i["command"]: i
+                      for i in self.client.get(f"/devices/{self.SN}/commands/history").json()}
+
+        self.assertEqual(by_command["DATA UPDATE user Pin=1"]["return_code"], -14)
+        self.assertIn("rejected", by_command["DATA UPDATE user Pin=1"]["last_error"])
+
+        self.assertIsNone(by_command["DATA UPDATE user Pin=2"]["return_code"])
+        self.assertIn("no acknowledgement", by_command["DATA UPDATE user Pin=2"]["last_error"])
+
+    def test_an_unknown_serial_is_a_404_on_both_views(self):
+        self.assertEqual(self.client.get("/devices/NOSUCHSERIAL/commands").status_code, 404)
+        self.assertEqual(
+            self.client.get("/devices/NOSUCHSERIAL/commands/history").status_code, 404)
+
+    def test_one_devices_history_never_shows_anothers(self):
+        mine = self.queue("DATA UPDATE user Pin=1", sn=self.SN)
+        self.poll(self.SN)
+        self.ack(mine, sn=self.SN)
+
+        theirs = self.queue("DATA UPDATE user Pin=2", sn=self.OTHER_SN)
+        self.poll(self.OTHER_SN)
+        self.ack(theirs, sn=self.OTHER_SN)
+
+        items = self.client.get(f"/devices/{self.SN}/commands/history").json()
+        self.assertEqual([i["command"] for i in items], ["DATA UPDATE user Pin=1"])
+
+
+class DeadCommandTableTests(CommandDeliveryTestCase):
+    """device_commands is superseded. Nothing may quietly start using it again."""
+
+    def test_nothing_writes_to_the_old_table_any_more(self):
+        from app.models import DeviceCommand
+
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+        self.ack(command_id)
+
+        db = self.Session()
+        try:
+            self.assertEqual(db.query(DeviceCommand).count(), 0,
+                             "device_commands is dead — queue through "
+                             "app/services/commands.py, not this table")
+        finally:
+            db.close()
+
+    def test_a_row_left_in_the_old_table_is_never_delivered(self):
+        """The one production row is a D3 test artefact. It must stay inert."""
+        from app.models import DeviceCommand
+
+        db = self.Session()
+        try:
+            db.add(DeviceCommand(device_sn=self.SN, command="DATA UPDATE user Pin=999",
+                                 status="pending"))
+            db.commit()
+        finally:
+            db.close()
+
+        self.assertEqual(self.poll(), "OK")
+
+
+class CommandSchemaTests(unittest.TestCase):
+    """Both tables are new, so create_all builds them on every dialect and
+    nothing has to widen the existing device_command_status enum in place."""
+
+    def setUp(self):
+        self.engine = create_engine("sqlite://", poolclass=StaticPool)
+        Base.metadata.create_all(bind=self.engine)
+
+    def tearDown(self):
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def test_both_tables_are_created_with_every_column(self):
+        columns = {
+            table: {c["name"] for c in inspect(self.engine).get_columns(table)}
+            for table in ("device_command_outbox", "device_command_log")
+        }
+        self.assertEqual(columns["device_command_outbox"], {
+            "id", "device_sn", "command", "status", "attempts",
+            "next_attempt_at", "created_at", "sent_at",
+        })
+        self.assertEqual(columns["device_command_log"], {
+            "id", "device_sn", "command", "outcome", "attempts", "return_code",
+            "last_error", "created_at", "sent_at", "concluded_at",
+        })
+
+    def test_the_old_enum_was_not_widened(self):
+        """`failed` is a value on a NEW column of a NEW table. Adding it to
+        device_command_status instead would have needed dialect-specific DDL
+        (MariaDB MODIFY COLUMN, PostgreSQL ALTER TYPE ADD VALUE outside a
+        transaction, MSSQL no native enum) that app/migrations.py cannot do."""
+        from app.models import DeviceCommand, DeviceCommandLog, DeviceCommandOutbox
+
+        self.assertEqual(
+            set(DeviceCommand.__table__.c.status.type.enums),
+            {"pending", "sent", "acknowledged"},
+            "the old enum must be left exactly as it was",
+        )
+        self.assertEqual(
+            set(DeviceCommandOutbox.__table__.c.status.type.enums),
+            {"pending", "sent"},
+            "only outstanding states belong in the outbox",
+        )
+        self.assertEqual(
+            set(DeviceCommandLog.__table__.c.outcome.type.enums),
+            {"acknowledged", "failed"},
+        )
+
+    def test_a_command_longer_than_the_old_500_char_limit_fits(self):
+        """E3/E4 push biophoto/facev7 commands whose Content= is base64 image
+        or template data, which the dead table's String(500) would truncate."""
+        from app.models import DeviceCommandOutbox
+
+        long_command = "DATA UPDATE biophoto PIN=1\tContent=" + ("A" * 40000)
+        Session = sessionmaker(bind=self.engine)
+        db = Session()
+        try:
+            db.add(DeviceCommandOutbox(device_sn="X", command=long_command,
+                                       status="pending", attempts=0,
+                                       created_at=datetime.now(timezone.utc)))
+            db.commit()
+            self.assertEqual(len(db.query(DeviceCommandOutbox).first().command),
+                             len(long_command))
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

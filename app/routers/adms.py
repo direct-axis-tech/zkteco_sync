@@ -35,9 +35,9 @@ from sqlalchemy.orm import Session
 
 from app import audit, config
 from app.database import get_db
-from app.models import AttendanceLog, BiometricTemplate, Device, DeviceCommand
+from app.models import AttendanceLog, BiometricTemplate, Device
 from app.net import client_ip, ip_in_cidrs
-from app.services import employee_sync, pairing
+from app.services import commands, employee_sync, pairing
 
 router = APIRouter(tags=["adms"])
 
@@ -996,18 +996,68 @@ def adms_getrequest(
         return refusal
     _touch(db, device, request)
 
-    cmd = (
-        db.query(DeviceCommand)
-        .filter_by(device_sn=SN, status="pending")
-        .order_by(DeviceCommand.created_at)
-        .first()
-    )
-    if cmd:
-        cmd.status = "sent"
-        db.commit()
-        return PlainTextResponse(content=cmd.command)
+    # Delivery, retry and the attempt counter all live in one place —
+    # app/services/commands.py — because E3 and E4 both queue work through it
+    # and must not grow second opinions about what "delivered" means.
+    lines = commands.next_commands(db, SN)
+    if lines:
+        # §3.8: `C:<id>:<command>`, several separated by LF. The id matters:
+        # it is what the device quotes back at /iclock/devicecmd, and it is
+        # the only thing that lets an acknowledgement be matched to the
+        # command it is actually about.
+        return PlainTextResponse(content="\n".join(lines))
 
+    # Nothing owed. "OK" is the idle answer every implementation gives and the
+    # device treats it as a heartbeat acknowledgement.
     return PlainTextResponse(content="OK")
+
+
+def _parse_devicecmd(raw: str) -> list:
+    """Parse the acknowledgements in a ``/iclock/devicecmd`` body.
+
+    §3.9 specifies ``ID=${XXX}&Return=${XXX}&CMD=${XXX}&SN=${XXX}`` —
+    ampersand-separated in the **body**, not the query. Real firmware is less
+    tidy than the spec, so this accepts what devices are known to send:
+
+    * the value of ``CMD`` contains a space (``CMD=DATA UPDATE``) and is not
+      percent-encoded, so this splits on ``&`` and ``=`` directly rather than
+      trusting a strict form parser;
+    * some builds report several results in one POST, one per line, so each
+      line is parsed separately;
+    * ``Return`` may be signed (``Return=-14`` is a documented device-side
+      error), so it is parsed as a signed integer.
+
+    Returns ``[{"id": int, "return_code": int, "cmd": str}, …]``, skipping any
+    fragment without a usable numeric ``ID``. Never raises: a malformed ack is
+    worth a log line, not a 500 that makes the device retry the whole command.
+    """
+    results = []
+    for line in raw.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        fields = {}
+        for pair in line.split("&"):
+            if "=" not in pair:
+                continue
+            key, _, value = pair.partition("=")
+            fields[key.strip().lower()] = value.strip()
+
+        raw_id = fields.get("id", "")
+        if not raw_id.lstrip("-").isdigit():
+            continue
+
+        raw_return = fields.get("return", "")
+        results.append({
+            "id": int(raw_id),
+            # A missing Return is not silently treated as success: 0 is the
+            # device saying "done", and absence is the device saying nothing.
+            "return_code": int(raw_return) if raw_return.lstrip("-").isdigit() else None,
+            "cmd": fields.get("cmd", ""),
+        })
+
+    return results
 
 
 @router.post("/iclock/devicecmd", response_class=PlainTextResponse)
@@ -1015,22 +1065,60 @@ async def adms_devicecmd(
     request: Request,
     SN: str = Query(...),
     ID: str = Query(default=""),
+    Return: str = Query(default=""),
     db: Session = Depends(get_db),
 ):
+    """The device reporting what became of a command it was given.
+
+    This used to acknowledge the *oldest* ``sent`` command for the serial and
+    throw ``Return=`` away. With one command ever in flight that is invisible;
+    with a real queue it concludes the wrong command every time — marking a
+    failure as a success and leaving the command that actually ran to be
+    retried until it is declared failed. Both now come from the device's own
+    report: the id it names, and the code it returned.
+    """
     _, refusal = _authorise(SN, request, db)
     if refusal:
         return refusal
 
-    cmd = (
-        db.query(DeviceCommand)
-        .filter_by(device_sn=SN, status="sent")
-        .order_by(DeviceCommand.created_at)
-        .first()
-    )
-    if cmd:
-        cmd.status = "acknowledged"
-        db.commit()
+    raw = (await request.body()).decode("utf-8", errors="ignore")
+    acks = _parse_devicecmd(raw)
 
+    # The spec puts these in the body and that is what this parses first, but
+    # §3.8's own example is written as a query string and no capture from the
+    # operator's terminal has ever contained a devicecmd request — the device
+    # has been polling getrequest for a queue that was never given anything to
+    # deliver. So the query parameters are honoured as a fallback rather than
+    # assuming which of the two this firmware will use.
+    if not acks and ID.strip().lstrip("-").isdigit():
+        acks = [{
+            "id": int(ID.strip()),
+            "return_code": int(Return.strip()) if Return.strip().lstrip("-").isdigit() else None,
+            "cmd": request.query_params.get("CMD", ""),
+        }]
+
+    if not acks:
+        log.warning(
+            "devicecmd from %s carried no parseable ID= (body=%r, query=%r) — "
+            "no command concluded",
+            SN, raw[:200], str(request.query_params)[:200],
+        )
+        return PlainTextResponse(content="OK")
+
+    for ack in acks:
+        if ack["return_code"] is None:
+            # Cannot be called a success and must not be called a rejection.
+            # Left outstanding so the ordinary retry path gets another chance.
+            log.warning(
+                "devicecmd from %s reported ID=%s with no Return= — command "
+                "left outstanding rather than guessed at",
+                SN, ack["id"],
+            )
+            continue
+        commands.acknowledge(db, SN, ack["id"], ack["return_code"], ack["cmd"])
+
+    # Always "OK": the device has already done the work, and refusing its
+    # report only makes it repeat the command.
     return PlainTextResponse(content="OK")
 
 

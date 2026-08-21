@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, Integer, String, Boolean, UniqueConstraint, Enum, Text
+from sqlalchemy import Column, Integer, String, Boolean, Index, UniqueConstraint, Enum, Text
 from app import config
 from app.database import Base, UTCDateTime as DateTime
 
@@ -176,6 +176,16 @@ class AttendanceLog(Base):
 
 
 class DeviceCommand(Base):
+    """DEAD TABLE — superseded by DeviceCommandOutbox / DeviceCommandLog (E7).
+
+    Nothing reads or writes this any more: /iclock/getrequest and
+    POST /devices/{sn}/commands both moved to the outbox. It is left mapped
+    only because app/migrations.py is additive-only by design and dropping
+    tables is not something it does — the one production row is a D3 test
+    artefact. Do not wire anything back to it; queue through
+    app/services/commands.py instead.
+    """
+
     __tablename__ = "device_commands"
 
     id = Column(Integer, primary_key=True)
@@ -183,6 +193,84 @@ class DeviceCommand(Base):
     command = Column(String(500), nullable=False)
     status = Column(Enum("pending", "sent", "acknowledged", name="device_command_status"), default="pending")
     created_at = Column(DateTime, default=_now)
+
+
+class DeviceCommandOutbox(Base):
+    """Outstanding work only — a row exists here IFF the command is unresolved.
+
+    This is the table /iclock/getrequest scans on every poll (every ~10s per
+    device, forever), so it is kept to exactly the commands still owed to a
+    device. The moment one is acknowledged or given up on it is *moved* to
+    device_command_log in a single transaction, so this table drains itself
+    and the hot path stays small no matter how much history accumulates.
+    """
+
+    __tablename__ = "device_command_outbox"
+
+    id = Column(Integer, primary_key=True)
+    device_sn = Column(String(50), nullable=False, index=True)
+
+    # Text, not String(500): E3/E4 will push biophoto/facev7 commands whose
+    # Content= field is base64 image or template data, which does not fit in
+    # the 500 characters the dead table allowed.
+    command = Column(Text, nullable=False)
+
+    # Only two states can be outstanding. `acknowledged` and `failed` are not
+    # values here — they are outcomes in device_command_log, which is what
+    # avoids ever having to widen an enum in a live database.
+    status = Column(
+        Enum("pending", "sent", name="device_command_outbox_status"),
+        nullable=False,
+        default="pending",
+    )
+
+    # Deliveries attempted, not seconds elapsed. A command that is still
+    # `pending` because the device has not polled has attempts=0 and is not
+    # failing at anything.
+    attempts = Column(Integer, nullable=False, default=0)
+
+    # When a delivered-but-unacknowledged command may be offered again. Null
+    # while pending — there is nothing to wait for until it has been sent once.
+    next_attempt_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=_now)
+    sent_at = Column(DateTime, nullable=True)   # most recent delivery
+
+    __table_args__ = (
+        Index("ix_outbox_dispatch", "device_sn", "status"),
+    )
+
+
+class DeviceCommandLog(Base):
+    """Append-only history of concluded commands.
+
+    Written only by the atomic move out of the outbox, so every row here is a
+    command that is definitively over: the device either acknowledged it or it
+    was given up on, with the reason recorded. Pruned on a schedule by
+    retention age; never read by the delivery hot path.
+    """
+
+    __tablename__ = "device_command_log"
+
+    id = Column(Integer, primary_key=True)
+    device_sn = Column(String(50), nullable=False, index=True)
+    command = Column(Text, nullable=False)
+
+    outcome = Column(
+        Enum("acknowledged", "failed", name="device_command_outcome"),
+        nullable=False,
+    )
+
+    attempts = Column(Integer, nullable=False, default=0)
+
+    # As reported by the device: 0 = success, non-zero = the device refusing
+    # the command. Null when the command was never answered at all.
+    return_code = Column(Integer, nullable=True)
+    last_error = Column(String(255), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=_now)   # queued
+    sent_at = Column(DateTime, nullable=True)                     # last delivery
+    concluded_at = Column(DateTime, nullable=False, default=_now, index=True)
 
 
 class FingerprintTemplate(Base):
