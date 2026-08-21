@@ -5942,3 +5942,725 @@ class RevocationSingleWriterTests(RevocationTestCase):
         source = _inspect.getsource(provisioning)
         self.assertNotIn("db.add(DeviceEmployee(", source)
         self.assertIn("employee_sync.unlink_device_employee", source)
+
+
+# ---------------------------------------------------------------------------
+# 20. `/iclock/querydata` — the answer to a DATA QUERY (E9)
+#
+# Written against a real captured request, not a document. On 2026-08-21
+# 07:22 UTC the operator's BioFace A1 was handed the first command this
+# codebase has ever delivered to hardware:
+#
+#     C:1:DATA QUERY tablename=user,fielddesc=*,filter=*
+#
+# It understood the query, produced all three of its user records, and POSTed
+# them to /iclock/querydata — an endpoint push-protocol.md §3.12 had listed as
+# folklore because it appears in neither vendor document. There was no route,
+# so it 404d, so the device retried every ~5 seconds, indefinitely.
+# ---------------------------------------------------------------------------
+
+# The captured request line, verbatim, tabs and all. Only the serial is
+# substituted in the tests that queue a command, so that no command is ever
+# queued in a test against a serial belonging to a live terminal.
+CAPTURED_QUERYDATA_PATH = (
+    "/iclock/querydata?SN={sn}&type=tabledata&cmdid={cmdid}&tablename=user"
+    "&count=3&packcnt=1&packidx=1"
+)
+
+QUERY_COMMAND = "DATA QUERY tablename=user,fielddesc=*,filter=*"
+
+
+class QueryDataTestCase(CommandDeliveryTestCase):
+    """Both routers, an outbox, and a device that answers queries.
+
+    Built on CommandDeliveryTestCase because the half of this that matters
+    most is not the parse — it is that answering the query concludes the
+    command. Testing the ingest without the outbox would test the easy half.
+    """
+
+    QSN = "E9QUERY000001"
+    CIDR_SN = "E9QUERY000002"
+
+    def setUp(self):
+        super().setUp()
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=self.QSN, ip_address="203.0.113.10",
+                          port=4370, name="Face terminal", status="approved",
+                          protocol="acc"))
+            db.add(Device(serial_number=self.CIDR_SN, ip_address="198.51.100.7",
+                          port=4370, name="Elsewhere", status="approved",
+                          protocol="acc", ip_check_enabled=True,
+                          allowed_cidrs="198.51.100.0/24"))
+            db.commit()
+        finally:
+            db.close()
+        # The reassembly buffer is module state, so a transfer left part-received
+        # by one test would otherwise be visible to the next.
+        adms._transfers.clear()
+
+    def tearDown(self):
+        adms._transfers.clear()
+        super().tearDown()
+
+    # -- helpers ---------------------------------------------------------
+
+    def query_post(self, body="", sn=None, tablename="user", cmdid="",
+                   count=None, packcnt=1, packidx=1, qtype="tabledata"):
+        """One /iclock/querydata packet, as the device sends it."""
+        if count is None:
+            count = len([ln for ln in body.splitlines() if ln.strip()])
+        url = (
+            f"/iclock/querydata?SN={sn or self.QSN}&type={qtype}"
+            f"&cmdid={cmdid}&tablename={tablename}&count={count}"
+            f"&packcnt={packcnt}&packidx={packidx}"
+        )
+        return self.client.post(url, content=body)
+
+    def queue_query(self, sn=None, command=QUERY_COMMAND):
+        """Queue a DATA QUERY and hand it to the device, as really happened."""
+        command_id = self.queue(command=command, sn=sn or self.QSN)
+        self.poll(sn=sn or self.QSN)
+        return command_id
+
+    def employees(self):
+        db = self.Session()
+        try:
+            return {e.user_id: e for e in db.query(Employee).all()}
+        finally:
+            db.close()
+
+    def photos(self):
+        from app.models import EmployeePhoto
+        db = self.Session()
+        try:
+            return {(p.user_id, p.source): p for p in db.query(EmployeePhoto).all()}
+        finally:
+            db.close()
+
+    def templates(self):
+        db = self.Session()
+        try:
+            return {(t.user_id, t.type, t.no): t
+                    for t in db.query(BiometricTemplate).all()}
+        finally:
+            db.close()
+
+
+class QueryDataCapturedRequestTests(QueryDataTestCase):
+    """The request that is looping right now, and what must happen to it."""
+
+    def test_the_captured_request_is_accepted_and_stores_all_three_users(self):
+        """The whole unit, in one test. The real path, the real query string,
+        the real body — and three employees at the end of it."""
+        command_id = self.queue_query()
+        response = self.client.post(
+            CAPTURED_QUERYDATA_PATH.format(sn=self.QSN, cmdid=command_id),
+            content=CAPTURED_USER_UPLOAD,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        employees = self.employees()
+        self.assertEqual(sorted(employees), ["1", "2", "3"])
+        self.assertEqual(
+            [employees[p].privilege for p in ("1", "2", "3")], [14, 14, 0]
+        )
+
+    def test_the_real_serials_own_request_no_longer_404s(self):
+        """Byte-for-byte the captured request, real serial included — the one
+        thing that must change is that it stops being a 404. No command is
+        queued here on purpose: a real serial must never be given work in a
+        test, and the ingest must not depend on the command existing anyway."""
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=ACC_SN, ip_address="203.0.113.10",
+                          port=4370, name="BioFace A1", status="approved",
+                          protocol="acc"))
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.client.post(
+            CAPTURED_QUERYDATA_PATH.format(sn=ACC_SN, cmdid=1),
+            content=CAPTURED_USER_UPLOAD,
+            headers={"User-Agent": "iClock Proxy/1.09"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+    def test_the_catch_all_no_longer_claims_this_path(self):
+        """It is the catch-all's 404 that produced the retry loop. A concrete
+        route is declared, so the catch-all must not see this path at all."""
+        self.queue_query()
+        response = self.query_post(CAPTURED_USER_UPLOAD, cmdid=1)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.text, "Not Found")
+
+    def test_the_reply_follows_the_tabledata_convention(self):
+        """UNCONFIRMED against hardware. The device declares `type=tabledata`
+        and sends a tabledata body, so it is acknowledged like one. Pinned as
+        a test so that changing it is a deliberate act with evidence behind
+        it, not a drive-by edit."""
+        self.queue_query()
+        response = self.query_post(CAPTURED_USER_UPLOAD, cmdid=1, count=3)
+        self.assertEqual(response.content, b"user=3")
+        self.assertTrue(response.headers["content-type"].startswith("text/plain"))
+
+    def test_the_acknowledgement_can_be_flipped_to_ok_without_a_code_change(self):
+        """The other candidate. If the terminal is still looping after deploy,
+        the operator flips one setting rather than waiting for a new unit."""
+        self.queue_query()
+        original = config.QUERYDATA_ACK_STYLE
+        config.QUERYDATA_ACK_STYLE = "ok"
+        try:
+            response = self.query_post(CAPTURED_USER_UPLOAD, cmdid=1, count=3)
+        finally:
+            config.QUERYDATA_ACK_STYLE = original
+
+        self.assertEqual(response.text, "OK")
+        # ...and the ingest is unaffected either way.
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+    def test_the_request_is_named_in_the_log_whatever_it_carries(self):
+        """This endpoint is one capture old. The next surprise has to be
+        readable from the log without a debugger attached."""
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=1, count=3)
+        joined = "\n".join(captured.output)
+        self.assertIn("querydata", joined)
+        self.assertIn("tablename='user'", joined)
+        self.assertIn("packet=1/1", joined)
+
+    def test_a_get_is_answered_rather_than_left_to_the_catch_all(self):
+        """Unobserved, and registered anyway: a firmware that used GET would
+        otherwise fall to the 404 that started this."""
+        response = self.client.get(
+            f"/iclock/querydata?SN={self.QSN}&type=tabledata&tablename=user&count=0"
+        )
+        self.assertEqual(response.status_code, 200)
+
+
+class QueryDataConcludesTheCommandTests(QueryDataTestCase):
+    """`cmdid` is the acknowledgement. There is no devicecmd for a query."""
+
+    def test_a_single_packet_transfer_concludes_the_command(self):
+        command_id = self.queue_query()
+        self.assertEqual(len(self.outbox(self.QSN)), 1)
+
+        self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+
+        self.assertEqual(self.outbox(self.QSN), [])
+        concluded = self.history(self.QSN)
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "acknowledged")
+        self.assertEqual(concluded[0].command, QUERY_COMMAND)
+        self.assert_exactly_one_home(QUERY_COMMAND, sn=self.QSN)
+
+    def test_without_this_the_answered_command_would_retry(self):
+        """The point of concluding at all: an outstanding command comes back
+        round on the next poll after its backoff, and is eventually declared
+        failed — despite having been answered and its answer stored."""
+        command_id = self.queue_query()
+        self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+
+        # Nothing is left to offer again — there is not even a row to rewind.
+        self.assertEqual(self.outbox(self.QSN), [])
+        self.assertEqual(self.poll(sn=self.QSN), "OK")
+
+        # The counterfactual, so this is a test of concluding rather than of
+        # an empty queue: an identical command that is NOT answered does come
+        # back round once its backoff has elapsed.
+        unanswered = self.queue(command=QUERY_COMMAND, sn=self.QSN)
+        self.poll(sn=self.QSN)
+        self.rewind_backoff(unanswered)
+        self.assertIn(f"C:{unanswered}:", self.poll(sn=self.QSN))
+
+    def test_it_concludes_the_command_the_device_named_not_the_oldest(self):
+        """The bug E7 fixed for devicecmd, which must not reappear here."""
+        first = self.queue(command="DATA UPDATE user Pin=9\tName=Zoe", sn=self.QSN)
+        second = self.queue(command=QUERY_COMMAND, sn=self.QSN)
+        self.poll(sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        self.query_post(CAPTURED_USER_UPLOAD, cmdid=second, count=3)
+
+        outstanding = [r.id for r in self.outbox(self.QSN)]
+        self.assertEqual(outstanding, [first])
+        self.assertEqual([r.command for r in self.history(self.QSN)], [QUERY_COMMAND])
+
+    def test_a_query_answered_for_one_device_does_not_conclude_anothers(self):
+        mine = self.queue_query()
+        theirs = self.queue(command=QUERY_COMMAND, sn=self.SN)
+        self.poll(sn=self.SN)
+
+        self.query_post(CAPTURED_USER_UPLOAD, cmdid=theirs, sn=self.QSN, count=3)
+
+        self.assertEqual([r.id for r in self.outbox(self.SN)], [theirs])
+        self.assertEqual([r.id for r in self.outbox(self.QSN)], [mine])
+
+    def test_an_unmatched_cmdid_still_stores_the_payload_and_says_so(self):
+        """The data is real whether or not we can find the command it answers.
+        Storing it is right; doing so silently is not."""
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=4242, count=3)
+        self.assertIn("not outstanding", "\n".join(captured.output))
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+    def test_the_log_names_querydata_not_devicecmd(self):
+        """Two endpoints conclude commands now. A line that misnames which one
+        sends the next reader to the wrong place."""
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=4242, count=3)
+        joined = "\n".join(captured.output)
+        self.assertIn("querydata from", joined)
+        self.assertNotIn("devicecmd from", joined)
+
+    def test_a_missing_cmdid_stores_the_payload_and_warns(self):
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid="", count=3)
+        self.assertIn("no usable cmdid", "\n".join(captured.output))
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+
+class QueryDataReassemblyTests(QueryDataTestCase):
+    """`packcnt`/`packidx`. A fragment parsed as a whole record is the failure
+    this class exists to make impossible."""
+
+    def photo_body(self, pin="1", content=REALISTIC_PHOTO_B64):
+        return (
+            f"biophoto pin={pin}\tfilename={pin}.jpg\ttype=9"
+            f"\tsize={len(content)}\tcontent={content}\n"
+        )
+
+    def test_nothing_is_stored_until_the_final_packet(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=biophoto")
+        body = self.photo_body()
+        half = len(body) // 2
+
+        self.query_post(body[:half], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=1)
+
+        self.assertEqual(self.photos(), {})
+        self.assertEqual([r.id for r in self.outbox(self.QSN)], [command_id])
+
+    def test_a_photo_split_mid_base64_survives_whole(self):
+        """The exact corruption this reassembly exists to prevent. Split inside
+        the base64 so packet 1 alone is a syntactically valid record carrying a
+        truncated image — which `_store_photo_table` could not tell from a
+        small one."""
+        command_id = self.queue_query(command="DATA QUERY tablename=biophoto")
+        body = self.photo_body()
+        cut = body.index("content=") + 8 + 40   # 40 characters into the blob
+
+        self.query_post(body[:cut], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=1)
+        self.assertEqual(self.photos(), {})
+
+        self.query_post(body[cut:], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=2)
+
+        photos = self.photos()
+        self.assertEqual(list(photos), [("1", "biophoto")])
+        self.assertEqual(photos[("1", "biophoto")].content, REALISTIC_PHOTO_B64)
+        # And it still decodes to the original bytes, which is the only test
+        # that a truncation would actually fail.
+        self.assertEqual(
+            base64.b64decode(photos[("1", "biophoto")].content),
+            _REALISTIC_PHOTO_BYTES,
+        )
+
+    def test_packets_are_reassembled_in_index_order_not_arrival_order(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=biophoto")
+        body = self.photo_body()
+        cut = body.index("content=") + 8 + 40
+
+        self.query_post(body[cut:], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=2)
+        self.query_post(body[:cut], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=1)
+
+        self.assertEqual(
+            self.photos()[("1", "biophoto")].content, REALISTIC_PHOTO_B64
+        )
+
+    def test_a_split_on_a_record_boundary_does_not_glue_two_records(self):
+        """The other plausible chunking. If the firmware splits between records
+        and drops the trailing newline, plain concatenation would produce
+        `…verify=0user uid=2…` — one mangled record instead of two good ones."""
+        command_id = self.queue_query()
+        first, second, third = CAPTURED_USER_UPLOAD.splitlines()
+
+        self.query_post(first, cmdid=command_id, count=3, packcnt=2, packidx=1)
+        self.query_post(f"{second}\n{third}\n", cmdid=command_id, count=3,
+                        packcnt=2, packidx=2)
+
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+    def test_a_transfer_that_never_completes_stores_nothing_and_concludes_nothing(self):
+        command_id = self.queue_query()
+        first = CAPTURED_USER_UPLOAD.splitlines()[0]
+
+        self.query_post(first + "\n", cmdid=command_id, count=3,
+                        packcnt=3, packidx=1)
+        self.query_post(CAPTURED_USER_UPLOAD.splitlines()[1] + "\n",
+                        cmdid=command_id, count=3, packcnt=3, packidx=2)
+
+        self.assertEqual(self.employees(), {})
+        self.assertEqual([r.id for r in self.outbox(self.QSN)], [command_id])
+        self.assertEqual(self.history(self.QSN), [])
+
+    def test_an_incomplete_packet_is_still_acknowledged(self):
+        """Buffering is not a reason to leave the packet unanswered — an
+        unanswered packet is a repeated packet."""
+        command_id = self.queue_query()
+        response = self.query_post(
+            CAPTURED_USER_UPLOAD.splitlines()[0] + "\n", cmdid=command_id,
+            count=3, packcnt=3, packidx=1,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "user=3")
+
+    def test_repeating_one_packet_cannot_complete_a_transfer(self):
+        """Completion counts distinct packets, so a device retrying packet 1
+        of 3 forever never tricks the server into parsing a third of an answer."""
+        command_id = self.queue_query()
+        first = CAPTURED_USER_UPLOAD.splitlines()[0] + "\n"
+        for _ in range(5):
+            self.query_post(first, cmdid=command_id, count=3, packcnt=3, packidx=1)
+
+        self.assertEqual(self.employees(), {})
+        self.assertEqual([r.id for r in self.outbox(self.QSN)], [command_id])
+
+    def test_two_devices_answering_at_once_do_not_mix_payloads(self):
+        mine = self.queue_query()
+        theirs = self.queue(command=QUERY_COMMAND, sn=self.SN)
+        self.poll(sn=self.SN)
+
+        lines = CAPTURED_USER_UPLOAD.splitlines()
+        self.query_post(lines[0] + "\n", cmdid=mine, count=2, packcnt=2, packidx=1)
+        self.query_post(lines[1] + "\n", sn=self.SN, cmdid=theirs, count=2,
+                        packcnt=2, packidx=1)
+        # Only this device's transfer completes.
+        self.query_post(lines[2] + "\n", cmdid=mine, count=2, packcnt=2, packidx=2)
+
+        self.assertEqual(sorted(self.employees()), ["1", "3"])
+        self.assertEqual([r.id for r in self.outbox(self.SN)], [theirs])
+        self.assertEqual(self.outbox(self.QSN), [])
+
+    def test_an_abandoned_transfer_is_expired_loudly_and_stores_nothing(self):
+        """A device that starts a nine-packet answer and reboots. The buffer
+        must not be pinned until the process restarts, and the command must be
+        left outstanding so the answer can be asked for again."""
+        command_id = self.queue_query()
+        self.query_post(CAPTURED_USER_UPLOAD.splitlines()[0] + "\n",
+                        cmdid=command_id, count=3, packcnt=9, packidx=1)
+        self.assertEqual(len(adms._transfers), 1)
+
+        for entry in adms._transfers.values():
+            entry["updated"] -= config.QUERYDATA_TRANSFER_TTL_SECONDS + 1
+
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+
+        self.assertIn("abandoning incomplete transfer", "\n".join(captured.output))
+        # The stale fragment did not become part of the new answer.
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+    def test_an_oversized_transfer_is_discarded_rather_than_stored(self):
+        command_id = self.queue_query()
+        original = config.QUERYDATA_MAX_TRANSFER_BYTES
+        config.QUERYDATA_MAX_TRANSFER_BYTES = 100
+        try:
+            with self.assertLogs("app.routers.adms", level="ERROR") as captured:
+                self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id,
+                                count=3, packcnt=2, packidx=1)
+        finally:
+            config.QUERYDATA_MAX_TRANSFER_BYTES = original
+
+        self.assertIn("QUERYDATA_MAX_TRANSFER_BYTES", "\n".join(captured.output))
+        self.assertEqual(self.employees(), {})
+        self.assertEqual([r.id for r in self.outbox(self.QSN)], [command_id])
+        self.assertEqual(adms._transfers, {})
+
+    def test_the_number_of_open_transfers_is_bounded(self):
+        original = config.QUERYDATA_MAX_TRANSFERS
+        config.QUERYDATA_MAX_TRANSFERS = 1
+        try:
+            self.query_post("user pin=1\n", cmdid=1, count=2, packcnt=2, packidx=1)
+            with self.assertLogs("app.routers.adms", level="WARNING"):
+                self.query_post("user pin=2\n", cmdid=2, count=2,
+                                packcnt=2, packidx=1)
+        finally:
+            config.QUERYDATA_MAX_TRANSFERS = original
+
+        self.assertEqual(len(adms._transfers), 1)
+        self.assertEqual(self.employees(), {})
+
+    def test_a_restarted_transfer_does_not_splice_two_answers(self):
+        """The device changing its mind about how many packets there are means
+        this is a new answer, not a continuation of the old one."""
+        command_id = self.queue_query()
+        self.query_post("user uid=99\tpin=99\tname=Stale\n", cmdid=command_id,
+                        count=1, packcnt=4, packidx=1)
+
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+
+        self.assertIn("restarted", "\n".join(captured.output))
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+
+class QueryDataIdempotencyTests(QueryDataTestCase):
+    """The device has already retried this upload dozens of times against a
+    404, and will retry again after deploy. Re-delivery must converge."""
+
+    def test_redelivering_the_same_answer_does_not_duplicate_employees(self):
+        command_id = self.queue_query()
+        for _ in range(4):
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+        db = self.Session()
+        try:
+            self.assertEqual(db.query(Employee).count(), 3)
+        finally:
+            db.close()
+
+    def test_redelivering_writes_exactly_one_history_row(self):
+        command_id = self.queue_query()
+        for _ in range(3):
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+
+        self.assertEqual(len(self.history(self.QSN)), 1)
+        self.assert_exactly_one_home(QUERY_COMMAND, sn=self.QSN)
+
+    def test_a_redelivered_answer_is_acknowledged_the_same_way_every_time(self):
+        command_id = self.queue_query()
+        replies = {
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3).text
+            for _ in range(3)
+        }
+        self.assertEqual(replies, {"user=3"})
+
+    def test_a_retried_packet_overwrites_rather_than_appends(self):
+        """Re-delivery inside a multi-packet transfer, which is the case a
+        naive append would corrupt: the record would be stored twice, glued."""
+        command_id = self.queue_query(command="DATA QUERY tablename=biophoto")
+        body = (
+            f"biophoto pin=1\tfilename=1.jpg\ttype=9"
+            f"\tsize={len(REALISTIC_PHOTO_B64)}\tcontent={REALISTIC_PHOTO_B64}\n"
+        )
+        cut = body.index("content=") + 8 + 40
+
+        self.query_post(body[:cut], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=1)
+        self.query_post(body[:cut], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=1)
+        self.query_post(body[cut:], tablename="biophoto", cmdid=command_id,
+                        count=1, packcnt=2, packidx=2)
+
+        self.assertEqual(
+            self.photos()[("1", "biophoto")].content, REALISTIC_PHOTO_B64
+        )
+
+    def test_leftover_state_does_not_survive_a_completed_transfer(self):
+        command_id = self.queue_query()
+        self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3)
+        self.assertEqual(adms._transfers, {})
+
+
+class QueryDataAuthorisationTests(QueryDataTestCase):
+    """A public endpoint that writes employees, templates and photos. It must
+    not become a hole around the controls every other ADMS endpoint has."""
+
+    def test_an_unapproved_serial_is_refused_exactly_like_the_others(self):
+        db = self.Session()
+        try:
+            db.add(Device(serial_number="E9PENDING00001", ip_address="203.0.113.10",
+                          port=4370, name="Waiting", status="pending"))
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.query_post(CAPTURED_USER_UPLOAD, sn="E9PENDING00001",
+                                   cmdid=1, count=3)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.text, "Unauthorized")
+        self.assertEqual(self.employees(), {})
+
+    def test_an_unknown_serial_with_the_pairing_window_shut_is_refused(self):
+        response = self.query_post(CAPTURED_USER_UPLOAD, sn="E9STRANGER0001",
+                                   cmdid=1, count=3)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.employees(), {})
+
+    def test_a_source_outside_the_device_allowlist_is_refused(self):
+        """The per-device CIDR check, which is the control D3 added and which
+        this endpoint must not be a way around."""
+        response = self.query_post(CAPTURED_USER_UPLOAD, sn=self.CIDR_SN,
+                                   cmdid=1, count=3)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.employees(), {})
+
+    def test_a_refused_request_concludes_nothing(self):
+        """Otherwise anyone could retire another site's commands by guessing
+        an id — no data written, but the queue emptied."""
+        command_id = self.queue_query()
+        self.query_post(CAPTURED_USER_UPLOAD, sn="E9STRANGER0001",
+                        cmdid=command_id, count=3)
+        self.assertEqual([r.id for r in self.outbox(self.QSN)], [command_id])
+
+    def test_a_refusal_leaves_no_reassembly_buffer_behind(self):
+        """An unauthorised caller must not be able to allocate memory here."""
+        self.query_post("user pin=1\n", sn="E9STRANGER0001", cmdid=1,
+                        count=2, packcnt=2, packidx=1)
+        self.assertEqual(adms._transfers, {})
+
+    def test_the_refusal_is_recorded_for_the_operator(self):
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, sn="E9STRANGER0001",
+                            cmdid=1, count=3)
+        self.assertIn("ADMS refused", "\n".join(captured.output))
+
+
+class QueryDataTableDispatchTests(QueryDataTestCase):
+    """One table, one parser, whichever door the payload came through."""
+
+    def test_biodata_reaches_the_same_parser_as_a_tabledata_push(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=biodata")
+        self.query_post(CAPTURED_BIODATA_UPLOAD, tablename="biodata",
+                        cmdid=command_id, count=2)
+
+        templates = self.templates()
+        self.assertEqual(sorted(templates), [("1", 1, 5), ("1", 9, 0)])
+        self.assertEqual(templates[("1", 1, 5)].majorver, 13)
+        self.assertEqual(templates[("1", 1, 5)].source_device_sn, self.QSN)
+        self.assertEqual(self.outbox(self.QSN), [])
+
+    def test_biophoto_reaches_the_same_parser_as_a_tabledata_push(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=biophoto")
+        self.query_post(
+            f"biophoto pin=1\tfilename=1.jpg\ttype=9"
+            f"\tsize=104904\tcontent={REALISTIC_PHOTO_B64}\n",
+            tablename="biophoto", cmdid=command_id, count=1,
+        )
+        photos = self.photos()
+        self.assertEqual(list(photos), [("1", "biophoto")])
+        self.assertEqual(photos[("1", "biophoto")].content, REALISTIC_PHOTO_B64)
+
+    def test_userpic_reaches_the_same_parser_as_a_tabledata_push(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=userpic")
+        self.query_post(
+            f"userpic pin=2\tfilename=2.jpg\tsize=95016"
+            f"\tcontent={REALISTIC_PHOTO_B64}\n",
+            tablename="userpic", cmdid=command_id, count=1,
+        )
+        self.assertEqual(list(self.photos()), [("2", "userpic")])
+
+    def test_a_blob_answer_is_summarised_in_the_log_rather_than_dumped(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=biophoto")
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.query_post(
+                f"biophoto pin=1\tfilename=1.jpg\ttype=9"
+                f"\tsize=104904\tcontent={REALISTIC_PHOTO_B64}\n",
+                tablename="biophoto", cmdid=command_id, count=1,
+            )
+        joined = "\n".join(captured.output)
+        self.assertIn("not logged", joined)
+        self.assertNotIn(REALISTIC_PHOTO_B64, joined)
+
+    def test_a_keyed_answer_is_kept_whole_in_the_log(self):
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.query_post(CAPTURED_USER_UPLOAD, cmdid=1, count=3)
+        joined = "\n".join(captured.output)
+        for uid in ("uid=1", "uid=2", "uid=3"):
+            self.assertIn(uid, joined)
+
+    def test_no_second_parser_was_written_for_this_endpoint(self):
+        """E1, E2 and E5 already parse these tables. A second implementation
+        is how the same record comes to mean two different things depending on
+        which endpoint it arrived at."""
+        import inspect as _inspect
+        source = _inspect.getsource(adms.adms_querydata)
+        self.assertIn("_store_bulk_table", source)
+        for parser in ("_store_user_table", "_store_biodata_table",
+                       "_store_photo_table", "_tabledata_fields"):
+            self.assertNotIn(parser, source)
+
+
+class QueryDataUnknownTableTests(QueryDataTestCase):
+    """The discipline that produced this unit in the first place: log what you
+    do not understand, acknowledge it, and never drop it silently."""
+
+    def test_an_unknown_tablename_is_logged_with_its_body(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=extuser")
+        body = "extuser pin=1\tfunswitch=1\tfirstname=Aisha\tpersonalvs=0\n"
+
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            response = self.query_post(body, tablename="extuser",
+                                       cmdid=command_id, count=1)
+
+        joined = "\n".join(captured.output)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no parser for tablename", joined)
+        self.assertIn("firstname=Aisha", joined)
+
+    def test_an_unknown_tablename_is_acknowledged_not_refused(self):
+        command_id = self.queue_query(command="DATA QUERY tablename=extuser")
+        with self.assertLogs("app.routers.adms", level="WARNING"):
+            response = self.query_post("extuser pin=1\n", tablename="extuser",
+                                       cmdid=command_id, count=1)
+        self.assertEqual(response.text, "extuser=1")
+
+    def test_an_unknown_tablename_still_concludes_the_command(self):
+        """The device did answer. Leaving the command outstanding would retry a
+        query whose answer we already know we cannot use."""
+        command_id = self.queue_query(command="DATA QUERY tablename=extuser")
+        with self.assertLogs("app.routers.adms", level="WARNING"):
+            self.query_post("extuser pin=1\n", tablename="extuser",
+                            cmdid=command_id, count=1)
+        self.assertEqual(self.outbox(self.QSN), [])
+        self.assertEqual(self.history(self.QSN)[0].outcome, "acknowledged")
+
+    def test_a_request_with_no_tablename_is_logged_and_answered(self):
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            response = self.client.post(
+                f"/iclock/querydata?SN={self.QSN}&type=tabledata&cmdid=1",
+                content="something nobody has seen before\n",
+            )
+        self.assertEqual(response.text, "OK")
+        joined = "\n".join(captured.output)
+        self.assertIn("no tablename", joined)
+        self.assertIn("something nobody has seen before", joined)
+
+    def test_an_unfamiliar_type_is_still_dispatched_on_its_tablename(self):
+        """`type=` is recorded, not obeyed. The body's shape is what decides,
+        and a firmware inventing a new `type` must not silently lose a table
+        we do know how to parse."""
+        command_id = self.queue_query()
+        self.query_post(CAPTURED_USER_UPLOAD, cmdid=command_id, count=3,
+                        qtype="somethingelse")
+        self.assertEqual(sorted(self.employees()), ["1", "2", "3"])
+
+
+class QueryDataStorageFailureTests(QueryDataTestCase):
+    """A storage fault must not become an infinite upload loop."""
+
+    def test_a_failing_parser_still_acknowledges_and_concludes(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated storage failure")
+
+        command_id = self.queue_query()
+        original = adms._store_user_table
+        adms._store_user_table = boom
+        try:
+            with self.assertLogs("app.routers.adms", level="ERROR"):
+                response = self.query_post(CAPTURED_USER_UPLOAD,
+                                           cmdid=command_id, count=3)
+        finally:
+            adms._store_user_table = original
+
+        self.assertEqual(response.text, "user=3")
+        self.assertEqual(self.outbox(self.QSN), [])

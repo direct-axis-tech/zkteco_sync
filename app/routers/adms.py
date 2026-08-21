@@ -27,6 +27,8 @@ actually confirmed.
 
 import logging
 import secrets
+import threading
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -518,65 +520,8 @@ async def adms_receive(
             log.warning("ADMS tabledata from %s with no tablename: %s", SN, _clip(body))
             return PlainTextResponse(content="OK")
 
-        records = len([ln for ln in body.splitlines() if ln.strip()])
-        if not count:
-            # Fall back to counting records so the acknowledgement is still
-            # well-formed if the device omits the parameter.
-            count = str(records)
-
-        low = tablename.lower()
-        if low in _BLOB_TABLES:
-            # `biodata` (E2) and `biophoto`/`userpic` (E5) are stored below;
-            # `identitycard`, `templatev10` and `attphoto` are still out of
-            # scope and genuinely discarded after this summary.
-            stored_note = "stored" if low in _STORED_BLOB_TABLES else "not stored"
-            log.info(
-                "ADMS tabledata from %s: tablename=%s count=%s (%s) "
-                "body=%d bytes in %d record(s) [base64, not logged]",
-                SN, tablename, count, stored_note, len(raw), records,
-            )
-        else:
-            log.info(
-                "ADMS tabledata from %s: tablename=%s count=%s body=%s",
-                SN, tablename, count, _clip(body, _TABLEDATA_LOG_LIMIT),
-            )
-
-        if low == "user":
-            try:
-                _store_user_table(db, SN, body)
-            except Exception:
-                # The acknowledgement below matters more than the ingest. A
-                # device that does not see `<tablename>=<count>` is documented
-                # to retry the upload forever, so a parse or database fault
-                # here has to be loud in the log and invisible on the wire.
-                log.exception(
-                    "ADMS tabledata from %s: user upload could not be stored; "
-                    "acknowledging anyway so the device does not retry forever", SN,
-                )
-                db.rollback()
-        elif low == "biodata":
-            try:
-                _store_biodata_table(db, SN, body)
-            except Exception:
-                # Same rule as the user upload above: the ack must go out
-                # regardless, or the device retries a multi-KB template
-                # upload forever.
-                log.exception(
-                    "ADMS tabledata from %s: biodata upload could not be stored; "
-                    "acknowledging anyway so the device does not retry forever", SN,
-                )
-                db.rollback()
-        elif low in ("biophoto", "userpic"):
-            try:
-                _store_photo_table(db, SN, body, low)
-            except Exception:
-                # Same rule again: a ~100 KB photo upload must not become an
-                # infinite retry loop just because storage hiccupped.
-                log.exception(
-                    "ADMS tabledata from %s: %s upload could not be stored; "
-                    "acknowledging anyway so the device does not retry forever", SN, low,
-                )
-                db.rollback()
+        count = _log_bulk_payload("tabledata", SN, tablename, count, raw, body)
+        _store_bulk_table(db, SN, tablename, body, source="tabledata")
 
         _touch(db, device, request)
         return PlainTextResponse(content=f"{tablename}={count}")
@@ -593,6 +538,88 @@ async def adms_receive(
         _clip(raw.decode("utf-8", errors="ignore")),
     )
     return PlainTextResponse(content="OK")
+
+
+# ---------------------------------------------------------------------------
+# Bulk payloads: one log rule and one dispatch, shared by every transport
+#
+# The same keyed-TSV payload reaches this server two ways — pushed by the
+# device as `cdata?table=tabledata` (§3.7), or returned by the device in answer
+# to a `DATA QUERY` on `/iclock/querydata` (§3.13, E9). The bytes are
+# identical, so the parsers must be too: one table, one parser, whichever door
+# it came through. Anything else and a `user` record would mean two different
+# things depending on whether the operator asked for it or the device
+# volunteered it.
+# ---------------------------------------------------------------------------
+
+def _log_bulk_payload(source: str, sn: str, tablename: str, count: str,
+                      raw: bytes, body: str) -> str:
+    """Record one bulk payload's arrival, and return the count to acknowledge.
+
+    Blob tables are summarised by size and record count; everything else is
+    kept whole up to ``_TABLEDATA_LOG_LIMIT``. See the constants above for why
+    the two limits differ so much.
+
+    The returned count is the device's own ``count=`` when it sent one, and a
+    record tally when it did not — so the acknowledgement is well-formed
+    either way.
+    """
+    records = len([ln for ln in body.splitlines() if ln.strip()])
+    if not count:
+        count = str(records)
+
+    low = tablename.lower()
+    if low in _BLOB_TABLES:
+        # `biodata` (E2) and `biophoto`/`userpic` (E5) are stored below;
+        # `identitycard`, `templatev10` and `attphoto` are still out of
+        # scope and genuinely discarded after this summary.
+        stored_note = "stored" if low in _STORED_BLOB_TABLES else "not stored"
+        log.info(
+            "ADMS %s from %s: tablename=%s count=%s (%s) "
+            "body=%d bytes in %d record(s) [base64, not logged]",
+            source, sn, tablename, count, stored_note, len(raw), records,
+        )
+    else:
+        log.info(
+            "ADMS %s from %s: tablename=%s count=%s body=%s",
+            source, sn, tablename, count, _clip(body, _TABLEDATA_LOG_LIMIT),
+        )
+    return count
+
+
+def _store_bulk_table(db: Session, sn: str, tablename: str, body: str,
+                      source: str = "tabledata") -> bool:
+    """Hand one bulk payload to the parser that owns its table.
+
+    Returns True if a parser took it, False if the table is one nothing here
+    understands — the caller acknowledges either way.
+
+    Every parser is wrapped the same way and for the same reason: the
+    acknowledgement matters more than the ingest. A device that does not see
+    the reply it expects is documented to retry the upload forever, so a parse
+    or database fault has to be loud in the log and invisible on the wire.
+    """
+    low = tablename.lower()
+
+    if low == "user":
+        handler, args = _store_user_table, (db, sn, body)
+    elif low == "biodata":
+        handler, args = _store_biodata_table, (db, sn, body)
+    elif low in ("biophoto", "userpic"):
+        handler, args = _store_photo_table, (db, sn, body, low)
+    else:
+        return False
+
+    try:
+        handler(*args)
+    except Exception:
+        log.exception(
+            "ADMS %s from %s: %s upload could not be stored; "
+            "acknowledging anyway so the device does not retry forever",
+            source, sn, low,
+        )
+        db.rollback()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1267,6 +1294,326 @@ async def adms_devicecmd(
     # Always "OK": the device has already done the work, and refusing its
     # report only makes it repeat the command.
     return PlainTextResponse(content="OK")
+
+
+# ---------------------------------------------------------------------------
+# /iclock/querydata — the answer to a DATA QUERY (E9)
+#
+# CONFIRMED from the operator's BioFace A1 (VGU6254600603, 2026-08-21 07:22
+# UTC), which is the only reason this endpoint exists. push-protocol.md §3.12
+# listed `/iclock/querydata` as folklore because it appears in neither vendor
+# document; the device then used it. The captured request, verbatim:
+#
+#     POST /iclock/querydata?SN=VGU6254600603&type=tabledata&cmdid=1
+#          &tablename=user&count=3&packcnt=1&packidx=1
+#     user uid=1<HT>cardno=<HT>pin=1<HT>…<HT>privilege=14<HT>disable=0<HT>verify=0
+#     user uid=2<HT>…
+#     user uid=3<HT>…
+#
+# Three facts follow from it, and each one is load-bearing:
+#
+# 1. **The body is a tabledata body.** Same keyed TSV, same repeated table-name
+#    prefix, same tables. So it is parsed by the same parsers (E1/E2/E5) and
+#    not by new ones — see `_store_bulk_table`.
+#
+# 2. **`cmdid` is the acknowledgement.** A device answering a DATA QUERY never
+#    POSTs /iclock/devicecmd; it quotes the command id here instead. Nothing
+#    else will ever conclude that outbox row, so if this endpoint does not, the
+#    command retries on backoff and is eventually declared failed — after it
+#    already succeeded and its answer was stored.
+#
+# 3. **`packcnt`/`packidx` split a payload across requests.** The capture reads
+#    1/1 because three user records are about 375 bytes. A `biophoto` answer is
+#    ~100 KB per person and MAX_REQUEST_BYTES caps one request at 2 MB, so a
+#    real photo query will arrive in pieces. Parsing a piece is the failure
+#    mode this whole section is built around: `_store_photo_table` cannot tell
+#    a truncated base64 photo from a small one, and would store the fragment as
+#    a complete image. So nothing is parsed until the last packet lands.
+# ---------------------------------------------------------------------------
+
+# Part-received transfers, keyed (serial, cmdid, tablename). Guarded by a lock
+# because uvicorn runs the sync endpoints in a thread pool: two packets of the
+# same transfer can be in flight at once.
+#
+# WHY MEMORY, given it does not survive a restart mid-transfer: because an
+# incomplete transfer is worth nothing. Its command is deliberately left
+# outstanding until the payload is whole (see `_conclude_query`), so a restart
+# that drops the buffer leaves the DATA QUERY in the outbox, the device is
+# handed it again on its next poll, and it re-answers from the start. The
+# recovery path is the one the queue already has. The alternative — a table of
+# half-payloads — would put megabytes of provably useless data in the
+# operator's database to save a re-query that costs seconds.
+_transfers = {}
+_transfers_lock = threading.Lock()
+
+
+def _transfer_key(sn: str, cmdid: str, tablename: str) -> tuple:
+    """What makes two packets part of the same answer.
+
+    Serial and cmdid alone would do it in theory; `tablename` is in the key as
+    well because it costs nothing and it means a firmware that reuses a command
+    id across two different tables cannot splice a `user` list into the middle
+    of a photo.
+    """
+    return (sn, cmdid, tablename.lower())
+
+
+def _expire_transfers(now: float) -> None:
+    """Drop transfers nobody has added to in a while. Caller holds the lock.
+
+    A device that starts a nine-packet answer and then reboots would otherwise
+    pin its buffer until the process restarts. Logged at WARNING with the
+    packets that did arrive, because a query that was answered and then
+    abandoned half way is exactly the kind of thing that is invisible until
+    somebody asks why an employee has no photo.
+    """
+    ttl = config.QUERYDATA_TRANSFER_TTL_SECONDS
+    for key in [k for k, e in _transfers.items() if now - e["updated"] > ttl]:
+        entry = _transfers.pop(key)
+        log.warning(
+            "ADMS querydata: abandoning incomplete transfer %r after %.0fs — "
+            "%d of %s packet(s), %d byte(s) received and discarded; command %s "
+            "was NOT concluded, so the device will be asked again",
+            key, now - entry["updated"], len(entry["parts"]),
+            entry["packcnt"], entry["bytes"], key[1] or "<none>",
+        )
+
+
+def _join_packets(parts: dict, tablename: str) -> str:
+    """Reassemble the fragments of one transfer, in packet order.
+
+    Concatenated with nothing between them. The model this assumes is that the
+    device is chunking one byte stream, in which case plain concatenation
+    reproduces the original exactly and inserting a separator would corrupt any
+    record unlucky enough to straddle a boundary — a base64 photo with a
+    newline injected into it is a photo that no longer decodes.
+
+    The one case that model does not cover is a firmware that splits strictly
+    on record boundaries and drops the trailing newline, which would glue the
+    last record of one packet onto the first of the next. That case is repaired
+    here, and it can be repaired safely: the join only inserts a newline when
+    the next fragment *starts with the table-name prefix*, and `"user "`,
+    `"biodata "`, `"biophoto "` cannot occur inside a base64 blob — the base64
+    alphabet has no space in it. So a mid-record split never triggers it and a
+    record-boundary split always does.
+    """
+    prefix = f"{tablename} ".lower()
+    pieces = []
+    for _index, fragment in sorted(parts.items()):
+        if (
+            pieces
+            and not pieces[-1].endswith(("\n", "\r"))
+            and prefix.strip()
+            and fragment[:len(prefix)].lower() == prefix
+        ):
+            pieces.append("\n")
+        pieces.append(fragment)
+    return "".join(pieces)
+
+
+def _accept_packet(sn: str, cmdid: str, tablename: str, body: str,
+                   packidx: int, packcnt: int):
+    """Buffer one packet; return the whole payload once the last one arrives.
+
+    Returns the reassembled text when the transfer is complete, or ``None``
+    while it is still short — and ``None`` is the answer that means "store
+    nothing and conclude nothing yet".
+
+    Completion is ``len(parts) >= packcnt`` rather than "indices 1..packcnt are
+    all present". Both are true for a well-behaved device; the count form also
+    survives a firmware that indexes from 0, which is a plausible difference
+    between builds and not worth stalling a real transfer over. Re-delivery of
+    a packet already held overwrites it and does not advance the count, so a
+    device retrying packet 1 of 3 can never complete a transfer by repetition.
+    """
+    key = _transfer_key(sn, cmdid, tablename)
+    now = time.monotonic()
+
+    with _transfers_lock:
+        _expire_transfers(now)
+
+        entry = _transfers.get(key)
+        if entry is not None and entry["packcnt"] != packcnt:
+            # The device changed its mind about how long the answer is, which
+            # means this is a fresh answer to the same query rather than a
+            # continuation of the old one. Keeping the old fragments would
+            # splice two different payloads together.
+            log.warning(
+                "ADMS querydata from %s: transfer %r restarted (packcnt %s -> %s); "
+                "%d earlier packet(s) discarded",
+                sn, key, entry["packcnt"], packcnt, len(entry["parts"]),
+            )
+            entry = None
+
+        if entry is None:
+            if len(_transfers) >= config.QUERYDATA_MAX_TRANSFERS:
+                # Evict the least recently touched rather than refuse the new
+                # one: the stalled transfers are the ones worth losing.
+                oldest = min(_transfers, key=lambda k: _transfers[k]["updated"])
+                _transfers.pop(oldest)
+                log.warning(
+                    "ADMS querydata: %d transfers already part-received (limit %d) — "
+                    "evicted the stalest, %r",
+                    len(_transfers) + 1, config.QUERYDATA_MAX_TRANSFERS, oldest,
+                )
+            entry = {"parts": {}, "packcnt": packcnt, "bytes": 0, "updated": now}
+            _transfers[key] = entry
+
+        entry["parts"][packidx] = body
+        entry["updated"] = now
+        entry["bytes"] = sum(len(p) for p in entry["parts"].values())
+
+        if entry["bytes"] > config.QUERYDATA_MAX_TRANSFER_BYTES:
+            _transfers.pop(key, None)
+            log.error(
+                "ADMS querydata from %s: transfer %r exceeded "
+                "QUERYDATA_MAX_TRANSFER_BYTES (%d > %d) — discarded unparsed. "
+                "Nothing was stored and command %s was NOT concluded; raise the "
+                "limit if this payload is legitimate.",
+                sn, key, entry["bytes"], config.QUERYDATA_MAX_TRANSFER_BYTES,
+                cmdid or "<none>",
+            )
+            return None
+
+        if len(entry["parts"]) < packcnt:
+            log.info(
+                "ADMS querydata from %s: packet %s/%s of %r buffered "
+                "(%d packet(s), %d byte(s) so far) — nothing parsed and no "
+                "command concluded until the transfer is complete",
+                sn, packidx, packcnt, key, len(entry["parts"]), entry["bytes"],
+            )
+            return None
+
+        _transfers.pop(key, None)
+        return _join_packets(entry["parts"], tablename)
+
+
+def _conclude_query(db: Session, sn: str, cmdid: str) -> None:
+    """Conclude the outbox command this payload is the answer to.
+
+    Only ever called once a transfer is complete. Concluding on packet 1 of 3
+    would delete the outbox row while two thirds of the answer were still in
+    flight: if the device then stopped, the command would read as a success
+    whose result nobody has, and the retry that would have recovered it has
+    already been thrown away.
+
+    Delegated to `commands.acknowledge` rather than reimplemented, so this
+    shares one definition of "concluded" with /iclock/devicecmd — including its
+    DELETE-is-the-arbiter atomicity, which is what makes a re-delivered answer
+    converge instead of writing a second history row.
+    """
+    if not cmdid.lstrip("-").isdigit():
+        # A query answer with no id we can match. Worth saying out loud: the
+        # payload is stored, but some outbox command is now going to retry
+        # despite having been answered.
+        log.warning(
+            "ADMS querydata from %s: no usable cmdid=%r — the payload was "
+            "stored but no command could be concluded, so it will be retried",
+            sn, cmdid,
+        )
+        return
+
+    # Return=0: the device did what it was asked and this payload is the
+    # proof. There is no Return field on a querydata request to read it from —
+    # answering the query at all *is* the success report.
+    commands.acknowledge(db, sn, int(cmdid), 0, "DATA QUERY", source="querydata")
+
+
+def _querydata_ack(tablename: str, count: str) -> str:
+    """What to answer. See config.QUERYDATA_ACK_STYLE — this is not confirmed.
+
+    Sent on every packet, not only the last: each packet is its own HTTP
+    request, and an unanswered one is a retried one.
+    """
+    if config.QUERYDATA_ACK_STYLE == "ok" or not tablename:
+        return "OK"
+    return f"{tablename}={count}"
+
+
+@router.api_route("/iclock/querydata", methods=["POST", "GET"],
+                  response_class=PlainTextResponse)
+async def adms_querydata(
+    request: Request,
+    SN: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Receive a device's answer to a `DATA QUERY`, and conclude the command.
+
+    Authorised exactly like every other ADMS endpoint, and for a sharper reason
+    than most: this one writes employees, biometric templates and photos from
+    an unauthenticated request. The only thing standing between that and a
+    stranger filling the employee table is `_authorise`, so it runs before a
+    byte of the body is read.
+
+    GET is registered defensively. Nothing has ever been seen using it and it
+    carries no body, but a firmware that used it would otherwise fall to the
+    catch-all's 404 and start the very retry loop this unit is closing.
+    """
+    device, refusal = _authorise(SN, request, db)
+    if refusal:
+        return refusal
+
+    raw = b"" if request.method in ("GET", "HEAD") else await request.body()
+    body = raw.decode("utf-8", errors="ignore")
+
+    tablename = _query(request, "tablename").strip()
+    cmdid = _query(request, "cmdid").strip()
+    count = _query(request, "count").strip()
+    packcnt = max(1, _to_int(_query(request, "packcnt"), 1))
+    packidx = _to_int(_query(request, "packidx"), 1)
+
+    # One line naming everything the request declared, on every packet. This
+    # endpoint is two days old and derived from a single capture; the first
+    # multi-packet transfer and the first unfamiliar `type=` both have to be
+    # readable from the log alone.
+    log.info(
+        "ADMS querydata from %s: type=%r tablename=%r cmdid=%r count=%r "
+        "packet=%s/%s bytes=%d method=%s",
+        SN, _query(request, "type"), tablename, cmdid, count,
+        packidx, packcnt, len(raw), request.method,
+    )
+
+    _touch(db, device, request)
+
+    if not tablename:
+        # Nothing to dispatch on and nothing to acknowledge with. Kept whole in
+        # the log rather than dropped — the same rule as the catch-all — and
+        # answered so the device stops asking.
+        log.warning(
+            "ADMS querydata from %s with no tablename: query=%r body=%s",
+            SN, str(request.query_params), _clip(body, _TABLEDATA_LOG_LIMIT),
+        )
+        return PlainTextResponse(content="OK")
+
+    ack = _querydata_ack(tablename, count or str(
+        len([ln for ln in body.splitlines() if ln.strip()])
+    ))
+
+    payload = _accept_packet(SN, cmdid, tablename, body, packidx, packcnt)
+    if payload is None:
+        # Still short, or discarded for being oversized. Either way: nothing
+        # parsed, nothing concluded, and the device told its packet arrived so
+        # it sends the next one instead of repeating this one.
+        return PlainTextResponse(content=ack)
+
+    _log_bulk_payload("querydata", SN, tablename, count, payload.encode("utf-8"), payload)
+
+    if not _store_bulk_table(db, SN, tablename, payload, source="querydata"):
+        # A table nothing here parses. Logged in full and acknowledged, exactly
+        # as the cdata catch-all does: the reason we know this endpoint exists
+        # at all is that an unrecognised request was logged instead of dropped.
+        log.warning(
+            "ADMS querydata from %s: no parser for tablename=%r — payload "
+            "logged and acknowledged, not stored: %s",
+            SN, tablename, _clip(payload, _TABLEDATA_LOG_LIMIT),
+        )
+
+    # Last, and only now. The command is concluded once its answer is whole and
+    # has been offered to a parser — including a parser that refused it, since
+    # the device did answer and re-asking would earn the same reply.
+    _conclude_query(db, SN, cmdid)
+
+    return PlainTextResponse(content=ack)
 
 
 # ---------------------------------------------------------------------------

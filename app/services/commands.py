@@ -295,6 +295,7 @@ def acknowledge(
     command_id: int,
     return_code: int,
     command_name: str = "",
+    source: str = "devicecmd",
 ) -> str:
     """Record what the device reported about one specific command.
 
@@ -306,6 +307,15 @@ def acknowledge(
     ``acknowledged``, ``rejected``, ``unknown`` or ``duplicate``. Never raises
     and never refuses the request — a device that cannot deliver its ack will
     keep retrying the whole command, which is worse than a lost outcome.
+
+    ``source`` names the endpoint the report arrived on, for the log only.
+    There are two: ``/iclock/devicecmd`` for an ordinary command, and
+    ``/iclock/querydata`` for a ``DATA QUERY``, which a device answers by
+    uploading the data and quoting ``cmdid`` instead of ever calling devicecmd
+    (E9). Both conclude a command the same way and must keep doing so — one
+    definition of "concluded", one atomic move — but "devicecmd reported ID=1"
+    in a log line about a querydata upload would send the next person reading
+    it to the wrong endpoint.
     """
     row = (
         db.query(DeviceCommandOutbox)
@@ -323,9 +333,9 @@ def acknowledge(
         # — acknowledging whatever happened to be nearby is the bug this
         # function exists to fix.
         log.warning(
-            "devicecmd from %s reported ID=%s Return=%s CMD=%r, which is not "
+            "%s from %s reported ID=%s Return=%s CMD=%r, which is not "
             "outstanding for that serial — no other command was touched",
-            device_sn, command_id, return_code, command_name,
+            source, device_sn, command_id, return_code, command_name,
         )
         return "unknown"
 

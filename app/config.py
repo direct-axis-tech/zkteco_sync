@@ -186,6 +186,61 @@ PROVISION_USER_GROUP = _get_int("PROVISION_USER_GROUP", 0)
 
 
 # ---------------------------------------------------------------------------
+# Query responses arriving on /iclock/querydata (E9)
+# ---------------------------------------------------------------------------
+# A `DATA QUERY` command is answered by the device POSTing to
+# /iclock/querydata, not to /iclock/devicecmd. The reply can be split across
+# several packets (`packcnt`/`packidx`), and a fragment parsed as if it were a
+# whole record is the failure this section exists to prevent: a truncated
+# base64 photo or a half template stored as if complete. Packets are therefore
+# buffered in memory until the last one arrives, and only then parsed.
+#
+# In memory, deliberately. See the module comment in app/routers/adms.py: an
+# incomplete transfer is disposable because the outbox command that provoked
+# it is only concluded once the payload is whole, so a restart mid-transfer
+# leaves the command outstanding and the device re-answers it. Persisting
+# half-payloads would mean a new table holding megabytes of data that is
+# useless by definition.
+
+# How long a partly-received transfer is kept before it is abandoned. Long
+# enough for a slow multi-megabyte upload over a bad link; short enough that a
+# device which gives up half way does not pin memory until the next restart.
+QUERYDATA_TRANSFER_TTL_SECONDS = max(
+    1, _get_int("QUERYDATA_TRANSFER_TTL_SECONDS", 600)
+)
+
+# Ceiling on one reassembled payload. MAX_REQUEST_BYTES already bounds a
+# single packet; this bounds the sum of them, which is the number that
+# actually matters once a device can send as many packets as it likes.
+QUERYDATA_MAX_TRANSFER_BYTES = max(
+    1, _get_int("QUERYDATA_MAX_TRANSFER_BYTES", 16 * 1024 * 1024)
+)
+
+# How many transfers may be part-received at once, across all devices. A
+# handful of terminals answering a handful of queries is the real workload;
+# the cap is what stops a malfunctioning or hostile device opening unbounded
+# buffers by sending packet 1 of 9 forever.
+QUERYDATA_MAX_TRANSFERS = max(1, _get_int("QUERYDATA_MAX_TRANSFERS", 32))
+
+# What to answer a querydata POST with. UNCONFIRMED against hardware — the
+# device 404s today and retries every ~5 seconds, so it plainly wants
+# *something*, but nothing observed says what.
+#
+#   "tabledata"  `<tablename>=<count>`, the §3.7 bulk-upload convention. The
+#                default, because the request declares `type=tabledata`, its
+#                body is byte-identical in shape to a tabledata push, and it
+#                carries the same `tablename=`/`count=` parameters that
+#                acknowledgement is built from.
+#   "ok"         a bare `OK`, which is what every other ADMS endpoint answers.
+#
+# One setting rather than a code change on purpose: if the terminal is still
+# looping after this is deployed, the operator flips this value, restarts, and
+# watches the log — no rebuild, no second unit. Whichever value stops the
+# retry is new protocol evidence and belongs in push-protocol.md §3.13.
+QUERYDATA_ACK_STYLE = _get("QUERYDATA_ACK_STYLE", "tabledata").lower() or "tabledata"
+
+
+# ---------------------------------------------------------------------------
 # Timezone provenance
 # ---------------------------------------------------------------------------
 # A ZKTeco device sends a bare wall-clock string with no offset and no zone
