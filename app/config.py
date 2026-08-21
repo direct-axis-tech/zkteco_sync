@@ -121,6 +121,31 @@ COMMAND_SWEEP_MINUTES = max(1, _get_int("COMMAND_SWEEP_MINUTES", 15))
 # acknowledging a multi-command reply.
 COMMAND_BATCH_SIZE = max(1, _get_int("COMMAND_BATCH_SIZE", 1))
 
+# The same schedule, for a command that REVOKES access (`DATA DELETE …`, E8).
+#
+# Everywhere else in this application the queue's patience with an unreachable
+# device is the feature — it is what recovered a weekend of missed punches.
+# Revocation is the one place where it is a hazard: while a delete sits in a
+# backoff window the person it names can still open that door. So a delivered
+# but unacknowledged revocation is offered again much sooner than an ordinary
+# command.
+#
+# Safe to make aggressive because a delete is idempotent in exactly the way
+# E7 relies on for DATA UPDATE: deleting a user the terminal has already
+# removed does nothing the second time.
+#
+# The shorter schedule also means a revocation that is never acknowledged
+# exhausts its attempts in minutes rather than an hour. That is deliberate: a
+# failed revocation is something the operator has to *act* on — walk to the
+# door, pull the person some other way — and finding out quickly is worth more
+# than a few extra silent retries. Nothing is ever concluded on this clock
+# while the device is merely offline; that path consumes no attempts at all.
+REVOCATION_BACKOFF_SECONDS = [
+    max(1, int(v))
+    for v in _get_list("REVOCATION_BACKOFF_SECONDS", "30,60,120,300")
+    if v.lstrip("-").isdigit()
+] or [30, 60, 120, 300]
+
 
 # ---------------------------------------------------------------------------
 # Central provisioning of people onto access-control terminals (E3)

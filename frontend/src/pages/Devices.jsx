@@ -353,6 +353,35 @@ export default function Devices() {
         </div>
       )}
 
+      {/* A standing banner, not a toast. An access revocation that the door
+          has not confirmed does not stop being true because somebody looked
+          away, and it is the one queue state in this application where
+          waiting is a hazard rather than a feature. */}
+      {devices.some((d) => d.pending_revocations > 0) && (
+        <div className="mb-4 border-2 border-red-300 bg-red-50 rounded-xl px-4 py-3">
+          <p className="text-sm font-semibold text-red-800">
+            Access revocations are waiting to reach a door
+          </p>
+          <p className="text-xs text-red-700 mt-1">
+            These people have been removed in the system but the terminal has
+            not collected and confirmed it, so they can still get in. A device
+            that is offline will not collect anything until it comes back.
+          </p>
+          <ul className="mt-2 space-y-0.5">
+            {devices
+              .filter((d) => d.pending_revocations > 0)
+              .map((d) => (
+                <li key={d.serial_number} className="text-xs text-red-800">
+                  <span className="font-medium">{d.name || d.serial_number}</span>
+                  {' — '}
+                  {d.pending_revocations} outstanding
+                  {!d.is_online && ' · device is offline'}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
+
       <div className="bg-white rounded-xl border border-gray-200">
         {loading ? (
           <div className="p-12 text-center text-sm text-gray-400">Loading…</div>
@@ -383,6 +412,20 @@ export default function Devices() {
                 >
                   <td className="px-4 py-3 font-medium text-gray-900">
                     {device.name || <span className="text-gray-400">—</span>}
+                    {/* An outstanding revocation is a safety state, not a
+                        queue statistic: somebody has been taken off this door
+                        in the system and the door has not been told. It is
+                        surfaced here as well as on the person's page because
+                        an operator scanning this table for "is anything
+                        wrong" should not have to open every employee to find
+                        it. */}
+                    {device.pending_revocations > 0 && (
+                      <span className="block mt-1 text-xs font-semibold text-red-700">
+                        {device.pending_revocations} revocation
+                        {device.pending_revocations > 1 ? 's' : ''} not confirmed
+                        at this door
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-gray-500 font-mono text-xs">{device.serial_number}</td>
                   <td className="px-4 py-3 text-gray-500">{device.ip_address}:{device.port}</td>

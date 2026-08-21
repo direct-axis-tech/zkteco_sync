@@ -171,6 +171,41 @@ def link_device_employee(db: Session, device_sn: str, user_id: str, uid=None):
     return link
 
 
+def unlink_device_employee(db: Session, device_sn: str, user_id: str) -> bool:
+    """Record that ``user_id`` is no longer on ``device_sn``. True if a row went.
+
+    The mirror of :func:`link_device_employee`, and the only place a
+    `device_employees` row is destroyed, for the same reason there is only one
+    place they are created: this row is the app's whole answer to "is this
+    person on that door", and two different pieces of code with two different
+    ideas of when it stops being true is exactly how a revocation ends up
+    claimed but not performed.
+
+    Deliberately says nothing about *why*. The SDK transport calls this having
+    just watched the device delete the user; the ADMS transport calls it only
+    when the terminal acknowledges the delete command. Both are the same fact
+    by the time they get here — the person is off that device — and neither is
+    allowed to assert it any earlier.
+
+    Does not commit; the caller owns the transaction.
+    """
+    device_sn = str(device_sn or "").strip()
+    user_id = str(user_id or "").strip()[:_USER_ID_LIMIT]
+    if not device_sn or not user_id:
+        return False
+
+    link = db.query(DeviceEmployee).filter_by(
+        device_sn=device_sn, user_id=user_id
+    ).first()
+    if link is None:
+        return False
+
+    db.delete(link)
+    db.flush()
+    log.info("%s is no longer enrolled on %s", user_id, device_sn)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # The other kind of source: an operator, typing
 # ---------------------------------------------------------------------------

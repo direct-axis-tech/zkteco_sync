@@ -55,6 +55,36 @@ def _safe(fn, default=None):
 # Basic CRUD
 # ---------------------------------------------------------------------------
 
+def _with_pending_revocations(db: Session, rows) -> list:
+    """Stamp DeviceOut.pending_revocations on each device (E8).
+
+    One extra query for the whole listing, not one per device: the outbox is
+    the hot table on every device poll and this is an operator page.
+
+    Counted over the whole outbox rather than only `acc` rows because the
+    outbox is the only place a revocation can be outstanding at all — the SDK
+    transport has either done it or failed loudly by the time the request
+    returns, and never leaves anything behind to count.
+    """
+    serials = [r.serial_number for r in rows]
+    counts = {}
+    if serials:
+        for row in (
+            db.query(DeviceCommandOutbox)
+            .filter(DeviceCommandOutbox.device_sn.in_(serials))
+            .all()
+        ):
+            if provisioning.pin_from_revocation_command(row.command):
+                counts[row.device_sn] = counts.get(row.device_sn, 0) + 1
+
+    out = []
+    for row in rows:
+        shape = DeviceOut.model_validate(row)
+        shape.pending_revocations = counts.get(row.serial_number, 0)
+        out.append(shape)
+    return out
+
+
 @router.get("", response_model=List[DeviceOut])
 def list_devices(
     status: Optional[str] = Query(default=None, pattern="^(pending|approved|rejected)$"),
@@ -64,7 +94,7 @@ def list_devices(
     query = db.query(Device)
     if status:
         query = query.filter(Device.status == status)
-    return query.all()
+    return _with_pending_revocations(db, query.all())
 
 
 @router.post("", response_model=DeviceOut, status_code=201)
@@ -140,7 +170,7 @@ def close_pairing_window(request: Request, admin: User = Depends(require_admin),
 
 @router.get("/{sn}", response_model=DeviceOut)
 def get_device(sn: str, db: Session = Depends(get_db)):
-    return _get_device_or_404(sn, db)
+    return _with_pending_revocations(db, [_get_device_or_404(sn, db)])[0]
 
 
 @router.patch("/{sn}", response_model=DeviceOut)
@@ -656,6 +686,16 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
             if not emp:
                 errors.append(f"{user_id}: employee not found in DB")
                 continue
+            # One person's uncollected revocation must not be undone by a bulk
+            # push aimed at everybody else. Named in `errors` so it is visible
+            # rather than being a silently missing row in the result.
+            if provisioning.outstanding_revocations(db, sn, user_id):
+                errors.append(
+                    f"{user_id}: a revocation for this person on {sn} is still "
+                    "queued and unconfirmed — not pushed, because that would "
+                    "contradict it. Cancel the revocation to re-grant access."
+                )
+                continue
             queued.extend(r.id for r in provisioning.provision(db, sn, emp))
             pushed.append(user_id)
 
@@ -733,6 +773,9 @@ def push_user_to_device(sn: str, user_id: str, response: Response, db: Session =
         raise HTTPException(status_code=404, detail="Employee not found")
 
     if _uses_command_queue(device):
+        blocked = _revocation_block(db, sn, user_id)
+        if blocked:
+            raise blocked
         rows = provisioning.provision(db, sn, emp)
         response.status_code = 202
         return {
@@ -787,20 +830,208 @@ def push_user_to_device(sn: str, user_id: str, response: Response, db: Session =
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.delete("/{sn}/users/{user_id}", status_code=204, dependencies=[Depends(require_admin)])
-def remove_user_from_device(sn: str, user_id: str, db: Session = Depends(get_db)):
-    """Remove a user from the device. Does not delete the employee from DB."""
+# ---------------------------------------------------------------------------
+# Revoking a person from a device (E8)
+# ---------------------------------------------------------------------------
+#
+# The mirror of the push above, on the same two transports and by the same
+# rule — but with one difference that is not cosmetic.
+#
+# A push that has not been delivered yet means somebody cannot get in yet. A
+# revocation that has not been delivered yet means somebody who should have
+# lost access still has it, at a physical door, with nothing at the door
+# saying so. So on the `acc` path this endpoint answers **202 and the word
+# "queued"**, never 204 and silence, and every layer above it — the response
+# message, the outbox listing, the person's page, the device list — is
+# required to keep saying "not yet confirmed at the door" until the terminal
+# acknowledges. The single worst outcome available to this unit is a screen
+# that says access was revoked when it was not.
+
+
+def _revocation_block(db: Session, sn: str, user_id: str):
+    """A 409 if a revocation for this pair is outstanding, else None.
+
+    Called by every path that would put this person back onto this door. The
+    two orders of business are settled explicitly rather than left to the
+    FIFO: queueing a delete *withdraws* outstanding pushes (provisioning.
+    revoke), and queueing a push while a delete is outstanding is *refused*.
+
+    Not symmetrical on purpose. Withdrawing a push to make room for a delete
+    fails safe — the worst case is somebody has to be pushed again. Silently
+    letting a push through behind an uncollected delete fails the other way:
+    the terminal would perform the delete and then immediately restore the
+    person, and the operator's screen would show a completed revocation for
+    somebody who can still open the door.
+
+    Refusing needs an escape hatch or it just strands the operator behind an
+    offline terminal, so there is one: DELETE .../revocation cancels it, as a
+    named and audited act.
+    """
+    outstanding = provisioning.outstanding_revocations(db, sn, user_id)
+    if not outstanding:
+        return None
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"A revocation for {user_id} on {sn} has not been confirmed by the "
+            f"device yet ({len(outstanding)} command(s) still queued: "
+            f"{', '.join(str(r.id) for r in outstanding)}). Pushing now would "
+            "queue an instruction that contradicts it. Wait for the terminal "
+            "to collect the revocation, or cancel the revocation first — "
+            "nothing was queued."
+        ),
+    )
+
+
+@router.delete("/{sn}/users/{user_id}", dependencies=[Depends(require_admin)])
+def remove_user_from_device(
+    sn: str,
+    user_id: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Take one person off one device. Does not delete the employee from the DB.
+
+    Routed on Device.protocol exactly as the push is, and for the same reason:
+
+    * `att` — the SDK deletes the user over TCP 4370 now. **200,
+      `status: "removed"`.** By the time this returns it has happened, so the
+      local enrolment record is dropped in the same breath.
+    * `acc` — `DATA DELETE user` and `DATA DELETE userauthorize` go on the
+      outbox. **202, `status: "queued"`.** The terminal has not been told yet.
+      The local enrolment record deliberately **stays** until it acknowledges,
+      so the UI keeps showing this person as present-but-being-revoked rather
+      than quietly claiming a removal nobody has performed.
+
+    Before this unit both paths dialled TCP 4370 unconditionally, so an `acc`
+    terminal behind NAT — which is every one of them — answered 503 and there
+    was no way at all to take back access this application could grant.
+    """
     device = _get_device_or_404(sn, db)
     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
+
+    if _uses_command_queue(device):
+        # A person can be owed to a device without being on it: the push was
+        # queued and the terminal has not collected it. "Remove" then means
+        # "call it off", which is a real and useful thing to be able to do —
+        # and 404ing here would leave the push in the outbox to be delivered
+        # later, which is the opposite of what was asked for.
+        if not de:
+            withdrawn = provisioning.withdraw_pushes_for(
+                db, sn, user_id,
+                reason=f"withdrawn: {user_id} was removed from {sn} before delivery",
+            )
+            if not withdrawn:
+                raise HTTPException(
+                    status_code=404, detail="User not enrolled on this device"
+                )
+            audit.record(db, admin.username, "device_user_remove",
+                         target=f"{sn}/{user_id}", ip=client_ip(request),
+                         detail=f"withdrew {len(withdrawn)} undelivered push(es)")
+            return {
+                "device_sn": sn,
+                "user_id": user_id,
+                "transport": "adms_queue",
+                "status": "withdrawn",
+                "withdrawn_command_ids": withdrawn,
+                "message": (
+                    f"This person was never confirmed on {sn}; the "
+                    f"{len(withdrawn)} command(s) still waiting to put them "
+                    "there have been withdrawn. Nothing was sent to the device."
+                ),
+            }
+
+        rows, withdrawn = provisioning.revoke(db, sn, user_id)
+        audit.record(db, admin.username, "device_user_remove",
+                     target=f"{sn}/{user_id}", ip=client_ip(request),
+                     detail=f"queued={len(rows)} withdrew={len(withdrawn)}")
+        response.status_code = 202
+        return {
+            "device_sn": sn,
+            "user_id": user_id,
+            "transport": "adms_queue",
+            "status": "queued",
+            "command_ids": [r.id for r in rows],
+            "commands": [r.command for r in rows],
+            "withdrawn_command_ids": withdrawn,
+            # This string is what the operator reads. It is the difference
+            # between an accurate belief and a dangerous one, so it says the
+            # unwelcome thing first and does not soften it.
+            "message": (
+                f"Access revoked in the system — NOT yet confirmed at the door. "
+                f"{sn} collects one command per poll (about 10 seconds) and "
+                "confirms afterwards; until it does, this person can still "
+                "open that door. If the terminal is offline the revocation "
+                "waits, and stays visible as outstanding."
+            ),
+        }
+
     if not de:
         raise HTTPException(status_code=404, detail="User not enrolled on this device")
+
     try:
         with device_connection(device) as conn:
             conn.delete_user(uid=de.uid, user_id=user_id)
-        db.delete(de)
+        # Only now, and through the single deleter — the device has actually
+        # done it, which is what the SDK transport's synchronicity buys.
+        employee_sync.unlink_device_employee(db, sn, user_id)
         db.commit()
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
+
+    audit.record(db, admin.username, "device_user_remove", target=f"{sn}/{user_id}",
+                 ip=client_ip(request), detail="transport=sdk")
+    return {
+        "device_sn": sn,
+        "user_id": user_id,
+        "transport": "sdk",
+        "status": "removed",
+        "message": f"Removed from {sn}. The device confirmed it.",
+    }
+
+
+@router.delete("/{sn}/users/{user_id}/revocation", dependencies=[Depends(require_admin)])
+def cancel_user_revocation(
+    sn: str,
+    user_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Call off a revocation the device has not collected yet.
+
+    The escape hatch for the 409 in :func:`_revocation_block`. Only touches
+    commands still in the outbox — once a terminal has acknowledged a delete
+    there is nothing here to cancel, and the way to put the person back is to
+    push them again.
+
+    Deliberately its own endpoint rather than a flag on the push: re-granting
+    access somebody deliberately revoked should be a thing an operator has to
+    ask for by name, and a thing the audit trail records under that name.
+    """
+    _get_device_or_404(sn, db)
+    cancelled = provisioning.cancel_revocation(db, sn, user_id, by=admin.username)
+    if not cancelled:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No outstanding revocation for {user_id} on {sn}",
+        )
+    audit.record(db, admin.username, "device_user_revocation_cancel",
+                 target=f"{sn}/{user_id}", ip=client_ip(request),
+                 detail=f"cancelled={len(cancelled)}")
+    return {
+        "device_sn": sn,
+        "user_id": user_id,
+        "status": "cancelled",
+        "cancelled_command_ids": cancelled,
+        "message": (
+            f"Revocation cancelled. {user_id} keeps their access to {sn} — "
+            "if they were already confirmed on it, nothing about the device "
+            "changed at any point."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +1128,13 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
         # The user record has to be buildable before a template can be queued
         # behind it — a template belongs to a Pin the terminal knows.
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Same rule as the user push: a biometric queued behind an uncollected
+    # delete would put the credential back on the door the delete is meant to
+    # take it off.
+    blocked = _revocation_block(db, sn, user_id)
+    if blocked:
+        raise blocked
 
     sendable, from_this_device = provisioning.templates_for_device(db, sn, user_id)
 
@@ -1049,8 +1287,51 @@ def delete_user_template(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    """Delete a specific finger template from device and from DB."""
+    """Delete a specific finger template from device and from DB (`att` only).
+
+    On an `acc` terminal this is REFUSED — 501 — and the refusal is a finding,
+    not a gap somebody forgot to fill.
+
+    §3.8 reproduces ZKTeco's own access-control SDK command constants, which
+    the protocol reference rates as its highest-weight source. That
+    enumeration carries `DATA UPDATE` for every biometric table
+    (`BIODATA`, `biophoto`, `templatev10`, `facev7`), `DATA QUERY` and
+    `DATA COUNT` for `biodata` — and exactly one `DATA DELETE`, for `user`.
+    There is no per-template delete in the vendor's own command set, and the
+    reading that makes that coherent is that a person's biometrics live with
+    their user record and go when it goes.
+
+    So the supported way to remove somebody's biometrics from an
+    access-control terminal is to remove the person: DELETE
+    /devices/{sn}/users/{user_id}, which queues `DATA DELETE user Pin=<n>`.
+    That is said in the response, because an operator who clicked this needs
+    to be told what to do instead, not merely told no.
+
+    What this deliberately does NOT do is guess. Fabricating a delete for one
+    of the biometric tables and shipping it as though it were known would put
+    an unverified command on physical door hardware; if the shape were wrong
+    the terminal would refuse it and the operator would be looking at a
+    failure for a credential that was, in fact, still on the door — or at a
+    success for one that was not removed. Both readings are worse than an
+    honest refusal. UNVERIFIED either way until somebody watches a real
+    BioFace A1 answer a user delete and then reports whether its face count
+    dropped.
+    """
     device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"{sn} is an access-control terminal, and the PUSH protocol "
+                "has no confirmed command for deleting one biometric on its "
+                "own — the vendor's own SDK command set contains no biometric "
+                "delete at all. Nothing was queued and nothing was guessed at. "
+                "To take this person's biometrics off this door, remove the "
+                "person from it (Remove, on their Enrolled Devices list): "
+                "deleting the user record is what removes their templates. "
+                "UNVERIFIED against real hardware."
+            ),
+        )
     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
     if not de:
         raise HTTPException(status_code=404, detail="User not enrolled on this device")

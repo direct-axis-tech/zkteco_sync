@@ -53,6 +53,13 @@ class DeviceOut(BaseModel):
     # secret and this is the only shape a device is allowed to leave the
     # server in; only whether one is set is observable.
     comm_key_set: bool = False
+    # How many people have been revoked from this device in the system and NOT
+    # yet confirmed removed by the device itself (E8). Non-zero means somebody
+    # can still open this door who is not supposed to be able to. It is on the
+    # *device* shape as well as the person's page deliberately: an operator
+    # scanning the device list for "is anything wrong" should not have to open
+    # each employee in turn to find an outstanding revocation.
+    pending_revocations: int = 0
 
     class Config:
         from_attributes = True

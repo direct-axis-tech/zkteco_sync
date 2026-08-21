@@ -1246,6 +1246,12 @@ async def adms_devicecmd(
             # is where the device_employees link is written — through the same
             # single writer the SDK path uses, never inline here.
             provisioning.note_acknowledged(db, SN, body)
+            # And the mirror image (E8). A confirmed `DATA DELETE user` is the
+            # only moment this application is entitled to say the person is
+            # off that terminal — the link is dropped here and not one second
+            # earlier, because until this ack arrives the delete was merely
+            # queued and the person could still open the door.
+            provisioning.note_revocation_acknowledged(db, SN, body)
             db.commit()
         elif outcome == "rejected":
             # The mirror image, and the reason E4 can queue a biometric behind

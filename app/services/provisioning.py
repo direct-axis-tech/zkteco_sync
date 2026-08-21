@@ -500,3 +500,299 @@ def withdraw_orphaned_templates(db: Session, device_sn: str = None) -> list:
                 row_id, pin, row_sn,
             )
     return withdrawn
+
+
+# ---------------------------------------------------------------------------
+# Taking a person off a terminal (E8)
+# ---------------------------------------------------------------------------
+#
+# Everything above this line grants access. This is the half that takes it
+# away, and it is the half where the asymmetry of this whole design bites.
+#
+# Granting is allowed to be slow. If a `DATA UPDATE user` sits in the outbox
+# for a day because the terminal is unplugged, the consequence is that
+# somebody cannot get in yet — annoying, visible, self-correcting. Revoking is
+# not allowed to be slow in the same way: while a `DATA DELETE user` sits in
+# the outbox, the person it names can still open that door, and *nothing at
+# the door itself* says otherwise. The queue's tolerance of offline devices,
+# which is a feature everywhere else in this application, is here a safety
+# problem. That is why revocation gets a shorter retry schedule
+# (commands.backoff_for), an ERROR-level log line when it is given up on
+# (commands.conclude) and a UI that refuses to describe a queued delete as a
+# completed one.
+#
+# What is CONFIRMED, and what is not
+# ----------------------------------
+# `DATA DELETE user Pin=<n>` is verbatim from §3.8's own worked example
+# (`C:296:DATA DELETE user Pin=1`). It is the only delete shape the protocol
+# reference gives a literal example for, and it is the load-bearing one.
+#
+# `DATA DELETE userauthorize Pin=<n>` is DERIVED, not quoted: the generic
+# grammar `DATA DELETE <table> …` is documented, the table name
+# `userauthorize` is confirmed, and `Pin` is confirmed as its key from the
+# UPDATE shape. See :func:`authorize_delete_command` for why it is sent
+# anyway, and what happens if the terminal has already removed it.
+#
+# There is NO biometric delete here. Not a guessed one, not an UNVERIFIED one
+# — none. See :func:`revoke_commands_for`.
+
+
+def user_delete_command(user_id) -> str:
+    """`DATA DELETE user Pin=<n>` — verbatim from §3.8.
+
+    Quoted from the protocol reference's own example, `C:296:DATA DELETE user
+    Pin=1`, which is the single command shape in this module that needs no
+    derivation at all. One field, no TABs: unlike the UPDATE shapes there is
+    nothing else to say, because the Pin identifies the record and the record
+    is what goes.
+    """
+    return f"DATA DELETE user Pin={_wire_safe(user_id)}"
+
+
+def authorize_delete_command(user_id) -> str:
+    """`DATA DELETE userauthorize Pin=<n>` — the door permission, explicitly.
+
+    DERIVED, not quoted. §3.8 gives the generic form `DATA DELETE <table> …`,
+    gives `userauthorize` as a real table, and gives `Pin` as its key. What it
+    does *not* say anywhere is whether deleting the user also deletes that
+    user's authorization row. Both readings are plausible and the spec settles
+    neither, so this takes the safer of the two: send it, and do not depend on
+    a cascade nobody has observed.
+
+    The cost of being wrong in each direction is what decides it.
+
+    * If the terminal *does* cascade, this command is redundant. Worst case it
+      answers with a non-zero Return meaning "no such record", which is
+      surfaced honestly (see the UI wording) and costs nothing but a poll.
+    * If the terminal does *not* cascade and this were omitted, a
+      `userauthorize` row would outlive the person it belonged to. That is
+      the half-revocation this unit exists to prevent, and it is invisible
+      from the server: everything we can see would say the delete worked.
+
+    A redundant command is cheap; a stale door permission is not.
+    """
+    return f"DATA DELETE userauthorize Pin={_wire_safe(user_id)}"
+
+
+def revoke_commands_for(user_id) -> list:
+    """Both delete bodies for one person, in the order they must be sent.
+
+    The user record goes FIRST, and the order is the whole argument.
+
+    A terminal collects one command per poll. If it collects exactly one and
+    then loses power for a week, the one it got should be the one that
+    actually revokes. That is `DATA DELETE user`: it is the confirmed shape,
+    and removing the person's record removes the terminal's ability to
+    recognise them at all, whatever it does about permissions. The
+    authorization delete alone would leave the person still enrolled and rely
+    on the device treating a missing `userauthorize` row as "no doors" — very
+    probably true, entirely unverified, and not something to bet a door on.
+
+    So: the definitely-sufficient command first, the belt-and-braces one
+    behind it.
+
+    On biometrics — the question this unit was told to ANSWER, not guess at
+    -------------------------------------------------------------------
+    There is no template delete here, and that is a finding rather than an
+    omission. §3.8 reproduces ZKTeco's own access-control SDK command
+    constants (`namanhho/BioMatrix`, `Access/Commands.cs`), which the protocol
+    reference rates as the highest-weight source it has. That enumeration
+    contains `DATA UPDATE BIODATA`, `DATA UPDATE biophoto`, `DATA UPDATE
+    templatev10`, `DATA UPDATE facev7`, `DATA QUERY tablename=biodata` and
+    `DATA COUNT biodata` — and exactly one delete, for `user`. The vendor's
+    own SDK exposes no way to delete a biometric row on its own.
+
+    The reading that makes that consistent is that biometrics belong to the
+    user record and go when it goes; a terminal offering no biometric delete
+    at all, and thus no way ever to remove a face from an access controller,
+    is not a credible design. So removing the person is what removes their
+    templates, and `DATA DELETE user Pin=<n>` is the whole revocation.
+
+    Stated as what it is: an inference from an absence, marked UNVERIFIED
+    against real hardware, and the reason nothing here invents a delete for a
+    biometric table. Inventing one and shipping it as known would be guessing
+    at a command that writes physical door hardware, and if the guess were
+    wrong the terminal would refuse it and the operator would be shown a
+    failure for something that had, in fact, already worked.
+    """
+    return [user_delete_command(user_id), authorize_delete_command(user_id)]
+
+
+# `DATA DELETE user Pin=…` only. `DATA DELETE userauthorize Pin=…` must not
+# match: an acknowledged permission delete is not evidence that the person is
+# off the terminal, and it is the person being off the terminal that the
+# `device_employees` row means. The `\s+` after `user` is what keeps the two
+# apart — "userauthorize" has no whitespace at that position.
+_DELETE_USER_PIN = re.compile(r"^DATA DELETE user\s+Pin=([^\t]*)", re.IGNORECASE)
+
+# Any `DATA UPDATE <table> … Pin=…` — the push commands a revocation
+# contradicts. Deliberately generic over the table so a future push command
+# for a table this unit has never heard of is withdrawn too.
+_PUSH_PIN = re.compile(r"^DATA UPDATE \S+\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECASE)
+
+
+def pin_from_revocation_command(command: str):
+    """The Pin in a `DATA DELETE user` command, or None if it is not one."""
+    match = _DELETE_USER_PIN.match((command or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def pin_from_push_command(command: str):
+    """The Pin in any `DATA UPDATE <table>` command, or None."""
+    match = _PUSH_PIN.match((command or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def is_revocation_command(command: str) -> bool:
+    """True for either half of a revocation, for filtering the outbox."""
+    text = (command or "").strip()
+    return bool(
+        _DELETE_USER_PIN.match(text)
+        or re.match(r"^DATA DELETE userauthorize\s+Pin=", text, re.IGNORECASE)
+    )
+
+
+def pin_from_any_delete_command(command: str):
+    """The Pin in either delete command, or None. For grouping, not for acting."""
+    text = (command or "").strip()
+    match = re.match(r"^DATA DELETE \S+\s+Pin=([^\t]*)", text, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def outstanding_revocations(db: Session, device_sn: str = None, user_id: str = None) -> list:
+    """Outbox rows that are part of a revocation, optionally narrowed.
+
+    "Outstanding" is the honest word and the one the UI uses: the command is
+    still owed to a device, which means the person it names has *not* been
+    confirmed removed, which means they may still be able to open that door.
+    """
+    query = db.query(DeviceCommandOutbox)
+    if device_sn:
+        query = query.filter(DeviceCommandOutbox.device_sn == device_sn)
+    rows = [r for r in query.order_by(DeviceCommandOutbox.id).all()
+            if is_revocation_command(r.command)]
+    if user_id is not None:
+        rows = [r for r in rows
+                if pin_from_any_delete_command(r.command) == str(user_id)]
+    return rows
+
+
+def withdraw_pushes_for(db: Session, device_sn: str, user_id: str, reason: str) -> list:
+    """Retire every queued push for this (device, Pin). Returns the ids.
+
+    A queued `DATA UPDATE user` and a queued `DATA DELETE user` for the same
+    person on the same door are two instructions that contradict each other,
+    and the outbox is FIFO, so leaving both in it means the device performs
+    whichever was queued first and then the other — in the worst ordering,
+    deleting the person and then putting them straight back.
+
+    Same mechanism E4 built for orphaned templates: the command is concluded
+    ``failed`` with the reason recorded, so it appears in the device's history
+    and in the person's "not delivered" list rather than silently evaporating.
+    Called *before* the deletes are queued, so the outbox never holds the
+    contradiction at all.
+    """
+    withdrawn = []
+    for row in db.query(DeviceCommandOutbox).filter(
+        DeviceCommandOutbox.device_sn == device_sn
+    ).order_by(DeviceCommandOutbox.id).all():
+        if pin_from_push_command(row.command) != str(user_id):
+            continue
+        row_id, name = row.id, row.command.split("\t")[0]
+        if commands.conclude(db, row, "failed", last_error=reason):
+            withdrawn.append(row_id)
+            log.warning(
+                "withdrew queued push %s (%s) for %s on %s: %s",
+                row_id, name, user_id, device_sn, reason,
+            )
+    return withdrawn
+
+
+def revoke(db: Session, device_sn: str, user_id: str) -> tuple:
+    """Queue one person's removal from one `acc` terminal.
+
+    Returns ``(rows, withdrawn)`` — the outbox rows created and the ids of any
+    contradicting pushes retired to make room for them.
+
+    Writes nothing to `device_employees`. That row is this application's claim
+    that the person is on that door, and it survives until the terminal
+    acknowledges the delete (:func:`note_revocation_acknowledged`). Removing
+    it here would be the mirror of the bug E3 fixed on the way in: a local
+    record asserting a device state that no device has confirmed. Worse in
+    this direction, because it would read as "revoked" on a screen while the
+    person walks through the door.
+    """
+    withdrawn = withdraw_pushes_for(
+        db, device_sn, user_id,
+        reason=f"withdrawn: {user_id} is being removed from {device_sn}",
+    )
+    rows = [commands.queue(db, device_sn, body)
+            for body in revoke_commands_for(user_id)]
+    log.warning(
+        "revoking %s from %s: queued command ids %s (user + userauthorize)%s "
+        "— NOT yet revoked at the door; the terminal must collect and "
+        "acknowledge these first",
+        user_id, device_sn, [r.id for r in rows],
+        f", withdrew {len(withdrawn)} contradicting push(es)" if withdrawn else "",
+    )
+    return rows, withdrawn
+
+
+def note_revocation_acknowledged(db: Session, device_sn: str, command: str):
+    """The terminal confirmed a user delete: the person really is off it now.
+
+    The exact mirror of :func:`note_acknowledged`, and the only thing in the
+    ADMS transport allowed to drop the link. Goes through
+    employee_sync.unlink_device_employee, the single deleter, rather than
+    reaching for the table here.
+
+    Does not commit — the caller owns the transaction.
+    """
+    user_id = pin_from_revocation_command(command)
+    if not user_id:
+        return False
+    removed = employee_sync.unlink_device_employee(db, device_sn, user_id)
+    log.info(
+        "device %s acknowledged the deletion of %s — revoked and confirmed at "
+        "the door%s",
+        device_sn, user_id,
+        "" if removed else " (no local enrolment record existed to clear)",
+    )
+    return removed
+
+
+def cancel_revocation(db: Session, device_sn: str, user_id: str, by: str) -> list:
+    """Take an outstanding revocation back out of the outbox. Returns the ids.
+
+    Exists because of what happens on the other side of the collision: a push
+    for somebody with a revocation still outstanding is REFUSED, not
+    interleaved (see the 409 in app/routers/devices.py). Refusing without
+    offering a way out would strand an operator behind an offline terminal
+    with no way to re-grant access, so this is the way out — and it is a
+    deliberate, audited, named act rather than a side effect of clicking
+    "push" again.
+
+    Concluded ``failed`` rather than deleted outright: the log row is the
+    record that somebody decided not to revoke after all, which is exactly the
+    kind of thing an access-control system should not be able to forget.
+    """
+    cancelled = []
+    for row in outstanding_revocations(db, device_sn, user_id):
+        row_id, name = row.id, row.command.split("\t")[0]
+        if commands.conclude(
+            db, row, "failed",
+            last_error=f"revocation cancelled by {by} before the device collected it",
+        ):
+            cancelled.append(row_id)
+            log.warning(
+                "revocation command %s (%s) for %s on %s CANCELLED by %s — "
+                "this person keeps their access to that door",
+                row_id, name, user_id, device_sn, by,
+            )
+    return cancelled

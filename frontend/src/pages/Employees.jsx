@@ -20,6 +20,34 @@ const COMMAND_STATE = {
   sent: 'Delivered — waiting for the device to confirm',
 }
 
+// A revocation, as opposed to a push. Everywhere else in this app a queued
+// command means "not there yet"; here it means "still able to open that
+// door", so it is pulled out of the ordinary queue list and shown separately
+// and louder. Matching the wire text is deliberate — it is the same string
+// the server queued, not a status this page could get out of step with.
+const isRevocationCommand = (command) =>
+  /^DATA DELETE (user|userauthorize)\s+Pin=/i.test(String(command || ''))
+
+// The user record specifically. `\s+` after "user" is what keeps this from
+// also matching "userauthorize" — the same distinction the server draws, and
+// for the same reason: only this one, outstanding, means the person can still
+// be recognised at the door.
+const isUserDeleteCommand = (command) =>
+  /^DATA DELETE user\s+Pin=/i.test(String(command || ''))
+
+// How long something has been outstanding, in words an operator can act on.
+function since(iso) {
+  if (!iso) return ''
+  // Timestamps come back naive-UTC from the API; anchor them before diffing,
+  // or a UTC+4 browser reads a fresh command as four hours old.
+  const stamp = /(Z|[+-]\d\d:?\d\d)$/.test(iso) ? iso : `${iso}Z`
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(stamp).getTime()) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
+  return `${Math.floor(seconds / 86400)}d`
+}
+
 // A terminal may enrol somebody with no name at all — every record in the
 // BioFace A1 capture arrived as `name=`. The ingest stores that as an empty
 // string rather than inventing a plausible-looking name, so the PIN is what
@@ -91,14 +119,23 @@ function Section({ title, action, children }) {
 }
 
 function Toast({ message, type, onDismiss }) {
+  // A `warn` toast is a successful request reporting an unwelcome truth — the
+  // revocation was accepted but the door has not been told. It stays up
+  // noticeably longer than a routine confirmation, and it is not red, because
+  // red here would read as "the request failed" when it did not.
+  const linger = type === 'warn' ? 9000 : 3500
   useEffect(() => {
-    const t = setTimeout(onDismiss, 3500)
+    const t = setTimeout(onDismiss, linger)
     return () => clearTimeout(t)
-  }, [onDismiss])
+  }, [onDismiss, linger])
   return (
     <div
-      className={`fixed bottom-6 right-6 px-4 py-3 rounded-lg shadow-lg text-sm font-medium text-white z-50 ${
-        type === 'error' ? 'bg-red-600' : 'bg-gray-900'
+      className={`fixed bottom-6 right-6 max-w-md px-4 py-3 rounded-lg shadow-lg text-sm font-medium text-white z-50 ${
+        type === 'error'
+          ? 'bg-red-600'
+          : type === 'warn'
+          ? 'bg-amber-600'
+          : 'bg-gray-900'
       }`}
     >
       {message}
@@ -324,7 +361,36 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     )
   }
 
+  // The outbox split in two, because the two halves mean opposite things. A
+  // queued push is somebody not on a door yet; a queued delete is somebody
+  // still on a door they should be off. Only the second is a hazard, so only
+  // the second gets the loud treatment.
+  const revocations = queued.filter((r) => isRevocationCommand(r.command))
+  const pushesQueued = queued.filter((r) => !isRevocationCommand(r.command))
+  // Which doors this person is being revoked from but has not been yet — used
+  // to change what the Enrolled Devices row offers, so "Remove" cannot be
+  // clicked twice and read as though the first one landed.
+  const revokingSns = new Set(revocations.map((r) => r.device_sn))
+
   const enrolledSns = new Set((enrolledDevices || []).map((d) => d.device_sn))
+  // Doors where this person may still get in despite a revocation being on
+  // the books. TWO conditions, and the second one is load-bearing:
+  //
+  //   * a user-record delete is still queued, or
+  //   * the terminal still holds them — `device_employees`, which is dropped
+  //     ONLY on a real acknowledgement.
+  //
+  // Without the second condition, "no user delete outstanding" would be read
+  // as "the delete succeeded", which is false when the device REFUSED it: the
+  // command leaves the outbox either way. Getting that wrong put a reassuring
+  // "the terminal has confirmed this person's removal" directly above a red
+  // "ACCESS NOT REVOKED" during this unit's browser check. Absence of a
+  // pending command is not evidence of success; the link is.
+  const blockingSns = new Set(
+    revocations
+      .filter((r) => isUserDeleteCommand(r.command) || enrolledSns.has(r.device_sn))
+      .map((r) => r.device_sn)
+  )
   const unenrolledDevices = allDevices.filter((d) => !enrolledSns.has(d.serial_number))
   // An access-control terminal is provisioned over the command queue, so the
   // button must not promise something synchronous.
@@ -364,11 +430,37 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     }
   }
 
+  // Removing somebody from a door is the one action in this panel whose
+  // queued state is dangerous rather than merely incomplete, so it is the one
+  // place the toast is not allowed to round "queued" up to "done".
   async function handleRemoveFromDevice(sn) {
     setBusyDevice((b) => ({ ...b, [sn]: 'removing' }))
     try {
-      await api.devices.removeUser(sn, employee.user_id)
-      showToast(`Removed from ${sn}`)
+      const res = await api.devices.removeUser(sn, employee.user_id)
+      if (res?.status === 'queued') {
+        showToast(
+          res.message ||
+            `Revocation queued for ${sn} — NOT yet confirmed at the door`,
+          'warn'
+        )
+      } else if (res?.status === 'withdrawn') {
+        showToast(res.message || `Undelivered push to ${sn} withdrawn`)
+      } else {
+        showToast(`Removed from ${sn} — the device confirmed it`)
+      }
+      reload()
+    } catch (err) {
+      showToast(err.message, 'error')
+    } finally {
+      setBusyDevice((b) => ({ ...b, [sn]: null }))
+    }
+  }
+
+  async function handleCancelRevocation(sn) {
+    setBusyDevice((b) => ({ ...b, [sn]: 'cancelling' }))
+    try {
+      const res = await api.devices.cancelRevocation(sn, employee.user_id)
+      showToast(res?.message || `Revocation for ${sn} cancelled`)
       reload()
     } catch (err) {
       showToast(err.message, 'error')
@@ -433,10 +525,24 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   }
 
   async function handleDeleteTemplate(fingerId) {
-    // Need a device the user is enrolled on to run the SDK delete
-    const sn = enrolledDevices?.[0]?.device_sn
+    // Needs a device the user is enrolled on to run the SDK delete — and
+    // specifically an *attendance* one. The PUSH protocol has no confirmed
+    // command for deleting a single biometric on an access-control terminal
+    // (the vendor's own SDK command set has none at all), so the server
+    // refuses that with a 501 rather than guessing at a shape. Said here too,
+    // so the operator is told what to do instead of watching a request fail.
+    const sn = (enrolledDevices || [])
+      .map((d) => allDevices.find((x) => x.serial_number === d.device_sn))
+      .find((d) => d && (d.protocol || 'att') !== 'acc')?.serial_number
     if (!sn) {
-      showToast('Employee must be enrolled on at least one device to delete a template', 'error')
+      showToast(
+        (enrolledDevices || []).length
+          ? 'This person is only on access-control terminals, which have no ' +
+            'command for deleting one biometric. Remove them from the door ' +
+            'instead — that is what removes their templates.'
+          : 'Employee must be enrolled on at least one device to delete a template',
+        'error'
+      )
       return
     }
     setBusyTemplate((b) => ({ ...b, [fingerId]: true }))
@@ -492,17 +598,126 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
         </div>
       </Section>
 
+      {/* Revoked in the system, not yet at the door.
+
+          This is the section this whole unit exists for, and it is separate
+          from "Queued for delivery" below on purpose. Everywhere else a
+          queued command means somebody cannot get in *yet* — harmless, and
+          the queue's patience with an offline terminal is the feature that
+          recovered a weekend of missed punches. A queued revocation is the
+          opposite: it means somebody who should have lost access still has
+          it, at a physical door, and the door says nothing. So it is pulled
+          out, coloured as the hazard it is, timed, and it says plainly that
+          the person can still get in. */}
+      {revocations.length > 0 && (
+        <Section
+          title={
+            blockingSns.size > 0
+              ? 'Revoked in the system — not yet confirmed at the door'
+              : 'Revoked — finishing up at the door'
+          }
+        >
+          <div
+            className={`border-2 rounded-lg p-3 ${
+              blockingSns.size > 0
+                ? 'border-red-300 bg-red-50'
+                : 'border-amber-200 bg-amber-50'
+            }`}
+          >
+            <p
+              className={`text-xs font-semibold mb-2 ${
+                blockingSns.size > 0 ? 'text-red-800' : 'text-amber-800'
+              }`}
+            >
+              {blockingSns.size > 0 ? (
+                <>
+                  This person can still open the door
+                  {blockingSns.size > 1 ? 's' : ''} below. The removal has been
+                  queued but the terminal has not collected and confirmed it yet
+                  — if it is offline, it will not until it comes back.
+                </>
+              ) : (
+                <>
+                  The terminal has confirmed this person's removal, so they can
+                  no longer be recognised there. What is left below is the
+                  separate door-permission record being cleared as well.
+                </>
+              )}
+            </p>
+            <div className="space-y-2">
+              {revocations.map((row) => {
+                const deviceName =
+                  allDevices.find((x) => x.serial_number === row.device_sn)?.name
+                const busy = busyDevice[row.device_sn]
+                // Only an outstanding user-record delete means access is still
+                // live at that door.
+                const stillOpen = blockingSns.has(row.device_sn)
+                return (
+                  <div key={row.id} className="bg-white rounded-lg px-3 py-2.5 text-sm">
+                    <div className="flex items-center gap-2">
+                      <p className="text-gray-900 font-semibold flex-1 min-w-0 truncate">
+                        {deviceName || row.device_sn}
+                      </p>
+                      <span
+                        className={`text-xs px-1.5 py-0.5 rounded-full font-semibold whitespace-nowrap ${
+                          stillOpen
+                            ? 'bg-red-600 text-white'
+                            : 'bg-amber-100 text-amber-800'
+                        }`}
+                      >
+                        {stillOpen ? 'Still open' : 'Clearing permission'}
+                      </span>
+                    </div>
+                    <p
+                      className={`text-xs mt-1 ${
+                        stillOpen ? 'text-red-700' : 'text-amber-800'
+                      }`}
+                    >
+                      {row.status === 'sent'
+                        ? 'Handed to the device — waiting for it to confirm the removal'
+                        : 'Waiting for the device to poll. Nothing has reached it yet.'}
+                      {' · outstanding '}
+                      {since(row.created_at)}
+                      {row.attempts > 0 && ` · attempt ${row.attempts}`}
+                    </p>
+                    <p className="text-xs text-gray-400 font-mono mt-1 truncate">
+                      {row.command}
+                    </p>
+                    {/* Only offered while the revocation could still be called
+                        off. Once the terminal has confirmed the user delete
+                        the person is already gone, and "let them keep this
+                        door" would be an offer this button cannot honour —
+                        putting them back is a fresh push, not a cancel. */}
+                    {isAdmin && stillOpen && (
+                      <button
+                        onClick={() => handleCancelRevocation(row.device_sn)}
+                        disabled={!!busy}
+                        className="mt-2 text-xs text-gray-600 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-40 transition-colors"
+                      >
+                        {busy === 'cancelling'
+                          ? 'Cancelling…'
+                          : 'Cancel revocation — let them keep this door'}
+                      </button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </Section>
+      )}
+
       {/* Queued, not delivered. An access-control terminal is never dialled:
           it collects its commands on its own schedule, so this section is the
           honest state between "pushed" and "on the device". */}
-      {queued.length > 0 && (
+      {pushesQueued.length > 0 && (
         <Section title="Queued for delivery">
           <p className="text-xs text-gray-400 mb-2">
             Not on the device yet. Each terminal collects one command per poll
             (about every 10 seconds) and confirms it afterwards.
           </p>
           <div className="space-y-2">
-            {queued.map((row) => {
+            {pushesQueued.map((row) => {
               const deviceName =
                 allDevices.find((x) => x.serial_number === row.device_sn)?.name
               return (
@@ -541,18 +756,42 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                 allDevices.find((x) => x.serial_number === row.device_sn)?.name
               const isDoorPermission = row.command.startsWith('DATA UPDATE userauthorize')
               const isBiometric = row.command.startsWith('DATA UPDATE BIODATA')
+              const isUserDelete = /^DATA DELETE user\s+Pin=/i.test(row.command)
+              const isAuthorizeDelete = row.command.startsWith('DATA DELETE userauthorize')
               // No return code means nobody refused it: the server gave up on
               // it, or withdrew it because what it depended on failed. Saying
               // "the device refused this" would point the operator at the
               // wrong end of the wire.
               const withdrawn = row.return_code == null
+              // A revocation that did not land is the most serious thing this
+              // panel can show, and it is worth shouting about: the operator
+              // asked for somebody's access to be taken away, and it was not.
+              // Cancelled-on-purpose is not that, so it is told apart by the
+              // reason the server recorded rather than lumped in.
+              const cancelled = /cancelled by /.test(row.last_error || '')
+              const failedRevocation = isUserDelete && !cancelled
               return (
-                <div key={row.id} className="bg-red-50 rounded-lg px-3 py-2.5 text-sm">
+                <div
+                  key={row.id}
+                  className={`rounded-lg px-3 py-2.5 text-sm ${
+                    failedRevocation ? 'bg-red-100 border-2 border-red-400' : 'bg-red-50'
+                  }`}
+                >
                   <p className="text-gray-800 font-medium truncate">
                     {deviceName || row.device_sn}
                   </p>
                   <p className="text-xs text-red-700 mt-1">
-                    {withdrawn
+                    {failedRevocation
+                      ? 'ACCESS NOT REVOKED. This terminal never confirmed the ' +
+                        'removal, so this person may still be able to open this ' +
+                        'door. Check the device directly. ' +
+                        (row.last_error || '')
+                      : isAuthorizeDelete && !cancelled
+                      ? 'The terminal did not remove the door permission record. ' +
+                        'Harmless if the user record itself was removed above — ' +
+                        'the person is gone either way — but worth checking if ' +
+                        'it was not.'
+                      : withdrawn
                       ? row.last_error ||
                         'Never delivered — the server gave up on this command.'
                       : isDoorPermission
@@ -585,16 +824,30 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                 {enrolledDevices.map((d) => {
                   const busy = busyDevice[d.device_sn]
                   const deviceName = allDevices.find((x) => x.serial_number === d.device_sn)?.name
+                  // Still listed as enrolled, because the terminal has not
+                  // confirmed otherwise — that is exactly what this row means
+                  // and it must keep meaning it. What changes is that the row
+                  // says a revocation is in flight, so nobody reads a stale
+                  // "enrolled" as "the Remove click did nothing".
+                  const revoking = revokingSns.has(d.device_sn)
                   return (
                     <div
                       key={d.device_sn}
-                      className="bg-gray-50 rounded-lg px-3 py-2.5 flex items-center gap-2 text-sm"
+                      className={`rounded-lg px-3 py-2.5 flex items-center gap-2 text-sm ${
+                        revoking ? 'bg-red-50 border border-red-200' : 'bg-gray-50'
+                      }`}
                     >
                       <div className="flex-1 min-w-0">
                         <p className="text-gray-800 font-medium truncate">{deviceName || d.device_sn}</p>
-                        <p className="text-xs text-gray-400 font-mono">UID {d.uid}</p>
+                        {revoking ? (
+                          <p className="text-xs text-red-700 font-medium">
+                            Removal queued — still open at this door
+                          </p>
+                        ) : (
+                          <p className="text-xs text-gray-400 font-mono">UID {d.uid}</p>
+                        )}
                       </div>
-                      {templates && templates.length > 0 && (
+                      {templates && templates.length > 0 && !revoking && (
                         <button
                           onClick={() => handlePushTemplates(d.device_sn)}
                           disabled={!!busy}
@@ -603,13 +856,19 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                           {busy === 'templates' ? 'Pushing…' : 'Push Templates'}
                         </button>
                       )}
-                      <button
-                        onClick={() => handleRemoveFromDevice(d.device_sn)}
-                        disabled={!!busy}
-                        className="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-40 transition-colors"
-                      >
-                        {busy === 'removing' ? 'Removing…' : 'Remove'}
-                      </button>
+                      {revoking ? (
+                        <span className="text-xs text-red-600 font-semibold px-2 py-1 whitespace-nowrap">
+                          Revoking…
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => handleRemoveFromDevice(d.device_sn)}
+                          disabled={!!busy}
+                          className="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-40 transition-colors"
+                        >
+                          {busy === 'removing' ? 'Removing…' : 'Remove'}
+                        </button>
+                      )}
                     </div>
                   )
                 })}

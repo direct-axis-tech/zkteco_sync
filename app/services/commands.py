@@ -79,14 +79,39 @@ def wire_line(row: DeviceCommandOutbox) -> str:
     return f"C:{row.id}:{row.command}"
 
 
-def backoff_for(attempts: int) -> timedelta:
+# A command that takes access away rather than granting it (E8). Matched on
+# the wire text rather than a column so no schema change is needed and so a
+# command queued by hand through POST /devices/{sn}/commands gets the same
+# treatment as one this application built.
+_REVOCATION = re.compile(r"^DATA DELETE\b", re.IGNORECASE)
+
+
+def is_revocation(command: str) -> bool:
+    """True for `DATA DELETE …` — the commands that take access away.
+
+    Used for two things and nothing else: a shorter retry schedule, and a
+    louder log line when one is given up on. Both exist because while a
+    revocation is outstanding the person it names can still open the door.
+    """
+    return bool(_REVOCATION.match((command or "").strip()))
+
+
+def backoff_for(attempts: int, command: str = None) -> timedelta:
     """How long to wait after ``attempts`` deliveries before offering again.
 
     The schedule is a list, one entry per attempt, and the final entry repeats
     once attempts outrun it — so the wait is bounded however the two settings
     are combined.
+
+    A revocation gets its own, much shorter schedule
+    (config.REVOCATION_BACKOFF_SECONDS): every other command in this system
+    can afford to wait, and a delete cannot, because the wait is time during
+    which somebody who should have lost access still has it.
     """
-    schedule = config.COMMAND_BACKOFF_SECONDS
+    schedule = (
+        config.REVOCATION_BACKOFF_SECONDS if is_revocation(command)
+        else config.COMMAND_BACKOFF_SECONDS
+    )
     index = min(max(attempts, 1), len(schedule)) - 1
     return timedelta(seconds=schedule[index])
 
@@ -169,6 +194,18 @@ def conclude(
         **snapshot,
     ))
     db.commit()
+
+    # A revocation that did not land is not an ordinary failed command: the
+    # operator asked for somebody's access to be taken away and it was not.
+    # Said at ERROR, naming the door and the person's Pin, because this is the
+    # line somebody reads at 2am asking "can they still get in".
+    if outcome == "failed" and is_revocation(snapshot["command"]):
+        log.error(
+            "ACCESS NOT REVOKED: %s never confirmed %r (%s). That person may "
+            "still be able to open this door — check the terminal directly.",
+            snapshot["device_sn"], snapshot["command"][:120],
+            f"Return={return_code}" if return_code is not None else (last_error or "no acknowledgement"),
+        )
     return True
 
 
@@ -239,7 +276,7 @@ def next_commands(db: Session, device_sn: str, limit: int = None, now: datetime 
         row.attempts += 1
         row.status = "sent"
         row.sent_at = now
-        row.next_attempt_at = now + backoff_for(row.attempts)
+        row.next_attempt_at = now + backoff_for(row.attempts, row.command)
         lines.append(wire_line(row))
 
     db.commit()

@@ -148,7 +148,15 @@ export const api = {
     listUsers: (sn) => request('GET', `/devices/${sn}/users`),
     pushBulk: (sn, user_ids) => request('POST', `/devices/${sn}/users/push_bulk`, { user_ids }),
     pushUser: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/push`),
+    // Takes a person off a device. On an `acc` terminal this QUEUES the
+    // removal and answers 202 `status: "queued"` — the door has not been told
+    // yet and the person can still open it until it acknowledges. Callers
+    // must read `status` and must not report a queued revocation as done.
     removeUser: (sn, userId) => request('DELETE', `/devices/${sn}/users/${userId}`),
+    // Calls off a revocation the device has not collected yet. The escape
+    // hatch for the 409 that a push gets while a delete is outstanding.
+    cancelRevocation: (sn, userId) =>
+      request('DELETE', `/devices/${sn}/users/${userId}/revocation`),
     pushTemplates: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/templates/push`),
     enrollUser: (sn, userId, fingerId) =>
       request('POST', `/devices/${sn}/users/${userId}/enroll`, { finger_id: fingerId }),

@@ -5104,3 +5104,841 @@ class EmployeePhotoEndpointTests(ProvisioningTestCase):
         # The list response as a whole must stay small — nowhere near the
         # ~140,000-character base64 payload a single photo carries.
         self.assertLess(len(response.content), 2000)
+
+
+# ---------------------------------------------------------------------------
+# 24. Revocation: taking a person off a door (E8)
+# ---------------------------------------------------------------------------
+#
+# The half of provisioning where being slow is dangerous rather than merely
+# incomplete. E3/E4 could put somebody on the operator's BioFace A1; before
+# this unit nothing could take them off it, because both delete endpoints
+# dialled TCP 4370 unconditionally and an `acc` terminal behind NAT answered
+# 503.
+#
+# The assertions that matter here are not about status codes. They are:
+#
+#   * the exact bytes queued, because they are a command to physical door
+#     hardware and §3.8 gives a literal example for exactly one of them;
+#   * that the local "this person is on this door" record survives until the
+#     terminal acknowledges, because removing it earlier would make a screen
+#     claim a revocation nobody performed;
+#   * that a revocation nobody collected stays visibly outstanding, because a
+#     revocation that quietly looks finished is the worst outcome available.
+
+class RevocationTestCase(TemplatePushTestCase):
+    """Two acc terminals, one att terminal, one employee (9001)."""
+
+    def revoke(self, sn, user_id="9001"):
+        return self.client.delete(f"/devices/{sn}/users/{user_id}")
+
+    def cancel(self, sn, user_id="9001"):
+        return self.client.delete(f"/devices/{sn}/users/{user_id}/revocation")
+
+    def commands_on(self, sn):
+        return [row.command for row in self.outbox(sn)]
+
+
+class SdkRevocation(FakeConnection):
+    """FakeConnection plus a record of what was deleted over the SDK."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.deleted = []
+
+    def delete_user(self, uid=None, user_id=None):
+        self.deleted.append({"uid": uid, "user_id": user_id})
+
+
+class RevocationCommandShapeTests(unittest.TestCase):
+    """The literal bytes, against the protocol reference.
+
+    §3.8 gives ONE verbatim delete example::
+
+        C:296:DATA DELETE user Pin=1
+
+    That is the whole documented authority for this unit's wire format, and it
+    is reproduced here exactly rather than paraphrased. The `userauthorize`
+    delete is DERIVED from the documented generic form `DATA DELETE <table> …`
+    plus the confirmed table name and key field; the test says so, so a reader
+    is never left thinking both shapes carry the same evidence.
+    """
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def test_the_user_delete_is_exactly_the_documented_shape(self):
+        self.assertEqual(
+            self.provisioning.user_delete_command("1"),
+            "DATA DELETE user Pin=1",
+        )
+
+    def test_the_user_delete_matches_the_specs_own_worked_example(self):
+        """§3.8, verbatim: `C:296:DATA DELETE user Pin=1`. The `C:<id>:`
+        envelope is added at dispatch by commands.wire_line, so the body this
+        module builds is the remainder of that line, character for character."""
+        spec_line = "C:296:DATA DELETE user Pin=1"
+        body = spec_line.split(":", 2)[2]
+        self.assertEqual(self.provisioning.user_delete_command("1"), body)
+
+    def test_the_user_delete_carries_no_tabs(self):
+        """One field. A TAB here would invent a second field the device would
+        try to read as a filter."""
+        self.assertNotIn("\t", self.provisioning.user_delete_command("9001"))
+
+    def test_the_authorize_delete_is_the_derived_shape(self):
+        """DERIVED, not quoted — see authorize_delete_command's docstring."""
+        self.assertEqual(
+            self.provisioning.authorize_delete_command("9001"),
+            "DATA DELETE userauthorize Pin=9001",
+        )
+
+    def test_the_user_record_is_deleted_first(self):
+        """Order is the argument in revoke_commands_for: a terminal that
+        collects exactly one command and then dies should have collected the
+        one that definitely revokes."""
+        self.assertEqual(
+            self.provisioning.revoke_commands_for("9001"),
+            ["DATA DELETE user Pin=9001",
+             "DATA DELETE userauthorize Pin=9001"],
+        )
+
+    def test_no_biometric_delete_is_invented_anywhere(self):
+        """The finding this unit was asked to establish rather than guess.
+
+        §3.8 reproduces ZKTeco's own access-control SDK command constants and
+        they contain no biometric delete at all — only `DATA DELETE user`. So
+        nothing in this application may build one. If a later change adds a
+        `DATA DELETE biodata`/`facev7`/`templatev10`/`biophoto`, this fails,
+        and whoever added it has to justify the shape against real evidence
+        first."""
+        import inspect as _inspect
+        from app.routers import devices as devices_router
+
+        for module in (self.provisioning, devices_router):
+            source = _inspect.getsource(module).upper()
+            for table in ("BIODATA", "BIOPHOTO", "TEMPLATEV10", "FACEV7"):
+                self.assertNotIn(
+                    f"DATA DELETE {table}", source,
+                    f"{module.__name__} builds a {table} delete, which no "
+                    f"source confirms exists",
+                )
+
+    def test_a_pin_with_wire_breaking_characters_cannot_break_the_framing(self):
+        self.assertEqual(
+            self.provisioning.user_delete_command("90\t01"),
+            "DATA DELETE user Pin=90 01",
+        )
+
+    def test_the_user_delete_parser_does_not_match_the_authorize_delete(self):
+        """The parser that drops the `device_employees` link keys on the user
+        delete only. An acknowledged permission delete is not evidence that
+        the person is off the terminal — if it were treated as such, a
+        cascade-less device would have its link dropped while the person was
+        still enrolled."""
+        self.assertEqual(
+            self.provisioning.pin_from_revocation_command("DATA DELETE user Pin=9001"),
+            "9001",
+        )
+        self.assertIsNone(
+            self.provisioning.pin_from_revocation_command(
+                "DATA DELETE userauthorize Pin=9001"
+            )
+        )
+        self.assertIsNone(
+            self.provisioning.pin_from_revocation_command("DATA UPDATE user Pin=9001")
+        )
+
+
+class RevocationTransportRoutingTests(RevocationTestCase):
+    """acc queues, att dials. Never both — the E3 rule, applied to deletes."""
+
+    def test_an_acc_revocation_queues_the_exact_command_and_never_opens_a_socket(self):
+        from unittest import mock
+
+        self.link(self.SN)
+        conn = SdkRevocation()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.revoke(self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["status"], "queued")
+
+        # Byte-exact, in order, and nothing else.
+        self.assertEqual(
+            self.commands_on(self.SN),
+            ["DATA DELETE user Pin=9001",
+             "DATA DELETE userauthorize Pin=9001"],
+        )
+        # The SDK was never touched.
+        self.assertEqual(conn.deleted, [])
+        self.assertEqual(conn.written, [])
+
+    def test_the_queued_bytes_are_what_the_device_is_actually_handed(self):
+        """Not the outbox column — the reply body of a real getrequest, which
+        is the only thing the terminal ever sees."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        first = self.poll()
+        self.assertEqual(first, "C:1:DATA DELETE user Pin=9001")
+        self.assertEqual(first.encode(), b"C:1:DATA DELETE user Pin=9001")
+
+        second = self.poll()
+        self.assertEqual(second, "C:2:DATA DELETE userauthorize Pin=9001")
+
+    def test_an_att_revocation_uses_the_sdk_and_leaves_the_outbox_empty(self):
+        from unittest import mock
+
+        self.link(self.ATT_SN)
+        conn = SdkRevocation()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.revoke(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["transport"], "sdk")
+        self.assertEqual(response.json()["status"], "removed")
+        self.assertEqual(conn.deleted, [{"uid": 0, "user_id": "9001"}])
+        # Nothing queued anywhere — not on this device and not on any other.
+        self.assertEqual(self.outbox(), [])
+        # The SDK path IS synchronous, so the link goes now.
+        self.assertEqual(self.links(self.ATT_SN), [])
+
+    def test_an_unclassified_device_takes_the_sdk_path(self):
+        """Same safe default as every other write: anything not explicitly
+        `acc` fails loudly on TCP rather than sitting in a queue looking
+        healthy."""
+        from unittest import mock
+
+        self.link(self.DEFAULT_SN)
+        conn = SdkRevocation()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.revoke(self.DEFAULT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+        self.assertEqual(len(conn.deleted), 1)
+
+    def test_an_unreachable_att_device_still_reports_503_and_keeps_the_link(self):
+        from unittest import mock
+        from contextlib import contextmanager
+        from zk.exception import ZKNetworkError
+
+        self.link(self.ATT_SN)
+
+        @contextmanager
+        def _refuse(device):
+            raise ZKNetworkError("unreachable")
+            yield  # pragma: no cover
+
+        with mock.patch("app.routers.devices.device_connection", _refuse):
+            response = self.revoke(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 503)
+        # Nothing was removed, so nothing may claim it was.
+        self.assertEqual(len(self.links(self.ATT_SN)), 1)
+
+
+class RevocationLinkOnAckTests(RevocationTestCase):
+    """E3's rule in reverse: the link goes when the DEVICE says so."""
+
+    def test_the_link_survives_queueing_and_delivery_and_goes_only_on_ack(self):
+        self.link(self.SN)
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+        self.revoke(self.SN)
+        # Queued: the terminal has not been told anything yet.
+        self.assertEqual(len(self.links(self.SN)), 1,
+                         "the link was dropped at queue time — that claims a "
+                         "revocation the device has not performed")
+
+        self.poll()
+        # Delivered, but not confirmed. Still not a fact.
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+        self.assertEqual(self.links(self.SN), [])
+
+    def test_only_the_user_delete_drops_the_link(self):
+        """Acknowledging the permission delete first must not be read as the
+        person being gone."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.poll()
+
+        self.ack(2, return_code=0, cmd="DATA DELETE")   # userauthorize
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+        self.ack(1, return_code=0, cmd="DATA DELETE")   # user
+        self.assertEqual(self.links(self.SN), [])
+
+    def test_revoking_from_one_door_does_not_touch_another(self):
+        self.link(self.SN)
+        self.link(self.OTHER_SN)
+
+        self.revoke(self.SN)
+        self.poll(self.SN)
+        self.ack(1, return_code=0, cmd="DATA DELETE", sn=self.SN)
+
+        self.assertEqual(self.links(self.SN), [])
+        self.assertEqual(len(self.links(self.OTHER_SN)), 1)
+        self.assertEqual(self.outbox(self.OTHER_SN), [])
+
+    def test_the_employee_row_itself_survives_a_revocation(self):
+        """Removing somebody from a door is not deleting the person: their
+        attendance history and their central record stay."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+
+        self.assertIsNotNone(self.employee("9001"))
+
+
+class RefusedRevocationTests(RevocationTestCase):
+    """A device saying no is not the same as a device saying yes."""
+
+    def test_a_refused_delete_keeps_the_link_and_is_recorded_as_failed(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+
+        self.ack(1, return_code=-14, cmd="DATA DELETE")
+
+        # The person is STILL on that terminal as far as anything can tell.
+        self.assertEqual(len(self.links(self.SN)), 1,
+                         "a refused delete dropped the link — that is a "
+                         "revocation claimed and not performed")
+
+        concluded = [r for r in self.history(self.SN)
+                     if r.command == "DATA DELETE user Pin=9001"]
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "failed")
+        self.assertEqual(concluded[0].return_code, -14)
+
+    def test_a_refused_delete_is_not_retried(self):
+        """E7's rule: a refusal is permanent. Re-offering it earns the same
+        answer while occupying a queue that has a revocation in it."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=-14, cmd="DATA DELETE")
+
+        self.assertNotIn("DATA DELETE user Pin=9001", self.poll())
+
+    def test_a_refused_delete_reaches_the_operators_view(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=-14, cmd="DATA DELETE")
+
+        history = self.client.get(f"/devices/{self.SN}/commands/history").json()
+        failed = [r for r in history
+                  if r["command"] == "DATA DELETE user Pin=9001"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["outcome"], "failed")
+        self.assertEqual(failed[0]["return_code"], -14)
+
+    def test_a_refused_delete_is_logged_at_error_naming_the_door(self):
+        """The 2am log line. `failed` alone is not loud enough for a command
+        whose failure means somebody can still open a door."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+
+        with self.assertLogs("app.services.commands", level="ERROR") as logs:
+            self.ack(1, return_code=-14, cmd="DATA DELETE")
+
+        joined = "\n".join(logs.output)
+        self.assertIn("ACCESS NOT REVOKED", joined)
+        self.assertIn(self.SN, joined)
+
+    def test_an_empty_outbox_is_not_evidence_that_a_removal_happened(self):
+        """The invariant a UI bug found during this unit's browser check.
+
+        A refused delete leaves the outbox exactly as empty as a successful
+        one does — `conclude` moves the row out either way. So "no delete is
+        queued for this door" says nothing at all about whether the person is
+        off it, and anything that infers success from that absence is wrong.
+        The `device_employees` link is the evidence, and it is still here.
+
+        Pinned as data rather than as UI, because the panel reasons off these
+        two endpoints and this is the shape it must keep seeing."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=-14, cmd="DATA DELETE")
+
+        outstanding = [r.command for r in self.outbox(self.SN)]
+        self.assertNotIn("DATA DELETE user Pin=9001", outstanding,
+                         "a refusal must not leave the command outstanding")
+
+        enrolled = self.client.get("/employees/9001/devices").json()
+        self.assertEqual([d["device_sn"] for d in enrolled], [self.SN],
+                         "the link is the only evidence of presence and it "
+                         "must survive a refused delete")
+
+    def test_an_ack_with_no_return_code_leaves_the_revocation_outstanding(self):
+        """Absence of a Return is the device saying nothing, and must not be
+        read as success — that would drop the link on no evidence at all."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+
+        self.client.post(f"/iclock/devicecmd?SN={self.SN}",
+                         content=f"ID=1&CMD=DATA DELETE&SN={self.SN}")
+
+        self.assertEqual(len(self.links(self.SN)), 1)
+        self.assertEqual(len(self.outbox(self.SN)), 2)
+
+
+class OfflineRevocationStaysVisibleTests(RevocationTestCase):
+    """The point of the whole unit: waiting is not the same as done."""
+
+    def test_a_device_that_never_polls_leaves_the_revocation_outstanding(self):
+        self.link(self.SN)
+        response = self.revoke(self.SN)
+
+        # 202, not 204 and not 200. The word in the body is "queued".
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "queued")
+
+        # Nothing has been attempted, because the device has not come back.
+        rows = self.outbox(self.SN)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r.status == "pending" for r in rows))
+        self.assertTrue(all(r.attempts == 0 for r in rows))
+
+        # And the person is still recorded as being on that door, which is
+        # the truth.
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+    def test_the_response_says_not_yet_confirmed_at_the_door(self):
+        """The operator reads this string. It is not allowed to imply the
+        removal happened."""
+        self.link(self.SN)
+        message = self.revoke(self.SN).json()["message"]
+
+        self.assertIn("NOT yet confirmed at the door", message)
+        self.assertIn("can still", message)
+        self.assertNotIn("Removed from", message)
+
+    def test_an_uncollected_revocation_is_visible_on_the_device_shape(self):
+        """Surfaced on the DEVICE as well as the person, so an operator
+        scanning the device list sees it without opening every employee."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        listing = self.client.get("/devices").json()
+        by_sn = {d["serial_number"]: d for d in listing}
+        # One person, not two commands: this counts people, not queue rows.
+        self.assertEqual(by_sn[self.SN]["pending_revocations"], 1)
+        self.assertEqual(by_sn[self.OTHER_SN]["pending_revocations"], 0)
+
+        single = self.client.get(f"/devices/{self.SN}").json()
+        self.assertEqual(single["pending_revocations"], 1)
+
+    def test_the_count_clears_only_when_the_device_confirms(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+
+        still = self.client.get(f"/devices/{self.SN}").json()
+        self.assertEqual(still["pending_revocations"], 1,
+                         "delivered is not confirmed")
+
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+        done = self.client.get(f"/devices/{self.SN}").json()
+        self.assertEqual(done["pending_revocations"], 0)
+
+    def test_a_sweep_does_not_age_out_a_revocation_for_an_offline_device(self):
+        """Offline is not failure, even here. What changes for a revocation is
+        how loudly it is shown and how fast it is retried once the device IS
+        polling — not that it is given up on while unreachable."""
+        from app.services import commands as commands_service
+
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        db = self.Session()
+        try:
+            for _ in range(30):
+                commands_service.sweep(
+                    db, now=datetime.now(timezone.utc) + timedelta(days=1)
+                )
+        finally:
+            db.close()
+
+        rows = self.outbox(self.SN)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r.attempts == 0 for r in rows))
+
+
+class RevocationBackoffTests(unittest.TestCase):
+    """A revocation is retried faster than anything else, and why.
+
+    Every other command in this system can afford to wait out a 15-minute
+    backoff. A delete cannot: the wait is time during which somebody who
+    should have lost access still has it. Safe to be aggressive because a
+    delete is idempotent in exactly the way E7 relies on for DATA UPDATE.
+    """
+
+    def test_a_revocation_uses_the_short_schedule(self):
+        from app.services import commands as commands_service
+
+        ordinary = commands_service.backoff_for(1, "DATA UPDATE user Pin=1")
+        revocation = commands_service.backoff_for(1, "DATA DELETE user Pin=1")
+
+        self.assertEqual(ordinary.total_seconds(), config.COMMAND_BACKOFF_SECONDS[0])
+        self.assertEqual(revocation.total_seconds(),
+                         config.REVOCATION_BACKOFF_SECONDS[0])
+        self.assertLess(revocation, ordinary)
+
+    def test_every_attempt_of_a_revocation_is_faster_than_the_ordinary_one(self):
+        from app.services import commands as commands_service
+
+        for attempts in range(1, 8):
+            self.assertLess(
+                commands_service.backoff_for(attempts, "DATA DELETE user Pin=1"),
+                commands_service.backoff_for(attempts, "DATA UPDATE user Pin=1"),
+                f"attempt {attempts}",
+            )
+
+    def test_an_unknown_or_missing_command_gets_the_ordinary_schedule(self):
+        from app.services import commands as commands_service
+
+        self.assertEqual(
+            commands_service.backoff_for(1, None),
+            commands_service.backoff_for(1),
+        )
+        self.assertEqual(
+            commands_service.backoff_for(1, "SET OPTIONS IPAddress=10.0.0.1"),
+            commands_service.backoff_for(1),
+        )
+
+    def test_the_short_schedule_is_bounded(self):
+        from app.services import commands as commands_service
+
+        last = commands_service.backoff_for(
+            len(config.REVOCATION_BACKOFF_SECONDS) + 50, "DATA DELETE user Pin=1")
+        self.assertEqual(last.total_seconds(), config.REVOCATION_BACKOFF_SECONDS[-1])
+
+
+class RevocationDispatchBackoffTests(RevocationTestCase):
+    """The short schedule as the dispatcher actually applies it."""
+
+    def test_the_outbox_row_carries_the_short_window(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+
+        row = [r for r in self.outbox(self.SN) if r.status == "sent"][0]
+        window = (row.next_attempt_at - row.sent_at).total_seconds()
+        self.assertAlmostEqual(window, config.REVOCATION_BACKOFF_SECONDS[0], delta=2)
+        self.assertLess(window, config.COMMAND_BACKOFF_SECONDS[0])
+
+    def test_a_delivered_but_unacked_revocation_is_offered_again(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.assertIn("DATA DELETE user Pin=9001", self.poll())
+
+        # Inside the window: not re-offered (the backoff is doing its job).
+        self.assertNotIn("DATA DELETE user Pin=9001", self.poll())
+
+        self.rewind_backoff(1)
+        self.assertIn("DATA DELETE user Pin=9001", self.poll())
+
+
+class RevocationWithdrawsPushesTests(RevocationTestCase):
+    """A queued delete and a queued push for the same pair contradict."""
+
+    def test_queueing_a_delete_withdraws_the_outstanding_pushes(self):
+        self.push(self.SN, "9001")
+        self.assertEqual(len(self.outbox(self.SN)), 2)   # user + userauthorize
+
+        response = self.revoke(self.SN)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "withdrawn")
+        self.assertEqual(len(response.json()["withdrawn_command_ids"]), 2)
+
+        # Nothing contradicting is left in the outbox.
+        self.assertEqual(self.outbox(self.SN), [])
+        # The withdrawal is recorded, not silently dropped.
+        concluded = self.history(self.SN)
+        self.assertEqual(len(concluded), 2)
+        self.assertTrue(all(r.outcome == "failed" for r in concluded))
+        self.assertTrue(all("withdrawn" in (r.last_error or "") for r in concluded))
+
+    def test_a_confirmed_person_with_a_queued_template_has_both_handled(self):
+        """The link is real, so this is a genuine revocation — and the
+        template still queued behind it is withdrawn to make room."""
+        self.link(self.SN)
+        self.add_template(source=self.OTHER_SN)
+        self.push_templates(self.SN)
+        self.assertEqual(len(self.outbox(self.SN)), 1)   # the BIODATA
+
+        response = self.revoke(self.SN)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(len(response.json()["withdrawn_command_ids"]), 1)
+        self.assertEqual(
+            self.commands_on(self.SN),
+            ["DATA DELETE user Pin=9001",
+             "DATA DELETE userauthorize Pin=9001"],
+        )
+
+    def test_withdrawal_is_confined_to_this_person_on_this_door(self):
+        self.create_employee("9002", name="Omar Said")
+        self.push(self.SN, "9002")        # another person, same door
+        self.push(self.OTHER_SN, "9001")  # same person, another door
+        self.link(self.SN)
+
+        self.revoke(self.SN, "9001")
+
+        # The other person's push on this door is untouched.
+        self.assertEqual(
+            [c for c in self.commands_on(self.SN) if "9002" in c],
+            ["DATA UPDATE user Pin=9002\tCardNo=0\tPassword=\tGroup=0\t"
+             "StartTime=0\tEndTime=0\tName=Omar Said\tPrivilege=0",
+             "DATA UPDATE userauthorize Pin=9002\tAuthorizeTimezoneId=1"],
+        )
+        # And the same person's push to the OTHER door is untouched.
+        self.assertEqual(len(self.outbox(self.OTHER_SN)), 2)
+        self.assertTrue(all(c.startswith("DATA UPDATE")
+                            for c in self.commands_on(self.OTHER_SN)))
+
+    def test_a_pin_prefix_is_not_mistaken_for_the_pin(self):
+        """9001 must not withdraw 19001's commands, or vice versa."""
+        self.create_employee("19001", name="Someone Else")
+        self.push(self.SN, "19001")
+        self.link(self.SN)
+
+        self.revoke(self.SN, "9001")
+
+        self.assertEqual(
+            len([c for c in self.commands_on(self.SN) if "Pin=19001" in c]), 2)
+
+    def test_revoking_someone_never_confirmed_withdraws_and_says_so(self):
+        """Not a 404. Calling off an undelivered push is exactly what "remove"
+        means at that moment, and 404ing would leave it in the outbox to be
+        delivered later — the opposite of what was asked."""
+        self.push(self.SN, "9001")
+        response = self.revoke(self.SN)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "withdrawn")
+        self.assertIn("never confirmed", body["message"])
+        self.assertIn("Nothing was sent to the device", body["message"])
+        # No delete is queued: there is nothing on the device to delete.
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_revoking_somebody_who_is_neither_on_nor_owed_is_404(self):
+        response = self.revoke(self.SN)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class PushDuringRevocationTests(RevocationTestCase):
+    """The other order of business — settled explicitly, not by FIFO."""
+
+    def test_a_push_is_refused_while_a_revocation_is_outstanding(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        response = self.push(self.SN, "9001")
+        self.assertEqual(response.status_code, 409, response.text)
+        detail = response.json()["detail"]
+        self.assertIn("not been confirmed by the device yet", detail)
+        self.assertIn("nothing was queued", detail)
+
+        # And nothing was: the outbox still holds exactly the revocation.
+        self.assertEqual(
+            self.commands_on(self.SN),
+            ["DATA DELETE user Pin=9001",
+             "DATA DELETE userauthorize Pin=9001"],
+        )
+
+    def test_a_template_push_is_refused_too(self):
+        self.link(self.SN)
+        self.add_template(source=self.OTHER_SN)
+        self.revoke(self.SN)
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(len(self.outbox(self.SN)), 2)
+
+    def test_a_bulk_push_names_the_blocked_person_instead_of_skipping_silently(self):
+        self.create_employee("9002", name="Omar Said")
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        response = self.client.post(f"/devices/{self.SN}/users/push_bulk",
+                                    json={"user_ids": ["9001", "9002"]})
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["pushed"], ["9002"])
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertIn("9001", body["errors"][0])
+        self.assertIn("revocation", body["errors"][0])
+
+    def test_a_push_to_a_different_door_is_not_blocked(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        response = self.push(self.OTHER_SN, "9001")
+        self.assertEqual(response.status_code, 202, response.text)
+
+    def test_a_push_is_allowed_again_once_the_revocation_concludes(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+        self.poll()
+        self.ack(2, return_code=0, cmd="DATA DELETE")
+
+        response = self.push(self.SN, "9001")
+        self.assertEqual(response.status_code, 202, response.text)
+
+
+class CancelRevocationTests(RevocationTestCase):
+    """The escape hatch that stops the 409 from stranding an operator."""
+
+    def test_cancelling_clears_the_outbox_and_leaves_a_record(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        response = self.cancel(self.SN)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["cancelled_command_ids"]), 2)
+        self.assertEqual(self.outbox(self.SN), [])
+
+        concluded = self.history(self.SN)
+        self.assertEqual(len(concluded), 2)
+        self.assertTrue(all("cancelled by tester" in (r.last_error or "")
+                            for r in concluded))
+
+    def test_cancelling_leaves_the_person_on_the_device(self):
+        """Nothing ever reached the terminal, so nothing about it changed."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.cancel(self.SN)
+
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+    def test_a_push_works_immediately_after_a_cancel(self):
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.cancel(self.SN)
+
+        self.assertEqual(self.push(self.SN, "9001").status_code, 202)
+
+    def test_cancelling_nothing_is_a_404(self):
+        self.link(self.SN)
+        self.assertEqual(self.cancel(self.SN).status_code, 404)
+
+    def test_a_cancel_cannot_recall_a_command_the_device_already_took(self):
+        """Once a terminal has acknowledged the delete the person is off it,
+        and no amount of cancelling here puts them back — the way to do that
+        is to push them again."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+
+        response = self.cancel(self.SN)
+        # The userauthorize delete is still outstanding, so this succeeds —
+        # but the user delete is already history and the link is already gone.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.links(self.SN), [])
+
+    def test_cancelling_is_confined_to_one_door_and_one_person(self):
+        self.create_employee("9002", name="Omar Said")
+        self.link(self.SN)
+        self.link(self.OTHER_SN)
+        self.link(self.SN, "9002")
+        self.revoke(self.SN, "9001")
+        self.revoke(self.OTHER_SN, "9001")
+        self.revoke(self.SN, "9002")
+
+        self.cancel(self.SN, "9001")
+
+        self.assertEqual(len(self.outbox(self.OTHER_SN)), 2)
+        self.assertEqual(
+            [c for c in self.commands_on(self.SN) if "Pin=9002" in c],
+            ["DATA DELETE user Pin=9002",
+             "DATA DELETE userauthorize Pin=9002"],
+        )
+
+
+class TemplateDeleteOnAccTests(RevocationTestCase):
+    """No invented biodata delete — a refusal that says what to do instead."""
+
+    def test_deleting_one_template_on_an_acc_terminal_is_refused_not_guessed(self):
+        self.link(self.SN)
+        response = self.client.delete(
+            f"/devices/{self.SN}/users/9001/templates/1")
+
+        self.assertEqual(response.status_code, 501, response.text)
+        detail = response.json()["detail"]
+        self.assertIn("no confirmed command", detail)
+        self.assertIn("UNVERIFIED", detail)
+        self.assertIn("remove the person", detail.lower())
+        # The load-bearing assertion: nothing was queued to a door.
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_the_att_path_still_deletes_a_template_over_the_sdk(self):
+        from unittest import mock
+        from app.models import FingerprintTemplate
+
+        self.link(self.ATT_SN)
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id="9001", finger_id=1, valid=1,
+                                       template="0a0b", source_device_sn=self.ATT_SN))
+            db.commit()
+        finally:
+            db.close()
+
+        class Conn(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.removed = []
+
+            def delete_user_template(self, uid=None, temp_id=None, user_id=None):
+                self.removed.append((uid, temp_id, user_id))
+
+        conn = Conn()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.client.delete(
+                f"/devices/{self.ATT_SN}/users/9001/templates/1")
+
+        self.assertEqual(response.status_code, 204, response.text)
+        self.assertEqual(conn.removed, [(0, 1, "9001")])
+        self.assertEqual(self.outbox(), [])
+
+
+class RevocationSingleWriterTests(RevocationTestCase):
+    """`device_employees` has one creator and now one destroyer."""
+
+    def test_nothing_outside_employee_sync_deletes_a_device_link(self):
+        import inspect as _inspect
+        from app.routers import devices as devices_router
+        from app.services import provisioning
+
+        for module in (devices_router, provisioning):
+            source = _inspect.getsource(module)
+            self.assertNotIn("db.delete(de)", source, module.__name__)
+            self.assertNotIn("db.delete(link)", source, module.__name__)
+            self.assertNotIn("DeviceEmployee).delete(", source, module.__name__)
+
+    def test_the_revocation_path_adds_no_second_writer_of_the_link(self):
+        import inspect as _inspect
+        from app.services import provisioning
+
+        source = _inspect.getsource(provisioning)
+        self.assertNotIn("db.add(DeviceEmployee(", source)
+        self.assertIn("employee_sync.unlink_device_employee", source)
