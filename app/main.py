@@ -68,12 +68,22 @@ def _command_sweep_tick():
     ever re-offered when the device polls — so this job exists to conclude the
     commands no poll will ever resolve, and to keep history from growing
     without bound.
+
+    Two jobs share this tick because they are two halves of one question:
+    what has this queue given up on? `commands.sweep` retires the commands no
+    poll will resolve; `withdraw_orphaned_templates` then retires the
+    biometric templates that were queued behind one of them (E4). A user
+    record that is refused is caught immediately, on the acknowledgement — but
+    a user record that is *never acknowledged at all* only fails on a timer,
+    and its templates must not outlive it and be delivered to a terminal that
+    never took the person.
     """
-    from app.services import commands
+    from app.services import commands, provisioning
 
     db = SessionLocal()
     try:
         commands.sweep(db)
+        provisioning.withdraw_orphaned_templates(db)
     except Exception:
         # A failed sweep must never take the scheduler thread down with it;
         # the next tick will try again.

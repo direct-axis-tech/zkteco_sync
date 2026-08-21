@@ -3,8 +3,20 @@
 The workflow this serves is the operator's, taken from BioTime: create the
 person centrally, push them to a door, then walk up to that door and enrol a
 face or a finger *on the terminal*. The device uploads the resulting template
-back by itself (that is E1/E2). Nothing here sends a biometric — it sends the
-identity the biometric will later attach to.
+back by itself (that is E1/E2).
+
+Two things are pushed down from here, and they are deliberately separate
+calls:
+
+* :func:`provision` sends the *identity* — the person record and the door
+  permission. It sends no biometric at all; the person enrols one at the
+  terminal afterwards.
+* :func:`push_templates` sends a *biometric already captured somewhere else*,
+  so that somebody enrolled at one door works at every door without walking
+  back to each one. That is the highest-consequence thing this application
+  does: the bytes it queues become a credential on physical door hardware, so
+  they are replayed verbatim from storage and never reconstructed, guessed or
+  normalised (see :func:`biodata_command`).
 
 Two commands, not one
 ---------------------
@@ -50,7 +62,9 @@ import re
 from sqlalchemy.orm import Session
 
 from app import config
-from app.models import Employee
+from app.models import (
+    BiometricTemplate, DeviceCommandOutbox, DeviceEmployee, Employee,
+)
 from app.services import commands, employee_sync
 
 log = logging.getLogger(__name__)
@@ -223,3 +237,266 @@ def note_acknowledged(db: Session, device_sn: str, command: str):
         device_sn, user_id,
     )
     return link
+
+
+# ---------------------------------------------------------------------------
+# Biometric templates: enrol once, work everywhere
+# ---------------------------------------------------------------------------
+#
+# A template captured at one door is stored by E2 exactly as the device sent
+# it — every field, including the ones nothing reads — so that this module can
+# hand it to another door unchanged. Nothing here computes, decodes, converts
+# or defaults any part of a template: if a value were wrong, the credential
+# written to a real access-control terminal would be wrong, and the symptom
+# would be somebody else's face opening a door.
+
+# The wire field names in the *command* are CamelCase while the *upload* uses
+# lowercase (§3.7 vs §3.8). That asymmetry is the vendor's, is documented, and
+# is not a mismatch to tidy up: `Tmp` and `tmp` are the same value on two
+# different wires.
+_BIODATA_FIELDS = (
+    ("Pin", "user_id"),
+    ("No", "no"),
+    ("Index", "record_index"),   # `index` is reserved SQL; the value is unchanged
+    ("Valid", "valid"),
+    ("Duress", "duress"),
+    ("Type", "type"),
+    ("MajorVer", "majorver"),
+    ("MinorVer", "minorver"),
+    ("Format", "format"),
+    ("Tmp", "tmp"),
+)
+
+
+def biodata_command(template: BiometricTemplate) -> str:
+    """The `DATA UPDATE BIODATA` line for one stored template, §3.8 field order.
+
+    Verbatim from the vendor's own access-control SDK command constants::
+
+        DATA UPDATE BIODATA Pin={0}<HT>No={1}<HT>Index={2}<HT>Valid={3}<HT>
+        Duress={4}<HT>Type={5}<HT>MajorVer={6}<HT>MinorVer={7}<HT>
+        Format={8}<HT>Tmp={9}
+
+    Every field comes from a column E2 filled from the device's own upload.
+    ``Type`` is passed through as the number it is — 1 and 9 have been seen in
+    the field and read as fingerprint and visible-light face, but nothing here
+    branches on that and nothing should start: the modality is the device's
+    business, this is a replay.
+
+    ``Tmp`` is a few KB of base64 and is never decoded. It is *validated*
+    rather than sanitised: a TAB or a newline inside it would invent a field
+    or record boundary and hand the terminal a different template than the one
+    stored. Silently stripping the character would corrupt a credential, so
+    this raises instead and the caller reports the template as unsendable.
+    """
+    values = []
+    for wire_name, column in _BIODATA_FIELDS:
+        value = getattr(template, column)
+        if value is None:
+            raise ValueError(
+                f"template {getattr(template, 'id', '?')} has no {column}; "
+                f"a BIODATA command cannot be built from an incomplete record"
+            )
+        if wire_name == "Tmp":
+            if _WIRE_BREAKERS.search(str(value)):
+                raise ValueError(
+                    f"template {getattr(template, 'id', '?')} contains a tab or "
+                    f"newline in Tmp, which would break the wire framing; "
+                    f"refusing to alter biometric data to make it fit"
+                )
+            values.append(f"Tmp={value}")
+            continue
+        values.append(f"{wire_name}={_wire_safe(value)}")
+
+    return "DATA UPDATE BIODATA " + HT.join(values)
+
+
+def templates_for_device(db: Session, device_sn: str, user_id: str):
+    """This person's stored templates, split into what may be sent and what may not.
+
+    Returns ``(sendable, from_this_device)``.
+
+    **A template is never pushed back to the device it came from.** That is
+    what ``BiometricTemplate.source_device_sn`` is for. At best it is wasted
+    work on a queue that moves one command per ten seconds; at worst it
+    overwrites a device's own live enrolment record with this server's copy of
+    it, which is a corruption path with no upside — the device already has the
+    original.
+
+    Ordered by (type, no) so a given push is reproducible rather than
+    depending on insertion order.
+    """
+    rows = (
+        db.query(BiometricTemplate)
+        .filter(BiometricTemplate.user_id == str(user_id))
+        .order_by(BiometricTemplate.type, BiometricTemplate.no, BiometricTemplate.id)
+        .all()
+    )
+    sendable = [r for r in rows if r.source_device_sn != device_sn]
+    own = [r for r in rows if r.source_device_sn == device_sn]
+    return sendable, own
+
+
+def template_commands(templates) -> tuple:
+    """Build every command first, queue nothing. ``(commands, unsendable)``.
+
+    Building the whole batch before anything is queued is deliberate: a person
+    whose templates cannot all be expressed on the wire should not end up with
+    a half-sent enrolment and a user record queued for templates that will
+    never follow.
+    """
+    bodies, unsendable = [], []
+    for template in templates:
+        try:
+            bodies.append(biodata_command(template))
+        except ValueError as exc:
+            unsendable.append((template, str(exc)))
+            log.error(
+                "template %s for %s cannot be sent: %s",
+                template.id, template.user_id, exc,
+            )
+    return bodies, unsendable
+
+
+def is_on_device(db: Session, device_sn: str, user_id: str) -> bool:
+    """Has this terminal confirmed it holds this person?
+
+    `device_employees` earns its row only when the device acknowledges the
+    user record (E3), so this is a fact rather than a hope — which is exactly
+    what "may a template be sent without sending the person first" needs.
+    """
+    return (
+        db.query(DeviceEmployee)
+        .filter_by(device_sn=device_sn, user_id=str(user_id))
+        .first()
+        is not None
+    )
+
+
+def push_templates(
+    db: Session,
+    device_sn: str,
+    employee: Employee,
+    bodies: list,
+    with_user_record: bool,
+) -> list:
+    """Queue one person's templates onto one terminal. Returns the outbox rows.
+
+    Order matters and is guaranteed by construction
+    -----------------------------------------------
+    A template for a Pin the terminal has never heard of has nothing to attach
+    to. So when the device has not already confirmed the person
+    (:func:`is_on_device`), the user record and door permission are queued
+    *first*, in the same call, and the templates behind them.
+
+    That ordering survives delivery because the outbox is FIFO per device:
+    `commands._eligible` orders by ``created_at, id``, so the user record is
+    always offered on an earlier poll than the templates queued after it. The
+    device therefore receives the person before the credential, every time.
+
+    What FIFO does **not** guarantee — and this is the honest part — is that
+    the user record was *accepted*. Delivery order is not success order: if
+    the terminal refuses the user command, or never acknowledges it, the
+    templates behind it are still owed to that device. That residual is not
+    papered over; :func:`withdraw_orphaned_templates` withdraws them and
+    records why, so the operator sees a failure instead of a silent
+    half-success.
+    """
+    rows = []
+    if with_user_record:
+        rows.extend(provision(db, device_sn, employee))
+    rows.extend(commands.queue(db, device_sn, body) for body in bodies)
+    log.info(
+        "queued %s biometric template(s) for %s onto %s%s — command ids %s; "
+        "queued, not delivered",
+        len(bodies), employee.user_id, device_sn,
+        " (behind the user record, which the device has not confirmed yet)"
+        if with_user_record else " (the device already holds this person)",
+        [r.id for r in rows],
+    )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# The half-success this unit refuses to leave silent
+# ---------------------------------------------------------------------------
+
+_BIODATA_PIN = re.compile(r"^DATA UPDATE BIODATA\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECASE)
+
+
+def pin_from_biodata_command(command: str):
+    """The Pin in a `DATA UPDATE BIODATA` command, or None if it is not one."""
+    match = _BIODATA_PIN.match((command or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def withdraw_orphaned_templates(db: Session, device_sn: str = None) -> list:
+    """Retire template commands whose person is not going to be on that device.
+
+    A queued template is orphaned when, for the same device and Pin:
+
+    * the terminal has not confirmed the person (no `device_employees` row —
+      written only on a real acknowledgement), **and**
+    * no user record for them is still outstanding in that device's outbox.
+
+    Which leaves exactly one reading: the user command was concluded and it
+    concluded *failed* — refused with a non-zero ``Return``, or handed over
+    the maximum number of times and never acknowledged — or the person has
+    since been taken off the terminal. Delivering a biometric behind that is
+    the silent half-success this unit exists to prevent, so the command is
+    concluded ``failed`` with the reason recorded, where the UI shows it
+    alongside anything the device refused outright.
+
+    Called from two places, because a user record can fail in two ways: from
+    the acknowledgement path the moment a refusal arrives (app/routers/adms.py)
+    and from the scheduled sweep, which is what catches the user record that
+    was never acknowledged at all (app/main.py).
+
+    Returns the ids withdrawn. Does not raise: a sweep must not fall over.
+    """
+    query = db.query(DeviceCommandOutbox)
+    if device_sn:
+        query = query.filter(DeviceCommandOutbox.device_sn == device_sn)
+    outstanding = query.order_by(DeviceCommandOutbox.id).all()
+
+    templates = [
+        (row, pin) for row, pin in
+        ((row, pin_from_biodata_command(row.command)) for row in outstanding)
+        if pin
+    ]
+    if not templates:
+        return []
+
+    # Every user record still owed to a device, so a template waiting behind
+    # one that simply has not been collected yet is left alone.
+    awaiting_user_record = {
+        (row.device_sn, pin_from_user_command(row.command))
+        for row in outstanding
+        if pin_from_user_command(row.command)
+    }
+
+    withdrawn = []
+    for row, pin in templates:
+        if (row.device_sn, pin) in awaiting_user_record:
+            continue
+        if is_on_device(db, row.device_sn, pin):
+            continue
+
+        row_id, row_sn = row.id, row.device_sn
+        if commands.conclude(
+            db, row, "failed",
+            last_error=(
+                f"withdrawn: {row_sn} has no confirmed user record for Pin={pin}, "
+                f"so this template had nothing to attach to"
+            ),
+        ):
+            withdrawn.append(row_id)
+            log.warning(
+                "withdrew queued template command %s for %s on %s: the user "
+                "record was refused or never acknowledged, so the template "
+                "was not sent to a terminal that does not have the person",
+                row_id, pin, row_sn,
+            )
+    return withdrawn

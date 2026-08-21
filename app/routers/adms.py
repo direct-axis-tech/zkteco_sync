@@ -1154,6 +1154,16 @@ async def adms_devicecmd(
             # single writer the SDK path uses, never inline here.
             provisioning.note_acknowledged(db, SN, body)
             db.commit()
+        elif outcome == "rejected":
+            # The mirror image, and the reason E4 can queue a biometric behind
+            # a user record at all. A refused `DATA UPDATE user` means this
+            # terminal does not have the person — so any template still queued
+            # for them here has nothing to attach to and is withdrawn with the
+            # reason recorded, rather than being delivered to a device that
+            # will either refuse it or file it against nobody.
+            if provisioning.pin_from_user_command(body):
+                provisioning.withdraw_orphaned_templates(db, SN)
+                db.commit()
 
     # Always "OK": the device has already done the work, and refusing its
     # report only makes it repeat the command.

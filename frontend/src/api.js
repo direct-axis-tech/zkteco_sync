@@ -78,6 +78,11 @@ export const api = {
     get: (userId) => request('GET', `/employees/${userId}`),
     getDevices: (userId) => request('GET', `/employees/${userId}/devices`),
     getTemplates: (userId) => request('GET', `/employees/${userId}/templates`),
+    // Biometrics captured at a terminal (faces, fingers) — described, never
+    // handed over: the template bytes themselves stay on the server. What
+    // matters here is `source_device_sn`, the one terminal each will never be
+    // pushed back to.
+    getBiometrics: (userId) => request('GET', `/employees/${userId}/biometrics`),
   },
   auth: {
     login: async (username, password) => {

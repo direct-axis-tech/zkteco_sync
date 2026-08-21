@@ -4012,6 +4012,746 @@ class TransportRoutingTests(ProvisioningTestCase):
 
 
 # ---------------------------------------------------------------------------
+# 20e. E4 — enrol once, work everywhere: pushing a captured template onward
+# ---------------------------------------------------------------------------
+#
+# The highest-consequence write in this application. A `DATA UPDATE BIODATA`
+# command puts a biometric credential onto physical door hardware, so the
+# assertions here are about literal bytes, about which device a template is
+# NOT sent to, and about the order two commands are queued in — never about
+# status codes alone.
+#
+# Four failure modes are guarded:
+#
+#   1. A command shape the terminal misreads. §3.8's field names are CamelCase
+#      (`Index`, `MajorVer`, `Tmp`) while the upload that produced the stored
+#      row used lowercase; getting that asymmetry wrong writes a credential
+#      the device parses differently than intended.
+#   2. A template pushed back to the device that captured it — wasted work at
+#      best, and at worst this server overwriting a terminal's own live
+#      enrolment with its copy of it.
+#   3. A template landing on a terminal that never accepted the person, which
+#      is a credential attached to nobody and invisible from the server.
+#   4. Both transports writing the same device, which is the collision the
+#      whole bulk-data programme is routed around.
+
+# One record from the operator's own BioFace A1 capture, and one invented
+# alongside it, so the command below is built from data a real device sent.
+CAPTURED_FACE_TMP = "apUBFjYCAABuuOlOCQAoAQFM+ZoWAGJobX4kJSYnGSkqKw=="
+CAPTURED_FINGER_TMP = "apUBEBgEfAQBAA0AAVH4AAgJCgs42CmiExIxE2A4o0xKdg=="
+
+
+class _TemplateRow:
+    """A BiometricTemplate's fields without a database behind it."""
+
+    def __init__(self, **fields):
+        defaults = dict(
+            id=1, user_id="1", no=0, record_index=0, valid=1, duress=0,
+            type=9, majorver=40, minorver=1, format=0, tmp=CAPTURED_FACE_TMP,
+            source_device_sn=ACC_SN,
+        )
+        defaults.update(fields)
+        for key, value in defaults.items():
+            setattr(self, key, value)
+
+
+class BiodataCommandShapeTests(unittest.TestCase):
+    """The literal bytes, against the vendor's own command constant.
+
+    Verbatim from push-protocol.md §3.8, which took it from ZKTeco's
+    access-control SDK (`Access/Commands.cs`)::
+
+        DATA UPDATE BIODATA Pin={0}\tNo={1}\tIndex={2}\tValid={3}\tDuress={4}
+        \tType={5}\tMajorVer={6}\tMinorVer={7}\tFormat={8}\tTmp={9}
+
+    This file is not the authority on that string; the vendor is. The literals
+    below are transcribed from the protocol reference, not from the code.
+    """
+
+    def test_the_command_is_byte_for_byte_the_vendor_shape(self):
+        from app.services import provisioning
+
+        command = provisioning.biodata_command(_TemplateRow(
+            user_id="9001", no=3, record_index=9, valid=1, duress=1, type=1,
+            majorver=13, minorver=2, format=1, tmp="QUJDREVGRw==",
+        ))
+        self.assertEqual(
+            command,
+            "DATA UPDATE BIODATA Pin=9001\tNo=3\tIndex=9\tValid=1\tDuress=1\t"
+            "Type=1\tMajorVer=13\tMinorVer=2\tFormat=1\tTmp=QUJDREVGRw==",
+        )
+
+    def test_the_separator_is_a_tab_and_the_command_name_is_spaced(self):
+        """§3.8: the command *name* is space-separated, its *fields* are
+        TAB-separated. A single space where a tab belongs is a command the
+        terminal cannot parse, and it is exactly the kind of thing an editor
+        or a copy-paste turns silently."""
+        from app.services import provisioning
+
+        command = provisioning.biodata_command(_TemplateRow(user_id="7"))
+        head, sep, rest = command.partition("\t")
+        self.assertEqual(head, "DATA UPDATE BIODATA Pin=7")
+        self.assertEqual(sep, "\t")
+        self.assertEqual(command.count("\t"), 9)      # ten fields, nine separators
+        self.assertNotIn("\n", command)
+        self.assertNotIn("  ", command)
+
+    def test_the_field_names_are_camelcase_not_the_uploads_lowercase(self):
+        """The documented §3.7/§3.8 asymmetry: `index=` arrives, `Index=` is
+        sent back. Renaming either to match the other is the mistake."""
+        from app.services import provisioning
+
+        command = provisioning.biodata_command(_TemplateRow())
+        names = [field.split("=")[0] for field in
+                 command.replace("DATA UPDATE BIODATA ", "").split("\t")]
+        self.assertEqual(names, [
+            "Pin", "No", "Index", "Valid", "Duress", "Type",
+            "MajorVer", "MinorVer", "Format", "Tmp",
+        ])
+        for lowercase in ("pin=", "index=", "type=", "majorver=", "tmp="):
+            self.assertNotIn(lowercase, command)
+
+    def test_every_field_comes_from_storage_and_nothing_is_defaulted(self):
+        """E2 kept `duress`, `index`, `majorver`, `minorver` and `format`
+        verbatim precisely so this command never has to invent them."""
+        from app.services import provisioning
+
+        row = _TemplateRow(user_id="42", no=5, record_index=7, valid=0,
+                           duress=1, type=1, majorver=13, minorver=4, format=2,
+                           tmp=CAPTURED_FINGER_TMP)
+        command = provisioning.biodata_command(row)
+        for expected in ("Pin=42", "No=5", "Index=7", "Valid=0", "Duress=1",
+                         "Type=1", "MajorVer=13", "MinorVer=4", "Format=2",
+                         f"Tmp={CAPTURED_FINGER_TMP}"):
+            self.assertIn(expected, command)
+
+    def test_the_template_bytes_are_replayed_untouched(self):
+        """Not decoded, not re-encoded, not padded, not trimmed. The server
+        has no business understanding a template — only holding it."""
+        from app.services import provisioning
+
+        command = provisioning.biodata_command(_TemplateRow(tmp=CAPTURED_FACE_TMP))
+        self.assertTrue(command.endswith(f"\tTmp={CAPTURED_FACE_TMP}"))
+
+    def test_the_type_is_passed_through_and_never_interpreted(self):
+        """`type` is the device's data. 1 and 9 have been read as fingerprint
+        and visible-light face in the field, but nothing branches on that and
+        an unfamiliar value must still be sent, not dropped."""
+        from app.services import provisioning
+
+        for value in (0, 1, 2, 8, 9, 23):
+            command = provisioning.biodata_command(_TemplateRow(type=value))
+            self.assertIn(f"\tType={value}\t", command)
+
+    def test_a_tab_inside_the_template_is_refused_not_stripped(self):
+        """Trimming a character out of a credential to make it fit the wire is
+        the one thing worse than refusing to send it."""
+        from app.services import provisioning
+
+        with self.assertRaises(ValueError) as caught:
+            provisioning.biodata_command(_TemplateRow(tmp="AAAA\tBBBB"))
+        self.assertIn("Tmp", str(caught.exception))
+
+    def test_a_newline_inside_the_template_is_refused_too(self):
+        """A newline would invent a whole extra record (§3.8: records are
+        LF-separated), so half the template would be read as a second one."""
+        from app.services import provisioning
+
+        with self.assertRaises(ValueError):
+            provisioning.biodata_command(_TemplateRow(tmp="AAAA\nBBBB"))
+
+    def test_a_missing_field_is_refused_rather_than_guessed(self):
+        from app.services import provisioning
+
+        with self.assertRaises(ValueError):
+            provisioning.biodata_command(_TemplateRow(majorver=None))
+
+
+class TemplatePushTestCase(ProvisioningTestCase):
+    """The endpoint, over the same two acc terminals and one att terminal."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+
+    def add_template(self, user_id="9001", type=9, no=0, source=None, **fields):
+        row = dict(
+            user_id=user_id, type=type, no=no, record_index=0, valid=1,
+            duress=0, majorver=40, minorver=1, format=0,
+            tmp=CAPTURED_FACE_TMP, source_device_sn=source or self.OTHER_SN,
+        )
+        row.update(fields)
+        db = self.Session()
+        try:
+            db.add(BiometricTemplate(**row))
+            db.commit()
+        finally:
+            db.close()
+
+    def push_templates(self, sn, user_id="9001"):
+        return self.client.post(f"/devices/{sn}/users/{user_id}/templates/push")
+
+    def commands_on(self, sn):
+        return [row.command for row in self.outbox(sn)]
+
+    def link(self, sn, user_id="9001"):
+        """Pretend the terminal has already confirmed it holds this person."""
+        db = self.Session()
+        try:
+            employee_sync.link_device_employee(db, sn, user_id)
+            db.commit()
+        finally:
+            db.close()
+
+
+class TemplatePushQueueTests(TemplatePushTestCase):
+    """What lands in the outbox, and in what order."""
+
+    def test_the_queued_command_is_the_vendor_shape_byte_for_byte(self):
+        self.add_template(no=2, record_index=4, type=9, majorver=40,
+                          minorver=1, format=0, tmp=CAPTURED_FACE_TMP)
+        self.link(self.SN)          # person already confirmed on this terminal
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 202, response.text)
+
+        self.assertEqual(self.commands_on(self.SN), [
+            "DATA UPDATE BIODATA Pin=9001\tNo=2\tIndex=4\tValid=1\tDuress=0\t"
+            "Type=9\tMajorVer=40\tMinorVer=1\tFormat=0\t"
+            f"Tmp={CAPTURED_FACE_TMP}",
+        ])
+
+    def test_the_bytes_the_device_is_handed_carry_the_id_envelope(self):
+        self.add_template(no=2)
+        self.link(self.SN)
+        self.push_templates(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+
+        self.assertEqual(
+            self.poll(),
+            f"C:{command_id}:DATA UPDATE BIODATA Pin=9001\tNo=2\tIndex=0\t"
+            f"Valid=1\tDuress=0\tType=9\tMajorVer=40\tMinorVer=1\tFormat=0\t"
+            f"Tmp={CAPTURED_FACE_TMP}",
+        )
+
+    def test_two_templates_are_queued_as_two_commands(self):
+        self.add_template(type=1, no=5, tmp=CAPTURED_FINGER_TMP)
+        self.add_template(type=9, no=0, tmp=CAPTURED_FACE_TMP)
+        self.link(self.SN)
+
+        self.push_templates(self.SN)
+        queued = self.commands_on(self.SN)
+        self.assertEqual(len(queued), 2)
+        self.assertIn("\tType=1\t", queued[0])
+        self.assertIn("\tType=9\t", queued[1])
+
+    def test_the_response_says_queued_and_does_not_claim_success(self):
+        self.add_template()
+        self.link(self.SN)
+        body = self.push_templates(self.SN).json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["templates_queued"], 1)
+        self.assertIn("not delivered yet", body["message"])
+
+    def test_the_response_never_carries_the_template_bytes(self):
+        """A credential does not need to travel back out of the database to a
+        browser to be logged, cached or screenshotted."""
+        self.add_template()
+        self.link(self.SN)
+        body = self.push_templates(self.SN).json()
+        self.assertNotIn(CAPTURED_FACE_TMP, response_text := str(body))
+        self.assertNotIn("Tmp=", response_text)
+        self.assertEqual(body["commands"], ["DATA UPDATE BIODATA Pin=9001"])
+
+    def test_a_push_is_per_device_and_never_fans_out(self):
+        self.add_template(source=self.ATT_SN)
+        self.link(self.SN)
+        self.push_templates(self.SN)
+        self.assertEqual(len(self.outbox(self.SN)), 1)
+        self.assertEqual(self.outbox(self.OTHER_SN), [])
+
+    def test_the_queue_stays_at_one_command_per_poll(self):
+        """Two templates plus a user record is four commands and about forty
+        seconds. The batch size is not raised to hide that."""
+        self.add_template(type=1, no=5)
+        self.add_template(type=9, no=0)
+        body = self.push_templates(self.SN).json()
+        self.assertEqual(config.COMMAND_BATCH_SIZE, 1)
+        self.assertEqual(len(body["command_ids"]), 4)
+        self.assertIn("40 seconds", body["message"])
+
+
+class TemplateNeverGoesHomeTests(TemplatePushTestCase):
+    """A template is never pushed back to the device that captured it."""
+
+    def test_a_template_is_not_queued_to_its_own_source_device(self):
+        self.add_template(type=9, no=0, source=self.SN)      # captured here
+        self.add_template(type=1, no=5, source=self.OTHER_SN)  # captured elsewhere
+        self.link(self.SN)
+
+        self.push_templates(self.SN)
+        queued = self.commands_on(self.SN)
+        self.assertEqual(len(queued), 1)
+        self.assertIn("\tType=1\t", queued[0])       # only the foreign one
+
+    def test_the_skipped_template_is_named_rather_than_silently_dropped(self):
+        self.add_template(type=9, no=0, source=self.SN)
+        self.add_template(type=1, no=5, source=self.OTHER_SN)
+        self.link(self.SN)
+
+        body = self.push_templates(self.SN).json()
+        self.assertEqual(body["skipped_from_this_device"], [{"type": 9, "no": 0}])
+        self.assertEqual(body["templates_queued"], 1)
+
+    def test_pushing_only_its_own_templates_back_is_refused_and_queues_nothing(self):
+        self.add_template(type=9, no=0, source=self.SN)
+        self.link(self.SN)
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("never pushed back", response.json()["detail"])
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_the_same_template_still_goes_to_every_other_device(self):
+        """The exclusion is per target device, not a global veto: the whole
+        point of the unit is that one enrolment reaches every other door."""
+        self.add_template(type=9, no=0, source=self.SN)
+        self.link(self.OTHER_SN)
+
+        response = self.push_templates(self.OTHER_SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(len(self.commands_on(self.OTHER_SN)), 1)
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class TemplateOrderingTests(TemplatePushTestCase):
+    """The user record reaches the terminal before the credential does."""
+
+    def test_the_user_record_is_queued_ahead_of_the_template(self):
+        """A template for a Pin the terminal has never heard of has nothing to
+        attach to, so the person and their door permission go first."""
+        self.add_template()
+        self.push_templates(self.SN)
+
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.SN)], [
+            "DATA UPDATE user Pin=9001",
+            "DATA UPDATE userauthorize Pin=9001",
+            "DATA UPDATE BIODATA Pin=9001",
+        ])
+
+    def test_the_device_is_handed_them_in_that_order(self):
+        """The outbox is FIFO per device (ordered by created_at, id), so the
+        ordering survives delivery: the user record is offered on an earlier
+        poll than the template every time."""
+        self.add_template()
+        self.push_templates(self.SN)
+
+        handed = [self.poll() for _ in range(3)]
+        self.assertIn(":DATA UPDATE user Pin=9001\t", handed[0])
+        self.assertIn(":DATA UPDATE userauthorize Pin=9001\t", handed[1])
+        self.assertIn(":DATA UPDATE BIODATA Pin=9001\t", handed[2])
+
+    def test_the_user_record_is_not_re_sent_when_the_device_confirmed_it(self):
+        """`device_employees` is written only on a real acknowledgement, so
+        its presence is evidence the terminal has the person. Re-queueing the
+        record would cost two more polls for nothing."""
+        self.add_template()
+        self.link(self.SN)
+        body = self.push_templates(self.SN).json()
+
+        self.assertFalse(body["user_record_queued"])
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.SN)],
+                         ["DATA UPDATE BIODATA Pin=9001"])
+
+    def test_a_queued_but_unconfirmed_user_record_does_not_count_as_confirmed(self):
+        """Provisioned ten seconds ago and not yet acknowledged is not "on the
+        device". The template goes behind a second user record rather than
+        being sent on the strength of a hope."""
+        self.add_template()
+        self.push(self.SN, "9001")           # E3 provisioning, not yet acked
+        self.push_templates(self.SN)
+
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.SN)], [
+            "DATA UPDATE user Pin=9001",
+            "DATA UPDATE userauthorize Pin=9001",
+            "DATA UPDATE user Pin=9001",
+            "DATA UPDATE userauthorize Pin=9001",
+            "DATA UPDATE BIODATA Pin=9001",
+        ])
+
+    def test_a_confirmed_push_leaves_the_person_on_the_device_afterwards(self):
+        """End to end: queue, collect, acknowledge — and the terminal now
+        holds both the person and their template."""
+        self.add_template()
+        self.push_templates(self.SN)
+        for row in list(self.outbox(self.SN)):
+            self.poll()
+            self.ack(row.id, return_code=0)
+
+        self.assertEqual([l.user_id for l in self.links(self.SN)], ["9001"])
+        self.assertEqual(self.outbox(self.SN), [])
+        self.assertEqual({r.outcome for r in self.history(self.SN)}, {"acknowledged"})
+
+
+class TemplateRefusalTests(TemplatePushTestCase):
+    """What the device refused must be visible, never silently absent."""
+
+    def test_a_refused_template_is_recorded_with_its_return_code(self):
+        self.add_template()
+        self.link(self.SN)
+        self.push_templates(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(command_id, return_code=-14)
+
+        failed = [r for r in self.history(self.SN) if r.outcome == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].return_code, -14)
+        self.assertTrue(failed[0].command.startswith("DATA UPDATE BIODATA Pin=9001"))
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_a_refused_template_is_not_retried(self):
+        """A refusal is permanent (E7): the device understood the command and
+        declined it. Re-offering a multi-KB credential earns the same answer
+        more slowly."""
+        self.add_template()
+        self.link(self.SN)
+        self.push_templates(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(command_id, return_code=-14)
+
+        self.assertEqual(self.poll(), "OK")
+
+    def test_a_refused_template_is_visible_through_the_operator_api(self):
+        """The UI reads this endpoint to show "refused" next to the person —
+        the whole point of not swallowing the outcome."""
+        self.add_template()
+        self.link(self.SN)
+        self.push_templates(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(command_id, return_code=-14)
+
+        rows = self.client.get(f"/devices/{self.SN}/commands/history").json()
+        refused = [r for r in rows if r["outcome"] == "failed"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["return_code"], -14)
+        self.assertTrue(refused[0]["command"].startswith("DATA UPDATE BIODATA"))
+
+    def test_a_refused_template_does_not_unmake_the_person(self):
+        """The person is still on the terminal; only the credential failed.
+        They can walk up and enrol a face there — which is the state the whole
+        workflow started from, not a regression."""
+        self.add_template()
+        self.link(self.SN)
+        self.push_templates(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(command_id, return_code=-14)
+
+        self.assertEqual([l.user_id for l in self.links(self.SN)], ["9001"])
+
+
+class OrphanedTemplateTests(TemplatePushTestCase):
+    """The half-success this unit refuses to leave silent.
+
+    FIFO guarantees the user record is *offered* first. It cannot guarantee it
+    was *accepted*. If it is refused, or never acknowledged at all, the
+    template queued behind it is owed to a terminal that does not have the
+    person — so it is withdrawn and the reason recorded, rather than delivered
+    and filed against nobody.
+    """
+
+    def test_a_refused_user_record_withdraws_the_template_behind_it(self):
+        self.add_template()
+        self.push_templates(self.SN)
+        user_command_id = self.outbox(self.SN)[0].id
+
+        self.poll()
+        self.ack(user_command_id, return_code=-14)
+
+        remaining = [c.split("\t")[0] for c in self.commands_on(self.SN)]
+        self.assertNotIn("DATA UPDATE BIODATA Pin=9001", remaining)
+        self.assertEqual(self.links(self.SN), [])
+
+    def test_the_withdrawal_is_recorded_with_a_reason_not_just_deleted(self):
+        self.add_template()
+        self.push_templates(self.SN)
+        self.poll()
+        self.ack(self.outbox(self.SN)[0].id, return_code=-14)
+
+        withdrawn = [r for r in self.history(self.SN)
+                     if r.command.startswith("DATA UPDATE BIODATA")]
+        self.assertEqual(len(withdrawn), 1)
+        self.assertEqual(withdrawn[0].outcome, "failed")
+        self.assertIsNone(withdrawn[0].return_code)   # nobody refused it; we withdrew it
+        self.assertIn("no confirmed user record", withdrawn[0].last_error)
+
+    def test_a_withdrawn_template_is_never_handed_to_the_device(self):
+        self.add_template()
+        self.push_templates(self.SN)
+        self.poll()
+        self.ack(self.outbox(self.SN)[0].id, return_code=-14)
+
+        for _ in range(3):
+            self.assertNotIn("BIODATA", self.poll())
+
+    def test_a_user_record_that_is_never_acknowledged_withdraws_it_too(self):
+        """The refusal case is caught on the acknowledgement. This one has no
+        acknowledgement to catch — it fails on the sweep's timer instead, and
+        the template must not outlive it."""
+        from app.services import commands as commands_service
+        from app.services import provisioning
+
+        self.add_template()
+        self.push_templates(self.SN)
+
+        # Hand the user record over until it runs out of attempts, never
+        # acknowledging it — a terminal that collects and stays silent.
+        for _ in range(config.COMMAND_MAX_ATTEMPTS + 2):
+            self.poll()
+            for row in self.outbox(self.SN):
+                self.rewind_backoff(row.id)
+
+        db = self.Session()
+        try:
+            commands_service.sweep(db)
+            withdrawn = provisioning.withdraw_orphaned_templates(db)
+        finally:
+            db.close()
+
+        self.assertEqual(len(withdrawn), 1)
+        self.assertNotIn("DATA UPDATE BIODATA Pin=9001",
+                         [c.split("\t")[0] for c in self.commands_on(self.SN)])
+        biodata = [r for r in self.history(self.SN)
+                   if r.command.startswith("DATA UPDATE BIODATA")]
+        self.assertEqual([r.outcome for r in biodata], ["failed"])
+        self.assertIn("no confirmed user record", biodata[0].last_error)
+
+    def test_a_template_waiting_behind_an_uncollected_user_record_is_left_alone(self):
+        """Offline is not failure (E7). A device that has not polled yet owes
+        both commands and neither has failed at anything."""
+        from app.services import provisioning
+
+        self.add_template()
+        self.push_templates(self.SN)
+
+        db = self.Session()
+        try:
+            self.assertEqual(provisioning.withdraw_orphaned_templates(db), [])
+        finally:
+            db.close()
+        self.assertEqual(len(self.outbox(self.SN)), 3)
+
+    def test_a_template_behind_a_confirmed_user_record_is_left_alone(self):
+        from app.services import provisioning
+
+        self.add_template()
+        self.push_templates(self.SN)
+        self.poll()
+        self.ack(self.outbox(self.SN)[0].id, return_code=0)   # user record confirmed
+
+        db = self.Session()
+        try:
+            self.assertEqual(provisioning.withdraw_orphaned_templates(db), [])
+        finally:
+            db.close()
+        self.assertTrue(any(c.startswith("DATA UPDATE BIODATA")
+                            for c in self.commands_on(self.SN)))
+
+    def test_the_withdrawal_only_touches_the_device_that_failed(self):
+        self.add_template(source=self.ATT_SN)
+        self.push_templates(self.SN)
+        self.push_templates(self.OTHER_SN)
+
+        self.poll()
+        self.ack(self.outbox(self.SN)[0].id, return_code=-14)
+
+        self.assertTrue(any(c.startswith("DATA UPDATE BIODATA")
+                            for c in self.commands_on(self.OTHER_SN)))
+
+    def test_the_scheduled_sweep_runs_the_withdrawal(self):
+        """It is wired into the existing 15-minute job, not a second
+        scheduler, and not left as a function nothing calls.
+
+        Read off disk rather than imported: importing app.main runs
+        `Base.metadata.create_all` at module level, against whatever database
+        .env names — which for this repo is the operator's live one. A test
+        that only wants to read a function body has no business opening that
+        connection."""
+        import os.path
+
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "app", "main.py",
+        )
+        with open(path) as handle:
+            source = handle.read()
+        body = source.split("def _command_sweep_tick")[1].split("\ndef ")[0]
+        self.assertIn("commands.sweep(db)", body)
+        self.assertIn("withdraw_orphaned_templates(db)", body)
+
+
+class TemplatePushRefusalTests(TemplatePushTestCase):
+    """Clear errors instead of a queue that quietly does nothing."""
+
+    def test_a_person_with_no_templates_is_an_error_not_an_empty_success(self):
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("No biometric templates captured", response.json()["detail"])
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_a_person_with_no_templates_queues_no_user_record_either(self):
+        """Not even the harmless half: an operator who asked to send a
+        biometric and got a user record instead would reasonably read the
+        person as enrolled."""
+        self.push_templates(self.SN)
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_an_unknown_employee_is_a_404(self):
+        response = self.push_templates(self.SN, user_id="nobody")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_an_unknown_device_is_a_404(self):
+        self.add_template()
+        self.assertEqual(self.push_templates("NOSUCHSERIAL").status_code, 404)
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_unsendable_template_is_refused_and_queues_nothing(self):
+        """Every command is built before anything is queued, so a person whose
+        stored data cannot go on the wire does not end up with a user record
+        queued for a template that will never follow."""
+        self.add_template(tmp="AAAA\tBBBB")
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("cannot be put on the wire", response.json()["detail"])
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class TemplateTransportRoutingTests(TemplatePushTestCase):
+    """acc goes to the outbox, att goes to the SDK, never both."""
+
+    def add_fingerprint(self, user_id="9001", finger_id=1):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id=user_id, finger_id=finger_id,
+                                       valid=1, template="0a0b0c",
+                                       source_device_sn=self.OTHER_SN))
+            db.commit()
+        finally:
+            db.close()
+
+    def test_an_att_device_uses_the_sdk_and_never_touches_the_outbox(self):
+        from unittest import mock
+
+        self.add_template(source=self.OTHER_SN)   # an ADMS-captured template
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+
+        class Conn(FakeConnection):
+            def __init__(self):
+                super().__init__(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
+                self.templates = None
+
+            def save_user_template(self, user, fingers):
+                self.templates = fingers
+
+        conn = Conn()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.push_templates(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["templates_pushed"], 1)
+        self.assertEqual(len(conn.templates), 1)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_an_att_device_never_queues_a_biodata_command(self):
+        """The two tables are not each other's format: `biometric_templates`
+        is ADMS base64, `fingerprint_templates` is a pyzk-packed blob. Neither
+        is offered on the other's wire."""
+        from unittest import mock
+
+        self.add_template(source=self.OTHER_SN)
+        self.link(self.ATT_SN)
+        conn = FakeConnection(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.push_templates(self.ATT_SN)
+
+        # No fingerprint_templates row, so the SDK path has nothing to write —
+        # and it says so rather than quietly reaching for the acc table.
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_acc_device_never_opens_a_socket(self):
+        from unittest import mock
+
+        self.add_template()
+        self.link(self.SN)
+        conn = FakeConnection()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            self.push_templates(self.SN)
+
+        self.assertEqual(conn.written, [])
+        self.assertEqual(len(self.outbox(self.SN)), 1)
+
+    def test_a_device_with_no_protocol_set_takes_the_sdk_path(self):
+        from unittest import mock
+
+        self.add_template()
+        self.link(self.DEFAULT_SN)
+        conn = FakeConnection(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            self.push_templates(self.DEFAULT_SN)
+
+        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+
+    def test_the_template_push_writes_no_device_link_inline(self):
+        """Same discipline E3 established for employees and device links: the
+        template path adds no new writer of either table."""
+        import inspect as _inspect
+        from app.routers import devices as devices_router
+        from app.services import provisioning
+
+        for module in (devices_router, provisioning):
+            source = _inspect.getsource(module)
+            self.assertNotIn("db.add(DeviceEmployee(", source, module.__name__)
+            self.assertNotIn("db.add(Employee(", source, module.__name__)
+
+    def test_queueing_a_template_writes_no_device_link(self):
+        """Queued is not delivered — and a template is not what makes somebody
+        present on a terminal in the first place."""
+        self.add_template()
+        self.push_templates(self.SN)
+        self.assertEqual(self.links(), [])
+
+
+class BiometricListingTests(TemplatePushTestCase):
+    """What the operator reads before deciding to copy an enrolment."""
+
+    def test_the_listing_describes_the_templates_without_handing_them_over(self):
+        self.add_template(type=9, no=0, source=self.OTHER_SN)
+        rows = self.client.get("/employees/9001/biometrics").json()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["type"], 9)
+        self.assertEqual(rows[0]["source_device_sn"], self.OTHER_SN)
+        self.assertEqual(rows[0]["tmp_bytes"], len(CAPTURED_FACE_TMP))
+        self.assertNotIn("tmp", rows[0])
+        self.assertNotIn(CAPTURED_FACE_TMP, str(rows))
+
+    def test_a_person_with_nothing_enrolled_lists_nothing(self):
+        self.assertEqual(self.client.get("/employees/9001/biometrics").json(), [])
+
+    def test_an_unknown_person_is_a_404(self):
+        self.assertEqual(self.client.get("/employees/nobody/biometrics").status_code, 404)
+
+
+# ---------------------------------------------------------------------------
 # 21. The SPA shell must not be cached over its own API path
 # ---------------------------------------------------------------------------
 

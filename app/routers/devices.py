@@ -873,20 +873,136 @@ def pull_templates(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
+def _queue_templates_to_device(sn, user_id, request, response, db, admin):
+    """The `acc` half of the template push: `DATA UPDATE BIODATA` on the outbox.
+
+    Everything here is queued, never delivered. The terminal collects one
+    command on each poll (about every ten seconds) and reports on it
+    afterwards, so a person with two templates and no user record on that door
+    yet is four commands and roughly forty seconds. COMMAND_BATCH_SIZE stays
+    at 1: no real terminal has ever been observed acknowledging even a single
+    command, let alone several in one reply, and this is the wrong payload to
+    find that out with.
+
+    Nothing that fails here fails silently:
+
+    * templates captured on *this* device are never sent back to it, and the
+      response names them,
+    * a template that cannot be expressed on the wire is refused rather than
+      trimmed to fit, and the response names it,
+    * a person with nothing captured is an error, not an empty success.
+    """
+    emp = db.query(Employee).filter_by(user_id=user_id).first()
+    if not emp:
+        # The user record has to be buildable before a template can be queued
+        # behind it — a template belongs to a Pin the terminal knows.
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    sendable, from_this_device = provisioning.templates_for_device(db, sn, user_id)
+
+    if not sendable and not from_this_device:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No biometric templates captured for this person. They must "
+                "enrol a face or finger at a terminal first — nothing was queued."
+            ),
+        )
+    if not sendable:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"All {len(from_this_device)} stored template(s) for this person "
+                f"were captured on {sn} itself. A template is never pushed back "
+                "to its own device — nothing was queued."
+            ),
+        )
+
+    bodies, unsendable = provisioning.template_commands(sendable)
+    if not bodies:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Stored template data cannot be put on the wire: "
+                + "; ".join(reason for _, reason in unsendable)
+                + " — nothing was queued."
+            ),
+        )
+
+    # The person first, unless this terminal has already confirmed it holds
+    # them. `device_employees` is written only on a real acknowledgement (E3),
+    # so its presence is evidence rather than optimism.
+    already_there = provisioning.is_on_device(db, sn, user_id)
+    rows = provisioning.push_templates(
+        db, sn, emp, bodies, with_user_record=not already_there,
+    )
+
+    audit.record(db, admin.username, "template_queue", target=f"{sn}/{user_id}",
+                 ip=client_ip(request),
+                 detail=f"templates={len(bodies)} user_record={not already_there}")
+
+    response.status_code = 202
+    seconds = len(rows) * 10
+    return {
+        "device_sn": sn,
+        "user_id": user_id,
+        "transport": "adms_queue",
+        "status": "queued",
+        "templates_queued": len(bodies),
+        "user_record_queued": not already_there,
+        "command_ids": [r.id for r in rows],
+        # The command *names* only. The bytes of a template are a biometric
+        # credential and there is no reason to hand them back out of the
+        # database to a browser to be logged, cached or screenshotted.
+        "commands": [r.command.split("\t")[0] for r in rows],
+        "skipped_from_this_device": [
+            {"type": t.type, "no": t.no} for t in from_this_device
+        ],
+        "skipped_unsendable": [
+            {"type": t.type, "no": t.no, "reason": reason}
+            for t, reason in unsendable
+        ],
+        "message": (
+            f"Queued {len(rows)} commands for {sn}: {len(bodies)} template(s)"
+            + (" behind the person's user record and door permission, which "
+               "this terminal has not confirmed yet" if not already_there else "")
+            + f". At one command per poll this takes roughly {seconds} seconds, "
+            "and nothing is delivered until the device collects it — this is "
+            "not delivered yet."
+        ),
+    }
+
+
 @router.post("/{sn}/users/{user_id}/templates/push")
 def push_templates_to_device(
     sn: str,
     user_id: str,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    """
-    Copy fingerprint templates stored in DB onto the device.
-    Typical workflow: pull from Device A, then push to Devices B, C, D.
-    The user must already exist on the target device (call /push first).
+    """Copy stored biometrics onto a device, so one enrolment works everywhere.
+
+    Same routing rule as every other write to a terminal, and for the same
+    reason (see `_uses_command_queue`): the transport is a function of
+    Device.protocol, never of what happens to be reachable.
+
+    * `acc` — `DATA UPDATE BIODATA` commands on the E7 outbox, built verbatim
+      from the templates E2 captured. **202, `status: "queued"`.**
+    * `att` — the SDK writes the device now over TCP 4370, from
+      `fingerprint_templates`. 200, and the count it wrote.
+
+    The two draw on different tables and that is not an oversight. A
+    `biometric_templates` row is base64 the ADMS upload handed us; a
+    `fingerprint_templates` row is a pyzk-packed blob from a TCP pull. Neither
+    is the other's format, so neither is offered on the other's wire.
     """
     device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        return _queue_templates_to_device(sn, user_id, request, response, db, admin)
+
     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
     if not de:
         raise HTTPException(status_code=404, detail="User not enrolled on this device — call /push first")

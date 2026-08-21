@@ -256,6 +256,41 @@ class FingerprintTemplateOut(BaseModel):
         from_attributes = True
 
 
+class BiometricTemplateOut(BaseModel):
+    """One captured biometric, described but not handed over.
+
+    `tmp` — the template itself — is deliberately **not** in this schema. It
+    is a biometric credential a few KB long; the server needs it to replay a
+    `DATA UPDATE BIODATA` command to another terminal, and a browser needs
+    only to know the template exists, where it came from and how big it is.
+    Its size is reported instead, which is enough for an operator to see that
+    something real is stored.
+
+    `type` is passed through as the number the device sent. The protocol
+    documents an enumeration (1 fingerprint, 9 visible-light face, and others)
+    but nothing in this application branches on it and this schema does not
+    start: it is data from the device, presented as data.
+    """
+
+    id: int
+    user_id: str
+    type: int
+    no: int
+    record_index: int
+    valid: int
+    duress: int
+    majorver: int
+    minorver: int
+    format: int
+    tmp_bytes: int
+    source_device_sn: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class EnrollRequest(BaseModel):
     finger_id: int = 0  # 0-9, which finger to enroll
 

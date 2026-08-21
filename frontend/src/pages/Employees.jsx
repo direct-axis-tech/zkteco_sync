@@ -211,6 +211,7 @@ function EmployeeForm({ employee, onDone, onCancel }) {
 function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   const [enrolledDevices, setEnrolledDevices] = useState(null)
   const [templates, setTemplates] = useState(null)
+  const [biometrics, setBiometrics] = useState(null)
   const [queued, setQueued] = useState([])
   const [refused, setRefused] = useState([])
   const [toast, setToast] = useState(null)
@@ -218,6 +219,10 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   // Push to device
   const [pushDeviceSn, setPushDeviceSn] = useState('')
   const [pushing, setPushing] = useState(false)
+
+  // Copy a captured biometric to another door
+  const [bioDeviceSn, setBioDeviceSn] = useState('')
+  const [pushingBio, setPushingBio] = useState(false)
 
   // Enroll
   const [enrollDeviceSn, setEnrollDeviceSn] = useState('')
@@ -234,8 +239,10 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     if (!employee) return
     setEnrolledDevices(null)
     setTemplates(null)
+    setBiometrics(null)
     api.employees.getDevices(employee.user_id).then(setEnrolledDevices).catch(() => setEnrolledDevices([]))
     api.employees.getTemplates(employee.user_id).then(setTemplates).catch(() => setTemplates([]))
+    api.employees.getBiometrics(employee.user_id).then(setBiometrics).catch(() => setBiometrics([]))
 
     // What is still owed to a device for this person. Only `acc` terminals
     // have an outbox — an SDK push is synchronous and has either happened or
@@ -291,6 +298,14 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   // button must not promise something synchronous.
   const pushIsQueued =
     allDevices.find((d) => d.serial_number === pushDeviceSn)?.protocol === 'acc'
+  // Same distinction for the biometric copy, plus the rule that decides which
+  // terminals are worth offering: a template is never sent back to the device
+  // that captured it, so a door that already holds every one of them has
+  // nothing to receive.
+  const bioIsQueued =
+    allDevices.find((d) => d.serial_number === bioDeviceSn)?.protocol === 'acc'
+  const sendableTo = (sn) =>
+    (biometrics || []).filter((t) => t.source_device_sn !== sn).length
 
   async function handlePushToDevice(e) {
     e.preventDefault()
@@ -330,15 +345,44 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     }
   }
 
+  // One function for both transports, because the endpoint routes on the
+  // device's protocol and the two outcomes are genuinely different: an SDK
+  // push has written the terminal by the time it returns, an access-control
+  // terminal has not even been told yet.
   async function handlePushTemplates(sn) {
     setBusyDevice((b) => ({ ...b, [sn]: 'templates' }))
     try {
       const res = await api.devices.pushTemplates(sn, employee.user_id)
-      showToast(`${res.templates_pushed} template(s) pushed to ${sn}`)
+      if (res?.status === 'queued') {
+        showToast(res.message || `Queued for ${sn} — not delivered yet`)
+      } else {
+        showToast(`${res.templates_pushed} template(s) written to ${sn}`)
+      }
+      reload()
     } catch (err) {
       showToast(err.message, 'error')
     } finally {
       setBusyDevice((b) => ({ ...b, [sn]: null }))
+    }
+  }
+
+  async function handlePushBiometrics(e) {
+    e.preventDefault()
+    if (!bioDeviceSn) return
+    setPushingBio(true)
+    try {
+      const res = await api.devices.pushTemplates(bioDeviceSn, employee.user_id)
+      if (res?.status === 'queued') {
+        showToast(res.message || `Queued for ${bioDeviceSn} — not delivered yet`)
+      } else {
+        showToast(`${res.templates_pushed} template(s) written to ${bioDeviceSn}`)
+      }
+      setBioDeviceSn('')
+      reload()
+    } catch (err) {
+      showToast(err.message, 'error')
+    } finally {
+      setPushingBio(false)
     }
   }
 
@@ -453,22 +497,36 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
         </Section>
       )}
 
-      {/* What the device refused. */}
+      {/* What the device refused — and what was withdrawn before it could
+          reach one. Both belong here: a biometric that never arrived is the
+          state the operator most needs to see, because the person will simply
+          be unrecognised at that door and nothing else will say so. */}
       {refused.length > 0 && (
-        <Section title="Refused by the device">
+        <Section title="Refused or not delivered">
           <div className="space-y-2">
             {refused.map((row) => {
               const deviceName =
                 allDevices.find((x) => x.serial_number === row.device_sn)?.name
               const isDoorPermission = row.command.startsWith('DATA UPDATE userauthorize')
+              const isBiometric = row.command.startsWith('DATA UPDATE BIODATA')
+              // No return code means nobody refused it: the server gave up on
+              // it, or withdrew it because what it depended on failed. Saying
+              // "the device refused this" would point the operator at the
+              // wrong end of the wire.
+              const withdrawn = row.return_code == null
               return (
                 <div key={row.id} className="bg-red-50 rounded-lg px-3 py-2.5 text-sm">
                   <p className="text-gray-800 font-medium truncate">
                     {deviceName || row.device_sn}
                   </p>
                   <p className="text-xs text-red-700 mt-1">
-                    {isDoorPermission
+                    {withdrawn
+                      ? row.last_error ||
+                        'Never delivered — the server gave up on this command.'
+                      : isDoorPermission
                       ? 'The door permission was refused. This person can be recognised by the terminal and will still not be let through.'
+                      : isBiometric
+                      ? 'The terminal refused this biometric. The person is not enrolled at this door and must enrol there in person, or be pushed again.'
                       : 'The device refused this command.'}
                     {row.return_code != null && ` (Return=${row.return_code})`}
                   </p>
@@ -564,6 +622,105 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                 at the terminal from then on.
               </p>
             )}
+          </>
+        )}
+      </Section>
+
+      {/* Biometrics captured at a terminal, and the control that copies one
+          to another door. This is the "enrol once, work everywhere" half of
+          the workflow: the person walked up to one terminal, registered a
+          face or a finger there, and the device uploaded it here. Sending it
+          onward is what saves them walking to every other door.
+
+          `type` is shown as the number the device sent. The protocol
+          documents an enumeration and 9 has been seen in the field for a
+          visible-light face, but nothing in this application branches on it,
+          so nothing here translates it either — it is the device's data,
+          presented as data. */}
+      <Section title="Captured Biometrics">
+        {biometrics === null ? (
+          <p className="text-sm text-gray-400">Loading…</p>
+        ) : biometrics.length === 0 ? (
+          <p className="text-sm text-gray-400">
+            Nothing captured yet. The person enrols a face or finger at a
+            terminal and the device uploads it here by itself.
+          </p>
+        ) : (
+          <>
+            <div className="space-y-2 mb-3">
+              {biometrics.map((t) => {
+                const sourceName = allDevices.find(
+                  (x) => x.serial_number === t.source_device_sn
+                )?.name
+                return (
+                  <div
+                    key={t.id}
+                    className="bg-gray-50 rounded-lg px-3 py-2.5 flex items-center gap-2 text-sm"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <p className="text-gray-800 font-medium">
+                        Type {t.type} · No {t.no}
+                      </p>
+                      <p className="text-xs text-gray-400 truncate">
+                        captured at {sourceName || t.source_device_sn} ·{' '}
+                        {t.tmp_bytes} bytes
+                      </p>
+                    </div>
+                    <span
+                      className={`text-xs px-1.5 py-0.5 rounded-full ${
+                        t.valid ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400'
+                      }`}
+                    >
+                      {t.valid ? 'Valid' : 'Invalid'}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+
+            {isAdmin && allDevices.length > 0 && (
+              <form onSubmit={handlePushBiometrics} className="flex gap-2">
+                <select
+                  value={bioDeviceSn}
+                  onChange={(e) => setBioDeviceSn(e.target.value)}
+                  className="input flex-1 min-w-0 text-sm"
+                >
+                  <option value="">Copy to another door…</option>
+                  {allDevices.map((d) => {
+                    const count = sendableTo(d.serial_number)
+                    return (
+                      <option
+                        key={d.serial_number}
+                        value={d.serial_number}
+                        disabled={count === 0}
+                      >
+                        {d.name || d.serial_number}
+                        {count === 0 ? ' — captured here' : ` — ${count}`}
+                      </option>
+                    )
+                  })}
+                </select>
+                <button
+                  type="submit"
+                  disabled={!bioDeviceSn || pushingBio}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  {pushingBio
+                    ? bioIsQueued
+                      ? 'Queueing…'
+                      : 'Pushing…'
+                    : bioIsQueued
+                    ? 'Queue for Device'
+                    : 'Push to Device'}
+                </button>
+              </form>
+            )}
+            <p className="text-xs text-gray-400 mt-2">
+              A template is never sent back to the terminal that captured it.
+              {bioIsQueued
+                ? ' This terminal is queued, not written: the person and each template are one command per poll, so a face plus a finger is roughly half a minute, and nothing is delivered until the device collects it.'
+                : ''}
+            </p>
           </>
         )}
       </Section>
