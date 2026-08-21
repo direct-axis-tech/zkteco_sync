@@ -49,7 +49,10 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import DeviceEmployee, Employee
+from app.models import (
+    BiometricTemplate, DeviceEmployee, Employee, EmployeePhoto,
+    FingerprintTemplate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -297,6 +300,71 @@ def apply_operator_edit(db: Session, emp: Employee, *,
 
     db.flush()
     return changed
+
+
+def delete_employee(db: Session, user_id: str):
+    """Remove one person from the system, per an operator's deliberate ask.
+
+    Returns a dict of cascade counts keyed by table name, or ``None`` if no
+    such employee exists.
+
+    **What goes, and why it is safe to cascade it**: ``device_employees``,
+    ``biometric_templates``, ``employee_photos``, ``fingerprint_templates``.
+    Every one of these keys on ``user_id`` and describes an enrolment or a
+    credential — it exists only because this person was on a device, and it
+    is meaningless once the person is gone.
+
+    **What stays, and why it must**: ``attendance_logs``. A punch is
+    historical fact, not a live fact about the person — it already happened,
+    it has already been pushed to the operator's HRM, and
+    ``hrm_integration.last_synced_id`` points into that same table. Deleting
+    attendance rows here would silently rewrite payroll history and
+    desynchronise the sync pointer from what the HRM actually holds. Nothing
+    in this function touches ``attendance_logs``, and nothing else in this
+    module may either — see the module docstring's "one writer" rule, which
+    this is the deletion half of.
+
+    **This function does not check whether the person is still enrolled
+    anywhere.** That is a *refusal*, not a cascade decision, and it belongs
+    to the caller (the router), which can name the doors in its error
+    message — something this module has no business knowing how to phrase.
+    Calling this while a `device_employees` link exists would delete the
+    server's only record of a credential a door still holds; it must not
+    happen, and the router's 409 is what prevents it.
+
+    Does not commit — the caller owns the transaction, like everything else
+    here.
+    """
+    user_id = str(user_id or "").strip()[:_USER_ID_LIMIT]
+    emp = db.query(Employee).filter_by(user_id=user_id).first() if user_id else None
+    if emp is None:
+        return None
+
+    # Order does not matter — none of these reference each other — but this
+    # is also every table this function is allowed to touch, so it doubles
+    # as documentation of the cascade if a reader greps only this function.
+    counts = {
+        "device_employees": (
+            db.query(DeviceEmployee).filter_by(user_id=user_id).delete()
+        ),
+        "biometric_templates": (
+            db.query(BiometricTemplate).filter_by(user_id=user_id).delete()
+        ),
+        "employee_photos": (
+            db.query(EmployeePhoto).filter_by(user_id=user_id).delete()
+        ),
+        "fingerprint_templates": (
+            db.query(FingerprintTemplate).filter_by(user_id=user_id).delete()
+        ),
+    }
+    db.delete(emp)
+    db.flush()
+    log.warning(
+        "employee %s deleted by an operator — cascaded %s; attendance_logs "
+        "left untouched",
+        user_id, counts,
+    )
+    return counts
 
 
 def record_device_user(

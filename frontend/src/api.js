@@ -83,6 +83,11 @@ export const api = {
     // matters here is `source_device_sn`, the one terminal each will never be
     // pushed back to.
     getBiometrics: (userId) => request('GET', `/employees/${userId}/biometrics`),
+    // Admin-only. Refused with 409 while any device still holds this pin —
+    // read the 409's `message` to the operator; it names the doors. On
+    // success, cascades device_employees/biometric_templates/employee_photos/
+    // fingerprint_templates and leaves attendance_logs untouched.
+    delete: (userId) => request('DELETE', `/employees/${userId}`),
     // A URL, not a fetch: this is meant for an <img src>, so the browser
     // requests and caches it the ordinary way. Deliberately never inlined
     // into the employee list response — that would be ~100KB per person.

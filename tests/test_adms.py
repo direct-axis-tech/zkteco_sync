@@ -48,6 +48,7 @@ from app import config                                         # noqa: E402
 from app.database import Base, get_db                          # noqa: E402
 from app.models import (                                       # noqa: E402
     AdmsPairing, AttendanceLog, BiometricTemplate, Device, DeviceEmployee, Employee,
+    EmployeePhoto, FingerprintTemplate,
 )
 from app.routers import adms                                   # noqa: E402
 from app.services import employee_sync                         # noqa: E402
@@ -6324,6 +6325,197 @@ class RevocationSingleWriterTests(RevocationTestCase):
         source = _inspect.getsource(provisioning)
         self.assertNotIn("db.add(DeviceEmployee(", source)
         self.assertIn("employee_sync.unlink_device_employee", source)
+
+
+# ---------------------------------------------------------------------------
+# 20d. Removing an employee from the system entirely (E14)
+#
+# Before this unit the only way to get rid of a test record or a departed
+# employee was SQL by hand. The two hazards this closes: an invisible
+# credential (deleting the server row while a door still holds the pin) and
+# a rewritten payroll history (deleting attendance, which is historical fact
+# already pushed to the operator's HRM).
+# ---------------------------------------------------------------------------
+
+class EmployeeDeletionTests(RevocationTestCase):
+    """DELETE /employees/{user_id} — cascade, refusal, and the audit trail."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+
+    def delete(self, user_id="9001"):
+        return self.client.delete(f"/employees/{user_id}")
+
+    def test_deleting_cascades_enrolment_rows_and_leaves_attendance_intact(self):
+        """The cascade is device_employees, biometric_templates,
+        employee_photos, fingerprint_templates. attendance_logs is never
+        touched — those rows are historical fact already pushed to the HRM."""
+        from app.models import AttendanceLog
+
+        db = self.Session()
+        try:
+            db.add(BiometricTemplate(
+                user_id="9001", type=9, no=0, record_index=0, valid=1,
+                duress=0, majorver=40, minorver=1, format=0,
+                tmp=CAPTURED_FACE_TMP, source_device_sn=self.OTHER_SN,
+            ))
+            db.add(EmployeePhoto(
+                user_id="9001", source="userpic", content="Zm9v",
+                source_device_sn=self.SN,
+            ))
+            db.add(FingerprintTemplate(
+                user_id="9001", finger_id=1, valid=1, template="0a0b",
+                source_device_sn=self.ATT_SN,
+            ))
+            db.add(AttendanceLog(
+                device_sn=self.SN, user_id="9001",
+                timestamp=datetime(2026, 1, 1, 8, 0, 0),
+                status=0, punch=1, source="adms_push",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.delete()
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "deleted")
+        self.assertEqual(body["cascaded"], {
+            "device_employees": 0,
+            "biometric_templates": 1,
+            "employee_photos": 1,
+            "fingerprint_templates": 1,
+        })
+        # The re-creation warning belongs in this response — the operator
+        # should not be surprised by it later.
+        self.assertIn("re-create", body["message"])
+
+        self.assertIsNone(self.employee("9001"))
+
+        db = self.Session()
+        try:
+            self.assertEqual(
+                db.query(BiometricTemplate).filter_by(user_id="9001").count(), 0)
+            self.assertEqual(
+                db.query(EmployeePhoto).filter_by(user_id="9001").count(), 0)
+            self.assertEqual(
+                db.query(FingerprintTemplate).filter_by(user_id="9001").count(), 0)
+            # Attendance survives, digits untouched.
+            rows = db.query(AttendanceLog).filter_by(user_id="9001").all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].device_sn, self.SN)
+        finally:
+            db.close()
+
+    def test_deletion_is_refused_while_a_device_link_exists_and_names_the_door(self):
+        self.link(self.SN)
+        response = self.delete()
+
+        self.assertEqual(response.status_code, 409, response.text)
+        detail = response.json()["detail"]
+        self.assertIn("9001", detail)
+        self.assertIn("Terminal", detail)  # Device.name set for self.SN
+
+        # Nothing was touched.
+        self.assertIsNotNone(self.employee("9001"))
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+    def test_deletion_is_refused_while_a_revocation_is_only_queued_not_acked(self):
+        """A queued-but-unacknowledged revocation must refuse exactly like an
+        untouched enrolment — device_employees is the fact, not the outbox."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()  # delivered, not yet acknowledged
+
+        response = self.delete()
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIsNotNone(self.employee("9001"))
+
+    def test_deletion_succeeds_once_the_device_has_acknowledged_the_revocation(self):
+        """The exact sequence the browser gate exercises: revoke, acknowledge
+        by hand, then delete."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")  # the user delete
+        self.assertEqual(self.links(self.SN), [])
+
+        response = self.delete()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(self.employee("9001"))
+
+    def test_deleting_a_nonexistent_employee_is_a_404(self):
+        self.assertEqual(self.delete("nobody").status_code, 404)
+
+    def test_deletion_is_admin_only(self):
+        from app.deps import require_admin, require_auth
+        from app.models import User
+
+        viewer = User(id=2, username="viewer", role="viewer", password_hash="x")
+        # Leave require_admin's real body in place; only swap what it depends
+        # on, so the 403 comes from the actual guard, not a re-implementation
+        # of it in the test.
+        self.client.app.dependency_overrides[require_auth] = lambda: viewer
+        del self.client.app.dependency_overrides[require_admin]
+        try:
+            response = self.delete()
+        finally:
+            self.client.app.dependency_overrides[require_admin] = lambda: viewer
+            from app.models import User as _User
+            admin = User(id=1, username="tester", role="admin", password_hash="x")
+            self.client.app.dependency_overrides[require_auth] = lambda: admin
+            self.client.app.dependency_overrides[require_admin] = lambda: admin
+
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIsNotNone(self.employee("9001"))
+
+    def test_deletion_is_audited_with_cascade_counts(self):
+        from app.models import AuditLog
+
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+
+        db = self.Session()
+        try:
+            db.add(EmployeePhoto(
+                user_id="9001", source="userpic", content="Zm9v",
+                source_device_sn=self.SN,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.delete()
+        self.assertEqual(response.status_code, 200, response.text)
+
+        db = self.Session()
+        try:
+            row = (
+                db.query(AuditLog)
+                .filter_by(action="employee_delete", target="9001")
+                .order_by(AuditLog.id.desc())
+                .first()
+            )
+        finally:
+            db.close()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row.actor, "tester")
+        self.assertIn("employee_photos=1", row.detail)
+        self.assertIn("attendance_logs kept", row.detail)
+
+    def test_deletion_goes_through_the_shared_writer(self):
+        """Structural, like E1/E3's guard: this fails if a second deleter of
+        `employees` is ever added outside employee_sync."""
+        import inspect as _inspect
+        from app.routers import employees as employees_router
+
+        source = _inspect.getsource(employees_router)
+        self.assertIn("employee_sync.delete_employee", source)
+        self.assertNotIn("db.delete(emp)", source)
 
 
 # ---------------------------------------------------------------------------

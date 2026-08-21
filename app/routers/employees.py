@@ -10,7 +10,7 @@ from app import audit
 from app.database import get_db
 from app.deps import require_admin, require_auth
 from app.models import (
-    BiometricTemplate, DeviceEmployee, Employee, EmployeePhoto,
+    BiometricTemplate, Device, DeviceEmployee, Employee, EmployeePhoto,
     FingerprintTemplate, User,
 )
 from app.net import client_ip
@@ -116,6 +116,97 @@ def update_employee(
         audit.record(db, admin.username, "employee_update", target=user_id,
                      ip=client_ip(request), detail=", ".join(sorted(changed)))
     return emp
+
+
+@router.delete("/{user_id}")
+def delete_employee(
+    user_id: str,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Remove a person from the system entirely. Admin-only, audited.
+
+    Before E14 the only way to do this was SQL by hand — every operator who
+    wanted a test record or a departed employee gone had to be handed a
+    one-off script. This is that workaround, made real and safe.
+
+    **Refused while any device still holds this person** (a `device_employees`
+    link exists for them, on any device). That link means a real door still
+    recognises this pin; deleting only the server row would leave that
+    credential live with no record of it anywhere — an invisible way in,
+    which is worse than the gap this endpoint closes. The error names every
+    door that still needs revoking first. `device_employees` is written only
+    on a confirmed device acknowledgement (E3/E8), so this check is never
+    fooled by a revocation that is merely queued — a still-outstanding
+    revocation leaves the link in place and this refuses exactly the same as
+    an untouched enrolment.
+
+    **What is cascaded, and what survives**: see
+    :func:`app.services.employee_sync.delete_employee`. In short — every
+    enrolment and credential record goes (`device_employees`,
+    `biometric_templates`, `employee_photos`, `fingerprint_templates`);
+    `attendance_logs` never does, because a punch is historical fact already
+    pushed to the operator's HRM.
+
+    **This is not necessarily final.** If a device that was never told about
+    this deletion still holds the pin locally (should not happen if the
+    refusal above did its job, but a device can also enrol a pin the server
+    has never heard of), a later sync will re-create the employee row from
+    what the terminal reports — that is E1/E9 doing exactly what they are
+    supposed to do, ingesting what the device actually has. The UI says so
+    up front so it does not read as a bug later.
+    """
+    emp = db.query(Employee).filter_by(user_id=user_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    links = db.query(DeviceEmployee).filter_by(user_id=user_id).all()
+    if links:
+        serials = sorted({link.device_sn for link in links})
+        devices = {
+            d.serial_number: d.name
+            for d in db.query(Device).filter(Device.serial_number.in_(serials)).all()
+        }
+        doors = [devices.get(sn) or sn for sn in serials]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{user_id} is still enrolled on {len(doors)} door"
+                f"{'s' if len(doors) != 1 else ''}: {', '.join(doors)}. "
+                "Revoke them from each door first, and wait for the device to "
+                "confirm the removal — deleting the record here while a door "
+                "still holds the credential would leave an invisible way in "
+                "with no record of it anywhere."
+            ),
+        )
+
+    cascaded = employee_sync.delete_employee(db, user_id)
+    db.commit()
+
+    audit.record(
+        db, admin.username, "employee_delete", target=user_id,
+        ip=client_ip(request),
+        detail=(
+            f"cascaded device_employees={cascaded['device_employees']} "
+            f"biometric_templates={cascaded['biometric_templates']} "
+            f"employee_photos={cascaded['employee_photos']} "
+            f"fingerprint_templates={cascaded['fingerprint_templates']}; "
+            "attendance_logs kept"
+        ),
+    )
+    return {
+        "user_id": user_id,
+        "status": "deleted",
+        "cascaded": cascaded,
+        "message": (
+            f"{user_id} removed from the system. Attendance history is kept "
+            "— those rows are historical fact and already reached the HRM. "
+            "If a device still holds this pin, a future sync will re-create "
+            "the employee record from what the terminal reports; that is "
+            "correct behaviour, not a bug."
+        ),
+    }
 
 
 @router.get("/{user_id}/devices", response_model=List[DeviceEmployeeOut])

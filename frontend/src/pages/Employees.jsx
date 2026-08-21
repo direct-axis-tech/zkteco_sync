@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import RevocationCard from '../components/RevocationCard'
+import DeleteEmployeeModal from '../components/DeleteEmployeeModal'
 
 const PRIVILEGE_LABELS = { 0: 'User', 2: 'Enroller', 14: 'Admin' }
 
@@ -258,7 +259,7 @@ function EmployeeForm({ employee, onDone, onCancel }) {
   )
 }
 
-function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
+function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
   const [enrolledDevices, setEnrolledDevices] = useState(null)
   const [templates, setTemplates] = useState(null)
   const [biometrics, setBiometrics] = useState(null)
@@ -266,6 +267,7 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   const [revocationGroups, setRevocationGroups] = useState([])
   const [refused, setRefused] = useState([])
   const [toast, setToast] = useState(null)
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
 
   // Push to device
   const [pushDeviceSn, setPushDeviceSn] = useState('')
@@ -508,6 +510,17 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     }
   }
 
+  // Refused (409) while any device_employees link exists — the server names
+  // the doors in its error, which the modal surfaces verbatim rather than
+  // paraphrasing. On success the employee is gone from this server; the
+  // parent removes it from the sidebar and clears the selection.
+  async function handleDeleteConfirmed() {
+    const res = await api.employees.delete(employee.user_id)
+    setShowDeleteModal(false)
+    showToast(res?.message || `${employee.user_id} deleted`)
+    onDeleted(employee.user_id)
+  }
+
   async function handleDeleteTemplate(fingerId) {
     // Needs a device the user is enrolled on to run the SDK delete — and
     // specifically an *attendance* one. The PUSH protocol has no confirmed
@@ -557,12 +570,20 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
         title="Profile"
         action={
           isAdmin && (
-            <button
-              onClick={() => onEdit(employee)}
-              className="text-xs text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 transition-colors"
-            >
-              Edit
-            </button>
+            <div className="flex gap-1">
+              <button
+                onClick={() => onEdit(employee)}
+                className="text-xs text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 transition-colors"
+              >
+                Edit
+              </button>
+              <button
+                onClick={() => setShowDeleteModal(true)}
+                className="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 transition-colors"
+              >
+                Delete
+              </button>
+            </div>
           )
         }
       >
@@ -1072,6 +1093,14 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
           onDismiss={() => setToast(null)}
         />
       )}
+
+      {showDeleteModal && (
+        <DeleteEmployeeModal
+          employee={employee}
+          onConfirm={handleDeleteConfirmed}
+          onClose={() => setShowDeleteModal(false)}
+        />
+      )}
     </div>
   )
 }
@@ -1095,6 +1124,16 @@ export default function Employees() {
     )
     setSelected(saved)
     setEditing(null)
+  }
+
+  function handleDeleted(userId) {
+    setEmployees((list) => list.filter((e) => e.user_id !== userId))
+    // Delayed rather than immediate: the confirmation toast lives inside
+    // DetailPanel, and clearing the selection right away would unmount it
+    // along with the panel before the operator can read it.
+    setTimeout(() => {
+      setSelected((sel) => (sel?.user_id === userId ? null : sel))
+    }, 2000)
   }
 
   useEffect(() => {
@@ -1183,6 +1222,7 @@ export default function Employees() {
           allDevices={allDevices}
           isAdmin={isAdmin}
           onEdit={setEditing}
+          onDeleted={handleDeleted}
         />
       )}
     </div>
