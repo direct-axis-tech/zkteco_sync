@@ -2868,22 +2868,41 @@ class CommandAcknowledgementTests(CommandDeliveryTestCase):
         self.assertIn("not outstanding", "\n".join(captured.output))
 
     def test_a_repeated_ack_does_not_write_a_second_history_row(self):
+        """Still exactly one history row — but no longer a WARNING.
+
+        This test used to assert a WARNING here, on the reasoning that an ack
+        for a command that is not outstanding is always odd. Hardware showed
+        it is not odd at all: a DATA QUERY is acknowledged twice as a matter
+        of course, so that WARNING fired on every successful command. It is an
+        INFO now, and the id is matched against history so a genuinely unknown
+        id can still be told apart and still warns (below). (E11)
+        """
         command_id = self.queue()
         self.poll()
         self.ack(command_id)
 
-        with self.assertLogs("app.services.commands", level="WARNING"):
+        with self.assertLogs("app.services.commands", level="INFO") as captured:
             self.ack(command_id)
 
         self.assertEqual(len(self.history()), 1)
         self.assertEqual(self.outbox(), [])
+        self.assertEqual(
+            [r for r in captured.records if r.levelname == "WARNING"], [],
+            "a second ack for a command we concluded is ordinary, not a warning",
+        )
+        self.assertIn("already", "\n".join(captured.output))
 
     # -- Return= semantics ---------------------------------------------------
 
-    def test_a_non_zero_return_fails_permanently_and_is_never_retried(self):
-        """A non-zero Return is the device REFUSING the command. It received
-        it, understood it and declined. Retrying earns the same refusal while
-        occupying the queue, so it is concluded immediately."""
+    def test_a_negative_return_fails_permanently_and_is_never_retried(self):
+        """A NEGATIVE Return is read as the device refusing the command.
+
+        Was `test_a_non_zero_return_fails_permanently_and_is_never_retried`,
+        and the rename is the point: non-zero is no longer the trigger, because
+        hardware returns positive codes on commands that succeed. A negative
+        code still ends the command immediately — retrying a refusal earns the
+        same refusal while occupying the queue. (E11)
+        """
         command_id = self.queue("DATA UPDATE user Pin=1")
         self.poll()
 
@@ -2898,18 +2917,41 @@ class CommandAcknowledgementTests(CommandDeliveryTestCase):
         self.assertIn("Return=-14", concluded[0].last_error)
         self.assertEqual(concluded[0].attempts, 1,
                          "a refusal must not consume the retry budget — it ends it")
-        self.assertIn("rejected", "\n".join(captured.output))
+        self.assertIn("refused", "\n".join(captured.output))
 
         # And there is nothing left to hand out on the next poll.
         self.assertEqual(self.poll(), "OK")
 
-    def test_a_positive_non_zero_return_is_a_refusal_too(self):
-        command_id = self.queue()
+    def test_a_positive_return_on_a_non_query_is_unconfirmed_not_refused(self):
+        """Was `test_a_positive_non_zero_return_is_a_refusal_too`.
+
+        That test encoded the assumption hardware disproved. A positive code is
+        not evidence of refusal — the only positive codes ever observed were
+        record counts on commands that worked — so the command is concluded
+        (the device answered; there is nothing to wait for) and the code is
+        recorded, but nothing calls it a refusal. (E11)
+        """
+        command_id = self.queue("DATA UPDATE user Pin=1")
         self.poll()
-        with self.assertLogs("app.services.commands", level="WARNING"):
-            self.ack(command_id, return_code=1)
-        self.assertEqual(self.history()[0].outcome, "failed")
-        self.assertEqual(self.history()[0].return_code, 1)
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            self.ack(command_id, return_code=1, cmd="DATA UPDATE")
+
+        row = self.history()[0]
+        self.assertEqual(row.outcome, "failed")
+        self.assertEqual(row.return_code, 1)
+        self.assertIn("cannot", row.last_error)
+        self.assertIn("not refused", row.last_error)
+
+        logged = "\n".join(captured.output)
+        self.assertIn("cannot interpret", logged)
+        self.assertNotIn("refused by", logged)
+
+        from app.services import commands as command_service
+        self.assertEqual(
+            command_service.history_verdict(
+                row.outcome, row.return_code, row.last_error, row.command),
+            "unconfirmed",
+        )
 
     def test_an_ack_with_no_return_code_leaves_the_command_outstanding(self):
         """Absence is not success. Nothing is concluded on a guess; the
@@ -3443,7 +3485,7 @@ class CommandVisibilityTests(CommandDeliveryTestCase):
                       for i in self.client.get(f"/devices/{self.SN}/commands/history").json()}
 
         self.assertEqual(by_command["DATA UPDATE user Pin=1"]["return_code"], -14)
-        self.assertIn("rejected", by_command["DATA UPDATE user Pin=1"]["last_error"])
+        self.assertIn("refused", by_command["DATA UPDATE user Pin=1"]["last_error"])
 
         self.assertIsNone(by_command["DATA UPDATE user Pin=2"]["return_code"])
         self.assertIn("no acknowledgement", by_command["DATA UPDATE user Pin=2"]["last_error"])
@@ -3718,6 +3760,10 @@ class CommandSchemaTests(unittest.TestCase):
         self.assertEqual(columns["device_command_log"], {
             "id", "device_sn", "command", "outcome", "attempts", "return_code",
             "last_error", "created_at", "sent_at", "concluded_at",
+            # E11: the outbox row this came from, so a late acknowledgement
+            # quoting that id is recognisable as a report on a command we
+            # already concluded rather than an id we never issued.
+            "outbox_id",
         })
 
     def test_the_old_enum_was_not_widened(self):
@@ -6859,3 +6905,408 @@ class QueryDataStorageFailureTests(QueryDataTestCase):
 
         self.assertEqual(response.text, "user=3")
         self.assertEqual(self.outbox(self.QSN), [])
+
+
+# ---------------------------------------------------------------------------
+# 21. What `Return=` actually means, from the hardware  (E11)
+# ---------------------------------------------------------------------------
+#
+# Every capture quoted here is from the operator's live BioFace A1
+# VGU6254600603 on 2026-08-21, and each one contradicted something this
+# codebase believed:
+#
+#   10:00:04  ID=1&Return=3&CMD=DATA QUERY    after 3 user records stored
+#   10:11     ID=2&Return=3&CMD=DATA QUERY    after 3 photos stored
+#   10:13-14  ID=3&Return=6, ID=4&Return=6    after 6 biodata records, twice
+#   10:18:55  ID=5&Return=0&CMD=DATA UPDATE   provisioning a user, succeeded
+#   10:18:56  ID=6&Return=0&CMD=DATA UPDATE   userauthorize, succeeded
+#
+# Read together: on a DATA QUERY, `Return` is the RECORD COUNT. On a
+# DATA UPDATE it is a status and 0 is success. One field, two meanings, chosen
+# by the verb — which is why "non-zero is a refusal" marked successful queries
+# as refused, and would have raised a false ACCESS NOT REVOKED had the same
+# code ever come back on a delete.
+
+
+class AckSemanticsFieldEvidenceTests(QueryDataTestCase):
+    """The captured acknowledgements, replayed byte for byte."""
+
+    # -- the wire shape ---------------------------------------------------
+
+    def test_the_captured_query_ack_body_parses_exactly(self):
+        """`ID=1&Return=3&CMD=DATA QUERY\n` — body-form, trailing newline."""
+        self.assertEqual(
+            adms._parse_devicecmd("ID=1&Return=3&CMD=DATA QUERY\n"),
+            [{"id": 1, "return_code": 3, "cmd": "DATA QUERY"}],
+        )
+
+    def test_the_captured_update_ack_body_parses_exactly(self):
+        self.assertEqual(
+            adms._parse_devicecmd("ID=5&Return=0&CMD=DATA UPDATE\n"),
+            [{"id": 5, "return_code": 0, "cmd": "DATA UPDATE"}],
+        )
+
+    def test_the_ack_is_read_despite_an_unexpected_content_type(self):
+        """The device sends `application/push;charset=UTF-8`.
+
+        The body is form-shaped but the Content-Type is not
+        `application/x-www-form-urlencoded`, so anything that keyed off the
+        header — a strict form parser, for instance — would reject a perfectly
+        good acknowledgement. This endpoint reads the raw body and does not
+        consult the header at all; this test is what keeps it that way.
+        """
+        command_id = self.queue("DATA UPDATE user Pin=4", sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        response = self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=0&CMD=DATA UPDATE\n",
+            headers={"Content-Type": "application/push;charset=UTF-8"},
+        )
+
+        self.assertEqual(response.text, "OK")
+        concluded = self.history(sn=self.QSN)
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "acknowledged")
+
+    # -- DATA QUERY: the number is a count --------------------------------
+
+    def test_a_query_return_is_a_record_count_not_a_status(self):
+        """3, 3, 6, 6 — every observed code equalled the records stored.
+
+        Under the old rule all four of these commands were refusals.
+        """
+        from app.services import commands as command_service
+
+        for code in (3, 6, 12):
+            self.assertEqual(
+                command_service.verdict_for(code, "DATA QUERY"),
+                command_service.SUCCESS,
+                f"Return={code} on a query is a record count, not a refusal",
+            )
+            self.assertEqual(
+                command_service.record_count(code, "DATA QUERY"), code)
+
+        # And the count reading does not leak onto other verbs.
+        self.assertIsNone(command_service.record_count(3, "DATA UPDATE"))
+        self.assertIsNone(command_service.record_count(3, "DATA DELETE user Pin=1"))
+
+    def test_a_query_that_matched_nothing_is_a_success_not_a_refusal(self):
+        """`Return=0` on a DATA QUERY means the query ran and matched nothing.
+
+        A real, correct answer — and the one value the old rule happened to get
+        right for entirely the wrong reason. It must reach the operator as an
+        empty result, never as a failure.
+        """
+        command_id = self.queue(command=QUERY_COMMAND, sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=0&CMD=DATA QUERY\n",
+        )
+
+        row = self.history(sn=self.QSN)[0]
+        self.assertEqual(row.outcome, "acknowledged")
+
+        from app.services import commands as command_service
+        self.assertEqual(
+            command_service.history_verdict(
+                row.outcome, row.return_code, row.last_error, row.command),
+            "acknowledged",
+        )
+        self.assertEqual(
+            command_service.history_detail(
+                row.outcome, row.return_code, row.command),
+            "no records matched",
+        )
+
+    def test_a_query_acknowledged_with_a_count_reports_that_count(self):
+        command_id = self.queue(command=QUERY_COMMAND, sn=self.QSN)
+        self.poll(sn=self.QSN)
+        self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=6&CMD=DATA QUERY\n",
+        )
+
+        response = self.client.get(f"/devices/{self.QSN}/commands/history")
+        self.assertEqual(response.status_code, 200, response.text)
+        row = response.json()[0]
+        self.assertEqual(row["verdict"], "acknowledged")
+        self.assertEqual(row["verdict_detail"], "6 records")
+
+    # -- DATA UPDATE: the number is a status ------------------------------
+
+    def test_a_data_update_returning_zero_is_success(self):
+        """cmdid 5 and 6 from the capture: provisioning, Return=0, succeeded."""
+        command_id = self.queue("DATA UPDATE user Pin=4\tName=Test", sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=0&CMD=DATA UPDATE\n",
+        )
+
+        row = self.history(sn=self.QSN)[0]
+        self.assertEqual(row.outcome, "acknowledged")
+        self.assertEqual(row.return_code, 0)
+
+    def test_a_positive_code_on_an_update_is_unconfirmed_not_refused(self):
+        """The branch that has no hardware evidence, and behaves accordingly.
+
+        No non-zero DATA UPDATE ack has ever been observed. A count-like code
+        on one is therefore genuinely unknown: it is concluded (the device
+        answered), the code is recorded, and it is claimed as NEITHER a success
+        nor a refusal. Critically, the provisioning link is not written — doing
+        so would assert the person is on the terminal, which is exactly the
+        false reassurance this unit exists to prevent.
+        """
+        from app.models import DeviceEmployee
+
+        command_id = self.queue("DATA UPDATE user Pin=4\tName=Test", sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=3&CMD=DATA UPDATE\n",
+        )
+
+        row = self.history(sn=self.QSN)[0]
+        self.assertEqual(row.outcome, "failed")
+        self.assertEqual(row.return_code, 3)
+        self.assertIn("not refused", row.last_error)
+
+        response = self.client.get(f"/devices/{self.QSN}/commands/history")
+        self.assertEqual(response.json()[0]["verdict"], "unconfirmed")
+
+        db = self.Session()
+        try:
+            self.assertEqual(
+                db.query(DeviceEmployee).filter_by(device_sn=self.QSN).count(), 0,
+                "an unreadable code must not be taken as proof of enrolment",
+            )
+        finally:
+            db.close()
+
+    def test_the_captured_delete_ack_concludes_a_revocation(self):
+        """cmdid 7 and 8 from the capture: a real revocation, Return=0.
+
+        The verb family this rule was inferring for until hardware answered.
+        `DATA DELETE` is a status like `DATA UPDATE`, not a count like
+        `DATA QUERY` — and a confirmed delete must NOT raise E8's alarm.
+        """
+        for command in ("DATA DELETE user Pin=4",
+                        "DATA DELETE userauthorize Pin=4"):
+            command_id = self.queue(command, sn=self.QSN)
+            self.poll(sn=self.QSN)
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content=f"ID={command_id}&Return=0&CMD=DATA DELETE\n",
+                headers={"Content-Type": "application/push;charset=UTF-8"},
+            )
+
+        rows = self.history(sn=self.QSN)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row.outcome, "acknowledged")
+            self.assertEqual(row.return_code, 0)
+            # 0 on a delete is a status, never a record count.
+            self.assertIsNone(
+                __import__("app.services.commands", fromlist=["x"])
+                .history_detail(row.outcome, row.return_code, row.command))
+
+    def test_a_confirmed_revocation_raises_no_alarm(self):
+        """The mirror of the alarm tests: silence when it really was revoked."""
+        command_id = self.queue("DATA DELETE user Pin=4", sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        with self.assertLogs("app.services.commands", level="INFO") as captured:
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content=f"ID={command_id}&Return=0&CMD=DATA DELETE\n",
+            )
+
+        self.assertNotIn("ACCESS NOT REVOKED", "\n".join(captured.output))
+        self.assertEqual(
+            [r for r in captured.records if r.levelname in ("WARNING", "ERROR")],
+            [], "a confirmed revocation is quiet")
+
+    # -- revocation: E8's alarm under the new rule ------------------------
+
+    def test_an_unconfirmed_revocation_still_raises_access_not_revoked(self):
+        """The alarm must fire on "we do not know", not only on "refused".
+
+        A missed alarm is worse than a spurious one on a door. What changes is
+        the wording: it may not say the terminal refused anything, because it
+        did not.
+        """
+        command_id = self.queue("DATA DELETE user Pin=4", sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        with self.assertLogs("app.services.commands", level="ERROR") as captured:
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content=f"ID={command_id}&Return=3&CMD=DATA DELETE\n",
+            )
+
+        alarm = "\n".join(captured.output)
+        self.assertIn("ACCESS NOT REVOKED", alarm)
+        self.assertIn("cannot read", alarm)
+        self.assertNotIn("refused it", alarm)
+
+    def test_a_refused_revocation_still_says_refused(self):
+        command_id = self.queue("DATA DELETE user Pin=4", sn=self.QSN)
+        self.poll(sn=self.QSN)
+
+        with self.assertLogs("app.services.commands", level="ERROR") as captured:
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content=f"ID={command_id}&Return=-14&CMD=DATA DELETE\n",
+            )
+
+        alarm = "\n".join(captured.output)
+        self.assertIn("ACCESS NOT REVOKED", alarm)
+        self.assertIn("refused it with Return=-14", alarm)
+        self.assertEqual(
+            self.client.get(f"/devices/{self.QSN}/commands/history")
+                .json()[0]["verdict"],
+            "refused",
+        )
+
+    # -- the double acknowledgement ---------------------------------------
+
+    def test_the_double_ack_sequence_from_the_capture_is_quiet(self):
+        """querydata concludes it; devicecmd arrives 0.2s later on nothing.
+
+        This is the exact sequence the terminal produces for every successful
+        query, and it used to log a WARNING every time. A warning that fires on
+        the normal path teaches an operator to stop reading warnings.
+        """
+        command_id = self.queue_query()
+
+        self.query_post(
+            body=("user uid=1\tpin=1\tname=Aisha\n"
+                  "user uid=2\tpin=2\tname=Bilal\n"
+                  "user uid=3\tpin=3\tname=Carim\n"),
+            cmdid=str(command_id), count=3,
+        )
+        self.assertEqual(len(self.history(sn=self.QSN)), 1)
+        first = self.history(sn=self.QSN)[0]
+        self.assertEqual(first.outcome, "acknowledged")
+
+        with self.assertLogs("app.services.commands", level="INFO") as captured:
+            response = self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content=f"ID={command_id}&Return=3&CMD=DATA QUERY\n",
+                headers={"Content-Type": "application/push;charset=UTF-8"},
+            )
+
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(
+            [r for r in captured.records if r.levelname == "WARNING"], [],
+            "the second ack for a query is the normal path — never a warning",
+        )
+        self.assertIn("already concluded", "\n".join(captured.output))
+
+        after = self.history(sn=self.QSN)
+        self.assertEqual(len(after), 1, "no second history row")
+        self.assertEqual(after[0].outcome, "acknowledged")
+        self.assertEqual(after[0].concluded_at, first.concluded_at,
+                         "the late ack must not re-decide a concluded command")
+        self.assertEqual(self.outbox(sn=self.QSN), [])
+
+    def test_the_querydata_conclusion_records_no_invented_return_code(self):
+        """There is no `Return=` on a querydata request, so none is stored.
+
+        A synthetic 0 used to be written here to mean "success". Now that a
+        query's `Return` is known to be a record count, storing 0 would claim
+        the query matched nothing — a false statement about a payload we just
+        parsed and stored.
+        """
+        command_id = self.queue_query()
+        self.query_post(body="user uid=1\tpin=1\tname=Aisha\n",
+                        cmdid=str(command_id), count=1)
+
+        row = self.history(sn=self.QSN)[0]
+        self.assertEqual(row.outcome, "acknowledged")
+        self.assertIsNone(row.return_code)
+
+    def test_an_ack_for_an_id_never_issued_still_warns(self):
+        """The quiet is scoped to commands we actually concluded.
+
+        A device quoting an id we have no record of is a real anomaly and keeps
+        its WARNING — that distinction is the whole reason the outbox id is
+        carried into history.
+        """
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content="ID=99999&Return=3&CMD=DATA QUERY\n",
+            )
+
+        logged = "\n".join(captured.output)
+        self.assertIn("not outstanding", logged)
+        self.assertIn("matches no command we concluded", logged)
+        self.assertEqual(self.history(sn=self.QSN), [])
+
+    def test_a_late_refusal_contradicting_a_success_is_surfaced(self):
+        """Both cannot be true, and the optimistic half is already recorded."""
+        command_id = self.queue("DATA UPDATE user Pin=4", sn=self.QSN)
+        self.poll(sn=self.QSN)
+        self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=0&CMD=DATA UPDATE\n",
+        )
+
+        with self.assertLogs("app.services.commands", level="WARNING") as captured:
+            self.client.post(
+                f"/iclock/devicecmd?SN={self.QSN}",
+                content=f"ID={command_id}&Return=-14&CMD=DATA UPDATE\n",
+            )
+
+        self.assertIn("contradicting", "\n".join(captured.output))
+        rows = self.history(sn=self.QSN)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, "acknowledged",
+                         "history is settled; a late ack does not rewrite it")
+
+    # -- what the operator is told ----------------------------------------
+
+    def test_retry_does_not_claim_a_refusal_it_cannot_evidence(self):
+        command_id = self.queue("DATA UPDATE user Pin=4", sn=self.QSN)
+        self.poll(sn=self.QSN)
+        self.client.post(
+            f"/iclock/devicecmd?SN={self.QSN}",
+            content=f"ID={command_id}&Return=3&CMD=DATA UPDATE\n",
+        )
+        log_id = self.history(sn=self.QSN)[0].id
+
+        response = self.client.post(
+            f"/devices/{self.QSN}/commands/history/{log_id}/retry")
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+
+        self.assertFalse(body["was_device_refusal"])
+        self.assertEqual(body["verdict"], "unconfirmed")
+        self.assertIn("cannot read", body["message"])
+        self.assertNotIn("refused", body["message"])
+
+    def test_the_history_api_labels_every_ending(self):
+        """One vocabulary, served by the server, for the drawer to render."""
+        from app.services import commands as command_service
+
+        cases = [
+            ("acknowledged", 0, None, "DATA UPDATE user Pin=1", "acknowledged"),
+            ("acknowledged", 3, None, "DATA QUERY tablename=user", "acknowledged"),
+            ("failed", -14, None, "DATA UPDATE user Pin=1", "refused"),
+            ("failed", 3, None, "DATA UPDATE user Pin=1", "unconfirmed"),
+            ("failed", None, "cancelled by tester", "DATA UPDATE user", "cancelled"),
+            ("failed", None, "no acknowledgement after 5 attempts",
+             "DATA UPDATE user", "abandoned"),
+        ]
+        for outcome, code, error, command, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    command_service.history_verdict(outcome, code, error, command),
+                    expected,
+                )

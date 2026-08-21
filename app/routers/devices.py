@@ -457,9 +457,11 @@ def list_outstanding_commands(sn: str, db: Session = Depends(get_db)):
 def list_concluded_commands(sn: str, limit: int = 100, db: Session = Depends(get_db)):
     """Commands that are over, most recent first — how each one ended.
 
-    ``outcome='failed'`` with a ``return_code`` is the device having refused
-    the command; ``failed`` with a null code and a ``last_error`` is us having
-    given up on it.
+    Each row carries a ``verdict`` — ``acknowledged``, ``refused``,
+    ``unconfirmed``, ``cancelled`` or ``abandoned``. Prefer it to reading
+    ``outcome`` and ``return_code``: a non-zero ``return_code`` is NOT the
+    same thing as a refusal (E11), and ``unconfirmed`` is the case that
+    distinction exists for.
     """
     _get_device_or_404(sn, db)
     return (
@@ -586,15 +588,42 @@ def retry_command(
             detail="Only a failed command can be retried; this one was acknowledged",
         )
 
-    was_refusal = log_row.return_code is not None
     return_code = log_row.return_code
+    # A refusal, specifically — not merely "a code came back". A code this
+    # system cannot read is not a refusal, and warning the operator that the
+    # device "will very likely refuse again" would be asserting something we
+    # do not know, about a command that may well have worked. (E11)
+    verdict = commands.history_verdict(
+        log_row.outcome, return_code, log_row.last_error, log_row.command,
+    )
+    was_refusal = verdict == "refused"
 
     new_row = commands.retry(db, log_row)
 
     audit.record(db, admin.username, "device_command_retry",
                  target=f"{sn}/{log_id}", ip=client_ip(request),
-                 detail=f"new_command_id={new_row.id} "
-                        f"return_code={return_code if was_refusal else 'none'}")
+                 detail=f"new_command_id={new_row.id} verdict={verdict} "
+                        f"return_code={return_code if return_code is not None else 'none'}")
+
+    if was_refusal:
+        message = (
+            f"Requeued. The device refused this with Return={return_code} "
+            "last time — unless something changed at the device, it will "
+            "very likely refuse again the same way."
+        )
+    elif verdict == "unconfirmed":
+        message = (
+            f"Requeued. The device answered Return={return_code} last time, "
+            "which this system cannot read as either success or refusal — so "
+            "it may already have worked. Sending it again is safe; it is not "
+            "a retry of a known failure."
+        )
+    else:
+        message = (
+            "Requeued as a new command. The previous attempt was never "
+            "acknowledged; this one starts its own delivery attempts from "
+            "zero."
+        )
 
     return {
         "id": new_row.id,
@@ -602,15 +631,8 @@ def retry_command(
         "command": new_row.command,
         "retried_from_log_id": log_id,
         "was_device_refusal": was_refusal,
-        "message": (
-            f"Requeued. The device refused this with Return={return_code} "
-            "last time — unless something changed at the device, it will "
-            "very likely refuse again the same way."
-            if was_refusal else
-            "Requeued as a new command. The previous attempt was never "
-            "acknowledged; this one starts its own delivery attempts from "
-            "zero."
-        ),
+        "verdict": verdict,
+        "message": message,
     }
 
 

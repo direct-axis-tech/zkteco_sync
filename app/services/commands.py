@@ -38,10 +38,11 @@ was actually handed to a device and never acknowledged.
 A device that is switched off all weekend must come back to its queue intact,
 not to a pile of failures it never had a chance to attempt.
 
-**A non-zero ``Return`` is a refusal, not a hiccup.** The device received the
-command, understood it, and declined it. Re-sending it earns the same answer
-while occupying the queue, so it is concluded ``failed`` immediately with the
-code recorded. Only silence is retried.
+**A ``Return`` code is read three ways, not two.** This module used to say
+"``0`` is success, anything else is a refusal". Hardware disproved the second
+half — see :func:`verdict_for`. A code we cannot read is now concluded, and
+recorded, without being called either a success or a refusal. Only silence is
+retried.
 """
 
 import logging
@@ -117,6 +118,180 @@ def backoff_for(attempts: int, command: str = None) -> timedelta:
 
 
 # ---------------------------------------------------------------------------
+# What a `Return=<code>` actually tells us  (E11)
+# ---------------------------------------------------------------------------
+
+SUCCESS = "success"          # the device did the thing
+REFUSAL = "refusal"          # the device would not do the thing
+UNREADABLE = "unreadable"    # the device said something we cannot interpret
+
+
+# `DATA QUERY` is the one command type whose acknowledgement we have actually
+# watched real hardware produce, and it turned out not to answer with a status
+# at all. Matched loosely on purpose: this has to recognise both the device's
+# own `CMD=DATA QUERY` field and the full command text we queued
+# (`DATA QUERY tablename=user,fielddesc=*,filter=*`).
+_DATA_QUERY = re.compile(r"^\s*DATA\s+QUERY\b", re.IGNORECASE)
+
+
+def is_query(command_name: str) -> bool:
+    """True for a ``DATA QUERY``, from either a ``CMD=`` field or a command."""
+    return bool(_DATA_QUERY.match(command_name or ""))
+
+
+def verdict_for(return_code, command_name: str = "") -> str:
+    """Read one ``Return=`` code. Returns SUCCESS, REFUSAL or UNREADABLE.
+
+    The single owner of that judgement. It needs ``command_name`` because
+    **``Return`` does not mean the same thing for every command**, which is the
+    finding this whole function exists to encode.
+
+    `DATA QUERY`: ``Return`` is a RECORD COUNT
+    ------------------------------------------
+    Field-confirmed on BioFace A1 ``VGU6254600603``, 2026-08-21, four completed
+    queries:
+
+        cmdid 1   user      3 records stored   ID=1&Return=3&CMD=DATA QUERY
+        cmdid 2   biophoto  3 photos stored    ID=2&Return=3&CMD=DATA QUERY
+        cmdid 3   biodata   6 records stored   ID=3&Return=6&CMD=DATA QUERY
+        cmdid 4   biodata   6 records stored   ID=4&Return=6&CMD=DATA QUERY
+
+    ``Return`` tracked the number of records the query produced, exactly,
+    across three tables and two distinct counts. It was never a status. ``3``
+    never meant "success" — it meant "three records", and the reason this
+    firmware has never sent ``Return=0`` is simply that no query has yet
+    matched nothing.
+
+    So for a query, **any count is a success, including zero**. ``Return=0``
+    means the query ran and matched no records — a real, correct, useful
+    answer, and the one value the old rule would have got right for entirely
+    the wrong reason. A *negative* value cannot be a count at all; there is no
+    evidence for what it would be, so it is read as a refusal, which is the
+    pessimistic direction.
+
+`DATA UPDATE`: ``Return`` is a status, and ``0`` is success
+    -----------------------------------------------------------
+    Also field-confirmed, same terminal, 2026-08-21 10:18:55–10:18:56, the
+    first provisioning ever acknowledged by this deployment's hardware:
+
+        cmdid 5   DATA UPDATE user Pin=4 …          ID=5&Return=0&CMD=DATA UPDATE
+        cmdid 6   DATA UPDATE userauthorize Pin=4   ID=6&Return=0&CMD=DATA UPDATE
+
+    Both succeeded, both answered ``0``, matching the vendor's own example in
+    push-protocol.md §3.8 (``ID=295&Return=0&CMD=DATA UPDATE``). So it is now
+    observation, not documentation.
+
+    Which settles the shape of the problem: **the same wire field carries a
+    record count for one verb and a status for another.** ``Return=0`` means
+    "matched nothing, successfully" on a query and "did it" on an update; the
+    two readings cannot be reconciled under a single rule, and that is exactly
+    why the old single rule had to be wrong about one of them.
+
+    ``0``              SUCCESS.     Observed, and documented.
+    negative           REFUSAL.     Inference; see below.
+    any other non-zero UNREADABLE.  Never observed on an update. Not claimed.
+
+    No non-zero ``DATA UPDATE`` acknowledgement has been seen, so a positive
+    code on one is still genuinely unknown — it could be a status this firmware
+    uses for a partial result, or a count after all. It is concluded, recorded
+    and surfaced, and it is claimed as neither success nor refusal. That is the
+    safe way to be wrong: a missed alarm is worse than a spurious one on a
+    door, so an unconfirmed revocation still shouts.
+
+    The negative branch is an inference — that vendor error codes are negative,
+    which this codebase has assumed since E7 (``Return=-14``) and which our
+    documents do not attest either way. It is kept because it is the pessimistic
+    direction (it never turns a failure into a success) and because withdrawing
+    it would silently disable behaviour E4, E8 and E10 built on refusals.
+
+    ``DATA DELETE``: status, and ``0`` is success — also confirmed
+    --------------------------------------------------------------
+    Same terminal, 2026-08-21 10:23:25–10:23:26, a real revocation of a real
+    person from a real door:
+
+        cmdid 7   DATA DELETE user Pin=4          ID=7&Return=0&CMD=DATA DELETE
+        cmdid 8   DATA DELETE userauthorize Pin=4 ID=8&Return=0&CMD=DATA DELETE
+
+    Both succeeded, both answered ``0``, and E8's link-drop and
+    "revoked and confirmed at the door" both fired correctly. This was an
+    inference from the verb family until that capture; it is now observation.
+
+    Which means **every command family this codebase actually emits is now
+    evidenced**: query, update, delete. The UNREADABLE branch is no longer a
+    standing fallback for anything we routinely send — it is reserved for what
+    remains genuinely unobserved: a non-zero code on an update or a delete
+    (never seen), and any other verb (``DATA COUNT``, or whatever an operator
+    types by hand into the command box).
+
+    That reservation still matters, and it points at the door. If a terminal
+    ever answers a ``DATA DELETE`` with a count-like number, this rule reads it
+    as UNREADABLE, the revocation is concluded unconfirmed, and ACCESS NOT
+    REVOKED fires. Spurious, and the right way round.
+    """
+    if return_code is None:
+        return UNREADABLE
+
+    if is_query(command_name):
+        return SUCCESS if return_code >= 0 else REFUSAL
+
+    if return_code == 0:
+        return SUCCESS
+    if return_code < 0:
+        return REFUSAL
+    return UNREADABLE
+
+
+def record_count(return_code, command_name: str = ""):
+    """The number of records a ``DATA QUERY`` reported, or ``None``.
+
+    Only meaningful for a query, where ``Return`` *is* the count (see
+    :func:`verdict_for`). For anything else the number is a status of some
+    kind and calling it a count would be an invention.
+    """
+    if return_code is None or not is_query(command_name) or return_code < 0:
+        return None
+    return return_code
+
+
+# How a concluded command should be *described* — one owner for the wording the
+# API and the UI both use, so a history row cannot be labelled a refusal in one
+# place and something else in the other.
+def history_verdict(outcome: str, return_code=None, last_error: str = None,
+                    command: str = "") -> str:
+    """``acknowledged`` | ``refused`` | ``unconfirmed`` | ``cancelled`` | ``abandoned``."""
+    if outcome == "acknowledged":
+        return "acknowledged"
+    if return_code is not None:
+        verdict = verdict_for(return_code, command)
+        if verdict == REFUSAL:
+            return "refused"
+        # A SUCCESS code on a row concluded `failed` cannot happen through
+        # acknowledge(), but history is long-lived and the honest label for a
+        # code we are not calling a refusal is "unconfirmed", never "refused".
+        return "unconfirmed"
+    if (last_error or "").startswith("cancelled by"):
+        return "cancelled"
+    return "abandoned"
+
+
+def history_detail(outcome: str, return_code=None, command: str = ""):
+    """The extra clause a history label carries, or ``None``.
+
+    Exists so an operator reading E10's history sees what the device actually
+    told us. For a query that is a record count — and "no records matched" is
+    a real operational answer worth showing, not an absence.
+    """
+    if outcome != "acknowledged":
+        return None
+    count = record_count(return_code, command)
+    if count is None:
+        return None
+    return "no records matched" if count == 0 else (
+        f"{count} record{'s' if count != 1 else ''}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Queueing
 # ---------------------------------------------------------------------------
 
@@ -175,6 +350,12 @@ def conclude(
         sent_at=row.sent_at,
     )
     row_id = row.id
+    # The outbox id travels into history with the row (E11). Without it a
+    # later acknowledgement quoting that id is indistinguishable from an id we
+    # never issued, and the only honest thing to say about either is a
+    # WARNING — which is how a device's perfectly normal second ack for a
+    # DATA QUERY came to log one on every successful command.
+    snapshot["outbox_id"] = row_id
 
     deleted = (
         db.query(DeviceCommandOutbox)
@@ -200,11 +381,23 @@ def conclude(
     # Said at ERROR, naming the door and the person's Pin, because this is the
     # line somebody reads at 2am asking "can they still get in".
     if outcome == "failed" and is_revocation(snapshot["command"]):
+        # Deliberately fires for an UNREADABLE code too, and says so precisely.
+        # "The device answered with something we cannot read" is not evidence
+        # the door was closed, and an unconfirmed revocation is exactly what
+        # this line exists to shout about.
+        if return_code is None:
+            reason = last_error or "no acknowledgement"
+        elif verdict_for(return_code, snapshot["command"]) == REFUSAL:
+            reason = f"refused it with Return={return_code}"
+        else:
+            reason = (
+                f"answered Return={return_code}, which this system cannot read "
+                "as either success or refusal"
+            )
         log.error(
             "ACCESS NOT REVOKED: %s never confirmed %r (%s). That person may "
             "still be able to open this door — check the terminal directly.",
-            snapshot["device_sn"], snapshot["command"][:120],
-            f"Return={return_code}" if return_code is not None else (last_error or "no acknowledgement"),
+            snapshot["device_sn"], snapshot["command"][:120], reason,
         )
     return True
 
@@ -352,26 +545,40 @@ def acknowledge(
     return_code: int,
     command_name: str = "",
     source: str = "devicecmd",
+    known_verdict: str = None,
 ) -> str:
     """Record what the device reported about one specific command.
 
-    ``Return=0`` concludes it acknowledged. Any other code is the device
-    *refusing* the command — concluded failed immediately, with the code kept,
-    because retrying a refusal only earns the same refusal more slowly.
+    The verdict on ``return_code`` belongs to :func:`verdict_for`, which is
+    three-way — success, refusal, or *unreadable* — and carries the evidence
+    for each branch. Read it before changing anything here.
 
-    Returns a short word describing what happened, for the caller's log:
-    ``acknowledged``, ``rejected``, ``unknown`` or ``duplicate``. Never raises
-    and never refuses the request — a device that cannot deliver its ack will
-    keep retrying the whole command, which is worse than a lost outcome.
+    Returns one word, which is both the caller's log line and the caller's
+    permission to act:
+
+    ``acknowledged``  the device confirmed it. Act on success.
+    ``rejected``      the device refused it. Act on failure.
+    ``unconfirmed``   the device answered with a code we cannot read. Concluded
+                      — the device has replied, so there is nothing to wait for
+                      — but act on **neither** outcome. This is the branch that
+                      exists so a successful command is never called a refusal
+                      and a refused one is never called a success.
+    ``informational`` an acknowledgement for a command already concluded. The
+                      outcome was decided by better evidence; nothing changes.
+    ``unknown``       an id never issued to this serial. Nothing touched.
+    ``duplicate``     lost the race to conclude; another ack got there first.
+
+    Never raises and never refuses the request — a device that cannot deliver
+    its ack will keep retrying the whole command, which is worse than a lost
+    outcome.
 
     ``source`` names the endpoint the report arrived on, for the log only.
-    There are two: ``/iclock/devicecmd`` for an ordinary command, and
-    ``/iclock/querydata`` for a ``DATA QUERY``, which a device answers by
-    uploading the data and quoting ``cmdid`` instead of ever calling devicecmd
-    (E9). Both conclude a command the same way and must keep doing so — one
-    definition of "concluded", one atomic move — but "devicecmd reported ID=1"
-    in a log line about a querydata upload would send the next person reading
-    it to the wrong endpoint.
+    There are two, and a ``DATA QUERY`` uses **both** (E11, field-confirmed):
+    ``/iclock/querydata`` carries the payload and arrives first, then
+    ``/iclock/devicecmd`` follows about half a second later with a code. E9
+    read §3.13 as saying querydata was the only ack for a query; hardware says
+    it is the first of two. The second one lands here on an already-concluded
+    command, which is ordinary and expected, and is reported as such.
     """
     row = (
         db.query(DeviceCommandOutbox)
@@ -383,36 +590,141 @@ def acknowledge(
     )
 
     if row is None:
-        # Either already concluded (the device re-sent an ack, or acked after
-        # we gave up) or an id we never issued to this serial. Both are worth
-        # saying out loud, and neither is worth touching another command over
-        # — acknowledging whatever happened to be nearby is the bug this
+        # Nothing outstanding under that id. Two very different situations,
+        # and telling them apart is the whole point of this branch — see
+        # _report_on_concluded. Neither one touches another command:
+        # acknowledging whatever happened to be nearby is the bug this
         # function exists to fix.
-        log.warning(
-            "%s from %s reported ID=%s Return=%s CMD=%r, which is not "
-            "outstanding for that serial — no other command was touched",
-            source, device_sn, command_id, return_code, command_name,
+        return _report_on_concluded(
+            db, device_sn, command_id, return_code, command_name, source,
         )
-        return "unknown"
 
-    if return_code == 0:
-        moved = conclude(db, row, "acknowledged", return_code=0)
+    # `known_verdict` is for a caller holding better evidence than any code.
+    # /iclock/querydata is the only one: the device answers a DATA QUERY by
+    # uploading the data, and the arrival of the payload is the proof — there
+    # is no `Return=` field on that request to read. It passes SUCCESS and a
+    # null code rather than a synthetic zero, because now that `Return` on a
+    # query is known to be a record count, storing 0 there would claim the
+    # query matched nothing, which for a payload we just parsed is false.
+    verdict = known_verdict or verdict_for(return_code, command_name)
+
+    if verdict == SUCCESS:
+        moved = conclude(db, row, "acknowledged", return_code=return_code)
         if moved:
             log.info("command %s acknowledged by %s", command_id, device_sn)
         return "acknowledged" if moved else "duplicate"
 
+    if verdict == REFUSAL:
+        moved = conclude(
+            db, row, "failed",
+            return_code=return_code,
+            last_error=f"device refused the command with Return={return_code}",
+        )
+        if moved:
+            log.warning(
+                "command %s refused by %s with Return=%s (%r) — not retried, a "
+                "refusal is permanent",
+                command_id, device_sn, return_code, command_name,
+            )
+        return "rejected" if moved else "duplicate"
+
+    # UNREADABLE. The device answered, so the command is over — re-sending it
+    # has no reason to earn a different answer, and leaving it outstanding
+    # would eventually record "no acknowledgement", which is simply false.
+    # It is concluded `failed` because `failed` is this ledger's word for "not
+    # confirmed done", and because that is the direction that keeps a
+    # revocation shouting. What it is NOT is a refusal, and nothing downstream
+    # is told it was one.
     moved = conclude(
         db, row, "failed",
         return_code=return_code,
-        last_error=f"device rejected the command with Return={return_code}",
+        last_error=(
+            f"device answered Return={return_code}, which this system cannot "
+            f"read as success or refusal — treated as unconfirmed, not refused"
+        ),
     )
     if moved:
         log.warning(
-            "command %s rejected by %s with Return=%s (%r) — not retried, a "
-            "refusal is permanent",
-            command_id, device_sn, return_code, command_name,
+            "command %s: %s answered Return=%s (%r), a code this system cannot "
+            "interpret. NOT recorded as a refusal and NOT recorded as a "
+            "success — the command is concluded unconfirmed. If you can see at "
+            "the terminal whether this actually worked, that observation is "
+            "what settles what Return=%s means.",
+            command_id, device_sn, return_code, command_name, return_code,
         )
-    return "rejected" if moved else "duplicate"
+    return "unconfirmed" if moved else "duplicate"
+
+
+def _report_on_concluded(
+    db: Session,
+    device_sn: str,
+    command_id: int,
+    return_code,
+    command_name: str,
+    source: str,
+) -> str:
+    """An acknowledgement arrived for a command that is not outstanding.
+
+    Two cases, and they deserve very different volumes:
+
+    * **We concluded it already.** The ordinary case for a ``DATA QUERY``,
+      whose second acknowledgement always lands here (E11), and for a device
+      re-sending an ack it thinks we missed. The outcome was decided by better
+      evidence — the payload itself, for a query — so this changes nothing and
+      is said at INFO. A WARNING here fires on every single successful query,
+      and a warning that fires on the normal path teaches an operator to stop
+      reading warnings, which is expensive in a codebase that uses WARNING for
+      things that genuinely matter.
+
+    * **We never issued that id to this serial.** Still a WARNING: it means a
+      device is quoting an id we have no record of, and that is worth a look.
+
+    Told apart by ``device_command_log.outbox_id``. A history row written
+    before that column existed has none, so an ack for one of those falls
+    through to the WARNING — rare, self-correcting, and better than guessing.
+    """
+    prior = (
+        db.query(DeviceCommandLog)
+        .filter(
+            DeviceCommandLog.outbox_id == command_id,
+            DeviceCommandLog.device_sn == device_sn,
+        )
+        .order_by(DeviceCommandLog.id.desc())
+        .first()
+    )
+
+    if prior is None:
+        log.warning(
+            "%s from %s reported ID=%s Return=%s CMD=%r, which is not "
+            "outstanding for that serial and matches no command we concluded "
+            "— no other command was touched",
+            source, device_sn, command_id, return_code, command_name,
+        )
+        return "unknown"
+
+    # One exception to the quiet: the device is reporting a refusal for
+    # something we already wrote down as done. Both cannot be true, and the
+    # optimistic half is the one already recorded, so say so — without
+    # rewriting history, which conclude() owns and which is settled.
+    if (prior.outcome == "acknowledged"
+            and verdict_for(return_code, command_name) == REFUSAL):
+        log.warning(
+            "%s from %s reported ID=%s Return=%s CMD=%r, but that command was "
+            "already concluded ACKNOWLEDGED at %s. The device is contradicting "
+            "the evidence we concluded on — history is left as it stands, but "
+            "this one is worth checking at the terminal.",
+            source, device_sn, command_id, return_code, command_name,
+            prior.concluded_at,
+        )
+        return "informational"
+
+    log.info(
+        "%s from %s reported ID=%s Return=%s CMD=%r for a command already "
+        "concluded %s at %s — recorded, nothing re-decided",
+        source, device_sn, command_id, return_code, command_name,
+        prior.outcome, prior.concluded_at,
+    )
+    return "informational"
 
 
 # ---------------------------------------------------------------------------

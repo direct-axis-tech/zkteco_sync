@@ -68,16 +68,49 @@ function Pill({ tone = 'gray', children }) {
 // (return_code null, no cancellation). Read off the row, never inferred from
 // the outbox being empty — an empty outbox means "concluded", not "succeeded"
 // (E8's browser gate caught exactly that confusion).
+// How a concluded command is labelled. The judgement itself is the server's
+// (`row.verdict`, from commands.history_verdict) so that this panel cannot call
+// something a refusal that the server does not — the fallback below is only for
+// a server too old to send one.
+//
+// `Unconfirmed` is not a softer word for refused. It means the device answered
+// with a code this system cannot read, on firmware that has returned exactly
+// such a code on commands that demonstrably WORKED. Saying "Refused — code 3"
+// there would be a wrong verdict on a door command, which is the whole reason
+// this distinction exists (E11).
 function historyOutcome(row) {
-  if (row.outcome === 'acknowledged') {
-    return { label: 'Acknowledged', tone: 'green' }
+  const verdict =
+    row.verdict ||
+    (row.outcome === 'acknowledged'
+      ? 'acknowledged'
+      : row.return_code != null
+      ? row.return_code < 0
+        ? 'refused'
+        : 'unconfirmed'
+      : (row.last_error || '').startsWith('cancelled by')
+      ? 'cancelled'
+      : 'abandoned')
+
+  if (verdict === 'acknowledged') {
+    // `verdict_detail` is the server's plain-language reading of the device's
+    // number — for a DATA QUERY that is a record count, and "no records
+    // matched" is a real answer to a real query, not an absence. Showing it is
+    // the difference between an operator seeing that a query ran and returned
+    // nothing, and them seeing a bare "Acknowledged" and assuming data arrived.
+    return {
+      label: row.verdict_detail
+        ? `Acknowledged — ${row.verdict_detail}`
+        : 'Acknowledged',
+      tone: 'green',
+    }
   }
-  if (row.return_code != null) {
+  if (verdict === 'refused') {
     return { label: `Refused — code ${row.return_code}`, tone: 'red' }
   }
-  if ((row.last_error || '').startsWith('cancelled by')) {
-    return { label: 'Cancelled', tone: 'gray' }
+  if (verdict === 'unconfirmed') {
+    return { label: `Unconfirmed — code ${row.return_code}`, tone: 'amber' }
   }
+  if (verdict === 'cancelled') return { label: 'Cancelled', tone: 'gray' }
   return { label: 'Gave up — no reply', tone: 'amber' }
 }
 
@@ -423,9 +456,9 @@ export default function CommandsDrawer({ device, onClose, showToast, onChange })
                   {canRetry && (
                     confirmRetryId === row.id ? (
                       <div className="mt-2 text-xs bg-amber-50 border border-amber-200 rounded px-2 py-1.5 text-amber-800">
-                        The device refused this with Return={row.return_code} — unless
-                        something changed at the device it will very likely refuse
-                        again, unchanged.
+                        {outcome.label.startsWith('Refused')
+                          ? `The device refused this with Return=${row.return_code} — unless something changed at the device it will very likely refuse again, unchanged.`
+                          : `The device answered Return=${row.return_code} last time, which this system cannot read as either success or refusal — so this command may already have worked. Sending it again is safe, but it is not a retry of a known failure.`}
                         <div className="flex gap-3 mt-1.5">
                           <button
                             onClick={() => doRetry(row)}

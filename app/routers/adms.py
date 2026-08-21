@@ -1267,6 +1267,14 @@ async def adms_devicecmd(
 
         outcome = commands.acknowledge(db, SN, ack["id"], ack["return_code"], ack["cmd"])
 
+        # Note what has no branch here: "unconfirmed". A code this system
+        # cannot read earns NEITHER the success follow-on below NOR the
+        # failure follow-on after it. Writing the device_employees link would
+        # claim the person is on the terminal; dropping it would claim they
+        # are off it; withdrawing their templates would claim the user record
+        # was refused. We know none of those things, so we do none of them —
+        # the command is concluded, the code is recorded, and the history row
+        # says plainly that it is unconfirmed. (E11)
         if outcome == "acknowledged":
             # A confirmed `DATA UPDATE user` is the one moment the ADMS
             # transport learns that a person really is on this terminal, so it
@@ -1513,10 +1521,23 @@ def _conclude_query(db: Session, sn: str, cmdid: str) -> None:
         )
         return
 
-    # Return=0: the device did what it was asked and this payload is the
-    # proof. There is no Return field on a querydata request to read it from —
+    # The payload is the proof: the device did what it was asked, and this
+    # request carries the answer. That is better evidence than any code, which
+    # is why the SECOND acknowledgement this same command will get on
+    # /iclock/devicecmd about a fifth of a second from now (E11,
+    # field-confirmed) is allowed to land on an already-concluded command and
+    # change nothing at all.
+    #
+    # No return code is recorded, because the device sent none here. A
+    # synthetic 0 would now be a false statement rather than a harmless one:
+    # `Return` on a DATA QUERY is the record count, so 0 means "matched
+    # nothing" — which is exactly what this payload proves did not happen.
+    # There is no Return field on a querydata request to read it from —
     # answering the query at all *is* the success report.
-    commands.acknowledge(db, sn, int(cmdid), 0, "DATA QUERY", source="querydata")
+    commands.acknowledge(
+        db, sn, int(cmdid), None, "DATA QUERY", source="querydata",
+        known_verdict=commands.SUCCESS,
+    )
 
 
 def _querydata_ack(tablename: str, count: str) -> str:

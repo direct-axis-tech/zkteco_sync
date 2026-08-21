@@ -770,6 +770,13 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
               // reason the server recorded rather than lumped in.
               const cancelled = /cancelled by /.test(row.last_error || '')
               const failedRevocation = isUserDelete && !cancelled
+              // The device answered with a code this system cannot read (E11).
+              // It is NOT a refusal — this firmware has returned such a code on
+              // commands that demonstrably worked — so nothing below may say the
+              // terminal refused anything. It is equally not a success, which is
+              // why an unconfirmed revocation still shows as ACCESS NOT REVOKED:
+              // we did not confirm it, and that is precisely what that says.
+              const unconfirmed = row.verdict === 'unconfirmed'
               return (
                 <div
                   key={row.id}
@@ -785,6 +792,11 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                       ? 'ACCESS NOT REVOKED. This terminal never confirmed the ' +
                         'removal, so this person may still be able to open this ' +
                         'door. Check the device directly. ' +
+                        (unconfirmed
+                          ? 'The terminal did answer, with a code this system ' +
+                            'cannot read — that is not a refusal and not a ' +
+                            'confirmation. '
+                          : '') +
                         (row.last_error || '')
                       : isAuthorizeDelete && !cancelled
                       ? 'The terminal did not remove the door permission record. ' +
@@ -794,6 +806,11 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                       : withdrawn
                       ? row.last_error ||
                         'Never delivered — the server gave up on this command.'
+                      : unconfirmed
+                      ? 'The terminal answered with a code this system cannot ' +
+                        'read, so this was neither confirmed nor refused — it ' +
+                        'may have worked. Check the device before assuming ' +
+                        'either way, or send it again.'
                       : isDoorPermission
                       ? 'The door permission was refused. This person can be recognised by the terminal and will still not be let through.'
                       : isBiometric

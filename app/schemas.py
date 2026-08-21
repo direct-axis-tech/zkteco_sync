@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, computed_field, field_serializer
 from datetime import datetime
 from typing import Literal, Optional, List
 
@@ -179,8 +179,10 @@ class CommandOut(BaseModel):
 class CommandLogOut(BaseModel):
     """One concluded command — a row of device_command_log.
 
-    ``outcome='failed'`` with a ``return_code`` means the device refused it;
-    with no code, it means we gave up (``last_error`` says why).
+    Read ``verdict``, not ``outcome`` + ``return_code``, when the question is
+    "how did this end". ``outcome`` only has two values and cannot express the
+    case that matters most: the device answered with a code this system cannot
+    interpret. See ``verdict`` below.
     """
 
     id: int
@@ -193,6 +195,41 @@ class CommandLogOut(BaseModel):
     created_at: datetime
     sent_at: Optional[datetime] = None
     concluded_at: datetime
+
+    @computed_field
+    @property
+    def verdict(self) -> str:
+        """How this ended, in one word — the API's and the UI's shared answer.
+
+        ``acknowledged`` the device confirmed it.
+        ``refused``      the device refused it.
+        ``unconfirmed``  the device answered with a code we cannot read. NOT a
+                         refusal and NOT a success; it may have worked.
+        ``cancelled``    an operator withdrew it.
+        ``abandoned``    no acknowledgement ever arrived; we gave up.
+
+        Derived server-side, from commands.history_verdict, so the UI cannot
+        drift into calling something a refusal that the server does not. (E11)
+        """
+        from app.services import commands
+        return commands.history_verdict(
+            self.outcome, self.return_code, self.last_error, self.command,
+        )
+
+    @computed_field
+    @property
+    def verdict_detail(self) -> Optional[str]:
+        """What the device's number actually said, when it said anything.
+
+        For a ``DATA QUERY`` the ``Return`` code is a record count, not a
+        status (E11, field-confirmed), so this is where that count is shown —
+        including "no records matched", which is a real answer to a real query
+        and must not read as a failure.
+        """
+        from app.services import commands
+        return commands.history_detail(
+            self.outcome, self.return_code, self.command,
+        )
 
     class Config:
         from_attributes = True

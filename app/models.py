@@ -262,10 +262,20 @@ class DeviceCommandLog(Base):
         nullable=False,
     )
 
+    # The device_command_outbox id this row was moved from (E11). Nullable
+    # only because rows written before the column existed do not have one.
+    # It is what lets a late acknowledgement quoting that id be recognised as
+    # a report on a command we already concluded, rather than an id we never
+    # issued — the difference between an INFO line and a WARNING.
+    outbox_id = Column(Integer, nullable=True, index=True)
+
     attempts = Column(Integer, nullable=False, default=0)
 
-    # As reported by the device: 0 = success, non-zero = the device refusing
-    # the command. Null when the command was never answered at all.
+    # As reported by the device, exactly as sent. NOT a success/failure flag:
+    # 0 is a documented success and negative codes are read as refusals, but
+    # hardware has returned a positive code (3) on a command that demonstrably
+    # worked, so a non-zero code here does not by itself mean refused. The one
+    # place that judgement is made is commands.verdict_for().
     return_code = Column(Integer, nullable=True)
     last_error = Column(String(255), nullable=True)
 
