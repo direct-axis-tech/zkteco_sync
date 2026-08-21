@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
 import { useAuth } from '../auth'
+import RevocationCard from '../components/RevocationCard'
 
 const PRIVILEGE_LABELS = { 0: 'User', 2: 'Enroller', 14: 'Admin' }
 
@@ -27,26 +28,6 @@ const COMMAND_STATE = {
 // the server queued, not a status this page could get out of step with.
 const isRevocationCommand = (command) =>
   /^DATA DELETE (user|userauthorize)\s+Pin=/i.test(String(command || ''))
-
-// The user record specifically. `\s+` after "user" is what keeps this from
-// also matching "userauthorize" — the same distinction the server draws, and
-// for the same reason: only this one, outstanding, means the person can still
-// be recognised at the door.
-const isUserDeleteCommand = (command) =>
-  /^DATA DELETE user\s+Pin=/i.test(String(command || ''))
-
-// How long something has been outstanding, in words an operator can act on.
-function since(iso) {
-  if (!iso) return ''
-  // Timestamps come back naive-UTC from the API; anchor them before diffing,
-  // or a UTC+4 browser reads a fresh command as four hours old.
-  const stamp = /(Z|[+-]\d\d:?\d\d)$/.test(iso) ? iso : `${iso}Z`
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(stamp).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
-  return `${Math.floor(seconds / 86400)}d`
-}
 
 // A terminal may enrol somebody with no name at all — every record in the
 // BioFace A1 capture arrived as `name=`. The ingest stores that as an empty
@@ -282,6 +263,7 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   const [templates, setTemplates] = useState(null)
   const [biometrics, setBiometrics] = useState(null)
   const [queued, setQueued] = useState([])
+  const [revocationGroups, setRevocationGroups] = useState([])
   const [refused, setRefused] = useState([])
   const [toast, setToast] = useState(null)
 
@@ -330,6 +312,16 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
       )
     ).then((lists) => setQueued(lists.flat()))
 
+    // One entry per revocation still outstanding for this person — grouped
+    // server-side (E13) by (device_sn, pin), not re-derived here from the
+    // two `DATA DELETE` commands that carry it out. That is what keeps this
+    // panel from ever showing two "Cancel" buttons for one revocation.
+    Promise.all(
+      queueDevices.map((d) =>
+        api.devices.listRevocations(d.serial_number, employee.user_id).catch(() => [])
+      )
+    ).then((lists) => setRevocationGroups(lists.flat()))
+
     // Commands the device refused. Worth its own section rather than being
     // left in the device's command history: a `user` record that landed and a
     // `userauthorize` that was refused is a person the terminal recognises,
@@ -364,33 +356,25 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   // The outbox split in two, because the two halves mean opposite things. A
   // queued push is somebody not on a door yet; a queued delete is somebody
   // still on a door they should be off. Only the second is a hazard, so only
-  // the second gets the loud treatment.
-  const revocations = queued.filter((r) => isRevocationCommand(r.command))
+  // the second gets the loud treatment — and it is grouped server-side
+  // (E13), one card per revocation rather than one per `DATA DELETE`.
   const pushesQueued = queued.filter((r) => !isRevocationCommand(r.command))
   // Which doors this person is being revoked from but has not been yet — used
   // to change what the Enrolled Devices row offers, so "Remove" cannot be
   // clicked twice and read as though the first one landed.
-  const revokingSns = new Set(revocations.map((r) => r.device_sn))
+  const revokingSns = new Set(revocationGroups.map((g) => g.device_sn))
+  // Doors where this person may still get in despite a revocation being on
+  // the books. Read straight off `still_open` — the server's answer, itself
+  // read off `device_employees` rather than either command's state. Absence
+  // of a pending command is not evidence of success; the link is. Getting
+  // that wrong put a reassuring "the terminal has confirmed this person's
+  // removal" directly above a red "ACCESS NOT REVOKED" during E8's browser
+  // check.
+  const blockingSns = new Set(
+    revocationGroups.filter((g) => g.still_open).map((g) => g.device_sn)
+  )
 
   const enrolledSns = new Set((enrolledDevices || []).map((d) => d.device_sn))
-  // Doors where this person may still get in despite a revocation being on
-  // the books. TWO conditions, and the second one is load-bearing:
-  //
-  //   * a user-record delete is still queued, or
-  //   * the terminal still holds them — `device_employees`, which is dropped
-  //     ONLY on a real acknowledgement.
-  //
-  // Without the second condition, "no user delete outstanding" would be read
-  // as "the delete succeeded", which is false when the device REFUSED it: the
-  // command leaves the outbox either way. Getting that wrong put a reassuring
-  // "the terminal has confirmed this person's removal" directly above a red
-  // "ACCESS NOT REVOKED" during this unit's browser check. Absence of a
-  // pending command is not evidence of success; the link is.
-  const blockingSns = new Set(
-    revocations
-      .filter((r) => isUserDeleteCommand(r.command) || enrolledSns.has(r.device_sn))
-      .map((r) => r.device_sn)
-  )
   const unenrolledDevices = allDevices.filter((d) => !enrolledSns.has(d.serial_number))
   // An access-control terminal is provisioned over the command queue, so the
   // button must not promise something synchronous.
@@ -456,17 +440,17 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     }
   }
 
-  async function handleCancelRevocation(sn) {
-    setBusyDevice((b) => ({ ...b, [sn]: 'cancelling' }))
-    try {
-      const res = await api.devices.cancelRevocation(sn, employee.user_id)
-      showToast(res?.message || `Revocation for ${sn} cancelled`)
-      reload()
-    } catch (err) {
-      showToast(err.message, 'error')
-    } finally {
-      setBusyDevice((b) => ({ ...b, [sn]: null }))
-    }
+  // RevocationCard owns the request and its own busy state — this only
+  // reacts to the outcome. Calls E8's revocation-level DELETE, which cancels
+  // BOTH `DATA DELETE` commands atomically; there is no per-command cancel
+  // in this panel to accidentally leave half a revocation behind.
+  function handleRevocationCancelled(res) {
+    showToast(res?.message || 'Revocation cancelled')
+    reload()
+  }
+
+  function handleRevocationCancelError(err) {
+    showToast(err.message, 'error')
   }
 
   // One function for both transports, because the endpoint routes on the
@@ -609,7 +593,7 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
           it, at a physical door, and the door says nothing. So it is pulled
           out, coloured as the hazard it is, timed, and it says plainly that
           the person can still get in. */}
-      {revocations.length > 0 && (
+      {revocationGroups.length > 0 && (
         <Section
           title={
             blockingSns.size > 0
@@ -644,62 +628,30 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
                 </>
               )}
             </p>
+            {/* One card per revocation (E13) — grouped server-side by
+                (device_sn, pin), not one per `DATA DELETE` command. Cancel
+                is offered only while the revocation could still be called
+                off entirely: once the terminal has confirmed the user
+                delete the person is already gone, and "let them keep this
+                door" would be an offer this button cannot honour — putting
+                them back is a fresh push, not a cancel. */}
             <div className="space-y-2">
-              {revocations.map((row) => {
+              {revocationGroups.map((group) => {
                 const deviceName =
-                  allDevices.find((x) => x.serial_number === row.device_sn)?.name
-                const busy = busyDevice[row.device_sn]
-                // Only an outstanding user-record delete means access is still
-                // live at that door.
-                const stillOpen = blockingSns.has(row.device_sn)
+                  allDevices.find((x) => x.serial_number === group.device_sn)?.name
                 return (
-                  <div key={row.id} className="bg-white rounded-lg px-3 py-2.5 text-sm">
-                    <div className="flex items-center gap-2">
-                      <p className="text-gray-900 font-semibold flex-1 min-w-0 truncate">
-                        {deviceName || row.device_sn}
-                      </p>
-                      <span
-                        className={`text-xs px-1.5 py-0.5 rounded-full font-semibold whitespace-nowrap ${
-                          stillOpen
-                            ? 'bg-red-600 text-white'
-                            : 'bg-amber-100 text-amber-800'
-                        }`}
-                      >
-                        {stillOpen ? 'Still open' : 'Clearing permission'}
-                      </span>
-                    </div>
-                    <p
-                      className={`text-xs mt-1 ${
-                        stillOpen ? 'text-red-700' : 'text-amber-800'
-                      }`}
-                    >
-                      {row.status === 'sent'
-                        ? 'Handed to the device — waiting for it to confirm the removal'
-                        : 'Waiting for the device to poll. Nothing has reached it yet.'}
-                      {' · outstanding '}
-                      {since(row.created_at)}
-                      {row.attempts > 0 && ` · attempt ${row.attempts}`}
-                    </p>
-                    <p className="text-xs text-gray-400 font-mono mt-1 truncate">
-                      {row.command}
-                    </p>
-                    {/* Only offered while the revocation could still be called
-                        off. Once the terminal has confirmed the user delete
-                        the person is already gone, and "let them keep this
-                        door" would be an offer this button cannot honour —
-                        putting them back is a fresh push, not a cancel. */}
-                    {isAdmin && stillOpen && (
-                      <button
-                        onClick={() => handleCancelRevocation(row.device_sn)}
-                        disabled={!!busy}
-                        className="mt-2 text-xs text-gray-600 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-40 transition-colors"
-                      >
-                        {busy === 'cancelling'
-                          ? 'Cancelling…'
-                          : 'Cancel revocation — let them keep this door'}
-                      </button>
-                    )}
-                  </div>
+                  <RevocationCard
+                    key={`${group.device_sn}:${group.user_id}`}
+                    group={group}
+                    title={deviceName || group.device_sn}
+                    cancelLabel={
+                      isAdmin && group.still_open
+                        ? 'Cancel revocation — let them keep this door'
+                        : null
+                    }
+                    onCancelled={handleRevocationCancelled}
+                    onError={handleRevocationCancelError}
+                  />
                 )
               })}
             </div>

@@ -6115,6 +6115,147 @@ class CancelRevocationTests(RevocationTestCase):
         )
 
 
+class RevocationGroupingTests(RevocationTestCase):
+    """One revocation, one entry (E13) — not one per `DATA DELETE` command.
+
+    Employees.jsx and CommandsDrawer.jsx used to re-derive this grouping
+    independently on the wire text, which is how a UI ended up offering a
+    "Cancel" per command instead of per revocation. `GET
+    /devices/{sn}/revocations` is now the one place that judgement is made,
+    so it is tested here rather than trusted to match on both sides of the
+    wire.
+    """
+
+    def groups(self, sn=None, user_id=None):
+        url = f"/devices/{sn or self.SN}/revocations"
+        if user_id:
+            url += f"?user_id={user_id}"
+        return self.client.get(url)
+
+    def test_a_fresh_revocation_is_one_group_not_two_rows(self):
+        """Both commands outstanding, same person, same door: one entry."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+
+        body = self.groups().json()
+        self.assertEqual(len(body), 1)
+        group = body[0]
+        self.assertEqual(group["device_sn"], self.SN)
+        self.assertEqual(group["user_id"], "9001")
+        self.assertTrue(group["still_open"])
+        self.assertFalse(group["split"])
+        self.assertTrue(group["user"]["outstanding"])
+        self.assertEqual(group["user"]["state"], "pending")
+        self.assertTrue(group["userauthorize"]["outstanding"])
+        self.assertEqual(group["userauthorize"]["state"], "pending")
+
+    def test_cancelling_the_group_clears_both_commands_from_it(self):
+        """The escape hatch this panel must call: the atomic revocation
+        cancel, not a per-command cancel that could leave one half behind."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.assertEqual(len(self.groups().json()), 1)
+
+        response = self.cancel(self.SN)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["cancelled_command_ids"]), 2)
+
+        # Nothing left owed for this person on this door at all.
+        self.assertEqual(self.groups().json(), [])
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_an_acknowledged_half_beside_an_outstanding_half_is_reported_split(self):
+        """The case the ticket exists for: one command already concluded,
+        the other still outstanding. Must not be hidden or averaged away."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")  # user delete: acknowledged
+
+        body = self.groups().json()
+        self.assertEqual(len(body), 1)
+        group = body[0]
+        self.assertTrue(group["split"])
+        # The device confirmed removal, so the door itself is no longer open
+        # to this person — read straight off device_employees, not off
+        # either command's state (E8's gate caught that exact confusion).
+        self.assertFalse(group["still_open"])
+        self.assertFalse(group["user"]["outstanding"])
+        self.assertEqual(group["user"]["state"], "acknowledged")
+        self.assertTrue(group["userauthorize"]["outstanding"])
+        self.assertEqual(group["userauthorize"]["state"], "pending")
+
+    def test_a_refused_half_beside_an_outstanding_half_is_reported_split(self):
+        """The door permission delete can be refused independently of the
+        user delete — E8's design allows it. Access is still not revoked, so
+        `still_open` must say so even though one command is done."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        # Refuse the userauthorize half (id 2) while the user delete (id 1)
+        # is still sitting in the outbox, untouched.
+        self.ack(2, return_code=-14, cmd="DATA DELETE")
+
+        body = self.groups().json()
+        self.assertEqual(len(body), 1)
+        group = body[0]
+        self.assertTrue(group["split"])
+        self.assertTrue(group["still_open"],
+                         "the user record delete never concluded — this "
+                         "person can still open the door")
+        self.assertTrue(group["user"]["outstanding"])
+        # poll() dispatches the oldest pending command first (id 1, the user
+        # delete), so it is 'sent' — delivered, awaiting confirmation — by
+        # the time id 2 (userauthorize) gets refused below.
+        self.assertEqual(group["user"]["state"], "sent")
+        self.assertFalse(group["userauthorize"]["outstanding"])
+        self.assertEqual(group["userauthorize"]["state"], "refused")
+        self.assertEqual(group["userauthorize"]["return_code"], -14)
+
+    def test_an_unconfirmed_half_is_neither_acknowledged_nor_refused(self):
+        """E11's third verdict, carried through the grouped view: a positive
+        code this system cannot read must not read as a refusal here either."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(2, return_code=3, cmd="DATA DELETE")
+
+        group = self.groups().json()[0]
+        self.assertEqual(group["userauthorize"]["state"], "unconfirmed")
+        self.assertNotEqual(group["userauthorize"]["state"], "refused")
+
+    def test_a_fully_concluded_revocation_has_nothing_left_to_show(self):
+        """Both halves acknowledged: nothing outstanding, so no group at all
+        — this panel is for what is still owed, not a permanent record."""
+        self.link(self.SN)
+        self.revoke(self.SN)
+        self.poll()
+        self.ack(1, return_code=0, cmd="DATA DELETE")
+        self.poll()
+        self.ack(2, return_code=0, cmd="DATA DELETE")
+
+        self.assertEqual(self.groups().json(), [])
+
+    def test_grouping_is_confined_to_one_door_and_one_person(self):
+        """Two people, two doors, one revocation each: three separate groups,
+        never merged across a pin or a device boundary."""
+        self.create_employee("9002", name="Omar Said")
+        self.link(self.SN)
+        self.link(self.OTHER_SN)
+        self.link(self.SN, "9002")
+        self.revoke(self.SN, "9001")
+        self.revoke(self.OTHER_SN, "9001")
+        self.revoke(self.SN, "9002")
+
+        by_device = self.groups(self.SN).json()
+        self.assertEqual(sorted(g["user_id"] for g in by_device), ["9001", "9002"])
+        self.assertEqual(len(self.groups(self.OTHER_SN).json()), 1)
+
+        narrowed = self.groups(self.SN, user_id="9002").json()
+        self.assertEqual(len(narrowed), 1)
+        self.assertEqual(narrowed[0]["user_id"], "9002")
+
+
 class TemplateDeleteOnAccTests(RevocationTestCase):
     """No invented biodata delete — a refusal that says what to do instead."""
 

@@ -235,6 +235,58 @@ class CommandLogOut(BaseModel):
         from_attributes = True
 
 
+class RevocationRoleOut(BaseModel):
+    """One half of a revocation (`user` or `userauthorize`), wherever it is.
+
+    ``outstanding=True`` means still owed to the device — ``state`` is
+    ``pending`` or ``sent``, straight off the outbox. ``outstanding=False``
+    means concluded — ``state`` is the verdict (E11's ``acknowledged`` /
+    ``refused`` / ``unconfirmed`` / ``cancelled`` / ``abandoned``), read from
+    history, never inferred from the outbox being empty.
+    """
+
+    outstanding: bool
+    state: str
+    return_code: Optional[int] = None
+    last_error: Optional[str] = None
+    attempts: int
+    created_at: Optional[datetime] = None
+    sent_at: Optional[datetime] = None
+    concluded_at: Optional[datetime] = None
+    command: str
+
+
+class RevocationGroupOut(BaseModel):
+    """One revocation, as the operator asked for it (E13) — not the two
+    commands E8 sends to carry it out. Present only while at least one half
+    is still outstanding.
+
+    ``still_open`` is the door-safety verdict: whether the terminal still
+    recognises this person, read straight off ``device_employees`` rather
+    than guessed from either command's state.
+    """
+
+    device_sn: str
+    user_id: str
+    still_open: bool
+    user: Optional[RevocationRoleOut] = None
+    userauthorize: Optional[RevocationRoleOut] = None
+
+    @computed_field
+    @property
+    def split(self) -> bool:
+        """True when the two halves are genuinely in different states — one
+        acknowledged, one refused, one cancelled, one still outstanding —
+        and must be shown as such rather than folded into one status."""
+        u, a = self.user, self.userauthorize
+        if u is None or a is None:
+            return True
+        return (u.outstanding, u.state) != (a.outstanding, a.state)
+
+    class Config:
+        from_attributes = True
+
+
 # --- Device info ---
 
 class DeviceSizesOut(BaseModel):

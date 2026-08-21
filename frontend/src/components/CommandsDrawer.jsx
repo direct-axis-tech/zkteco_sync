@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
 import Drawer from './Drawer'
+import RevocationCard from './RevocationCard'
 
 const PRESETS = [
   { label: 'Reboot', value: 'REBOOT' },
@@ -9,11 +10,19 @@ const PRESETS = [
   { label: 'Disable', value: 'DISABLE' },
 ]
 
-// A command that takes access away, as opposed to granting it (E8/E7). Same
-// wire text `commands.is_revocation` matches server-side — kept in sync by
-// matching the string rather than trusting a schema field, so a command
-// typed by hand in the compose box below gets the same treatment as one this
-// application queued itself.
+// The two commands E8 sends to revoke one person (`DATA DELETE user` and
+// `DATA DELETE userauthorize`) — the exact shape `GET /devices/{sn}/revocations`
+// groups server-side (E13), and the two this section pulls out of the plain
+// outbox list so they get the grouped, loud treatment instead of sitting in
+// "Outstanding" as two unrelated rows. Narrower than "any DATA DELETE" on
+// purpose: a hand-typed delete for some other table is a real command this
+// drawer has never seen before and should stay visible in "Outstanding"
+// rather than silently vanish because it happened to start the same way.
+const isGroupedRevocation = (command) =>
+  /^DATA DELETE (user|userauthorize)\s+Pin=/i.test(String(command || '').trim())
+
+// For the History Pill and the retry-warning copy below, where "was this a
+// revocation" only needs to be roughly right, not grouped.
 const isRevocation = (command) => /^DATA DELETE\b/i.test(String(command || '').trim())
 
 // How long ago (past) or how long until (future) a timestamp is, in words an
@@ -133,6 +142,7 @@ export default function CommandsDrawer({ device, onClose, showToast, onChange })
 
   const [outbox, setOutbox] = useState([])
   const [history, setHistory] = useState([])
+  const [revocationGroups, setRevocationGroups] = useState([])
   const [loadingLists, setLoadingLists] = useState(true)
 
   const [busy, setBusy] = useState({}) // { [key]: true } while an action is in flight
@@ -144,12 +154,14 @@ export default function CommandsDrawer({ device, onClose, showToast, onChange })
 
   const refresh = useCallback(async () => {
     try {
-      const [ob, hs] = await Promise.all([
+      const [ob, hs, rv] = await Promise.all([
         api.devices.listCommands(sn),
         api.devices.commandHistory(sn),
+        api.devices.listRevocations(sn),
       ])
       setOutbox(ob)
       setHistory(hs)
+      setRevocationGroups(rv)
     } catch {
       showToast('Failed to load the command queue', 'error')
     } finally {
@@ -237,8 +249,21 @@ export default function CommandsDrawer({ device, onClose, showToast, onChange })
     doRetry(row)
   }
 
-  const revocations = outbox.filter((r) => isRevocation(r.command))
-  const otherOutbox = outbox.filter((r) => !isRevocation(r.command))
+  const otherOutbox = outbox.filter((r) => !isGroupedRevocation(r.command))
+
+  // RevocationCard owns the request and its own busy state — these only
+  // react to the outcome. Calls E8's revocation-level DELETE, which cancels
+  // BOTH `DATA DELETE` commands atomically — never the per-command cancel
+  // above, which could leave one half of a revocation behind (E13).
+  function handleRevocationCancelled(res) {
+    setNotice({ type: 'success', text: res?.message || 'Revocation cancelled' })
+    refresh()
+    onChange?.()
+  }
+
+  function handleRevocationCancelError(err) {
+    showToast(err.message, 'error')
+  }
 
   return (
     <Drawer title="Commands" onClose={onClose} width="max-w-lg">
@@ -305,61 +330,32 @@ export default function CommandsDrawer({ device, onClose, showToast, onChange })
 
       {/* Revocations pulled out and coloured as the hazard they are — an
           outstanding `DATA DELETE` means somebody may still be able to open
-          this door, exactly the distinction E8 exists to keep visible. */}
-      {revocations.length > 0 && (
+          this door, exactly the distinction E8 exists to keep visible.
+          Grouped server-side (E13), one card per person rather than one per
+          `DATA DELETE` command — the duplication that used to let an
+          operator cancel half a revocation with one click. */}
+      {revocationGroups.length > 0 && (
         <Section title="Revocations not yet confirmed at the door">
           <div className="border-2 border-red-300 bg-red-50 rounded-lg p-3 space-y-2">
             <p className="text-xs font-semibold text-red-800">
               The person named below can still open this door until the device
               confirms it collected this. If the device is offline it waits.
             </p>
-            {revocations.map((row) => (
-              <div key={row.id} className="bg-white rounded-lg px-3 py-2.5 text-sm">
-                <div className="flex items-center gap-2 mb-1">
-                  <Pill tone={row.status === 'sent' ? 'blue' : 'gray'}>
-                    {row.status === 'sent' ? 'Sent' : 'Pending'}
-                  </Pill>
-                  <span className="text-xs text-gray-400 flex-1">
-                    {row.status === 'sent'
-                      ? `attempt ${row.attempts} · retries ${until(row.next_attempt_at)}`
-                      : `waiting for the device to poll · queued ${since(row.created_at)}`}
-                  </span>
-                </div>
-                <p className="text-xs font-mono text-gray-500 truncate">{row.command}</p>
-                {confirmCancelId === row.id ? (
-                  <div className="mt-2 text-xs bg-amber-50 border border-amber-200 rounded px-2 py-1.5 text-amber-800">
-                    This has already been sent to the device at least once — cancelling
-                    only removes our record of owing it. It does <strong>not</strong>{' '}
-                    recall it; the person may already have been removed, or may not.
-                    <div className="flex gap-3 mt-1.5">
-                      <button
-                        onClick={() => doCancel(row)}
-                        className="text-red-700 font-semibold hover:underline"
-                      >
-                        Cancel our record anyway
-                      </button>
-                      <button
-                        onClick={() => setConfirmCancelId(null)}
-                        className="text-gray-500 hover:underline"
-                      >
-                        Never mind
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => handleCancelClick(row)}
-                    disabled={!!busy[`out-${row.id}`]}
-                    className="mt-1.5 text-xs text-gray-600 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-40 transition-colors"
-                  >
-                    {busy[`out-${row.id}`]
-                      ? 'Cancelling…'
-                      : row.status === 'sent'
-                        ? 'Cancel — will not recall it'
-                        : 'Cancel — never sent'}
-                  </button>
-                )}
-              </div>
+            {revocationGroups.map((group) => (
+              <RevocationCard
+                key={`${group.device_sn}:${group.user_id}`}
+                group={group}
+                title={`Pin ${group.user_id}`}
+                cancelLabel={
+                  group.still_open
+                    ? `Cancel — Pin ${group.user_id} keeps access to this door`
+                    : group.user?.outstanding || group.userauthorize?.outstanding
+                      ? 'Cancel the leftover delete — door permission record only'
+                      : null
+                }
+                onCancelled={handleRevocationCancelled}
+                onError={handleRevocationCancelError}
+              />
             ))}
           </div>
         </Section>

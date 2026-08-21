@@ -63,7 +63,8 @@ from sqlalchemy.orm import Session
 
 from app import config
 from app.models import (
-    BiometricTemplate, DeviceCommandOutbox, DeviceEmployee, Employee,
+    BiometricTemplate, DeviceCommandLog, DeviceCommandOutbox, DeviceEmployee,
+    Employee,
 )
 from app.services import commands, employee_sync
 
@@ -796,6 +797,95 @@ def cancel_revocation(db: Session, device_sn: str, user_id: str, by: str) -> lis
                 row_id, name, user_id, device_sn, by,
             )
     return cancelled
+
+
+def _outstanding_role_status(row: DeviceCommandOutbox) -> dict:
+    """One outstanding half of a revocation, as it sits in the outbox."""
+    return {
+        "outstanding": True,
+        "state": row.status,  # 'pending' or 'sent' — never anything else here
+        "return_code": None,
+        "last_error": None,
+        "attempts": row.attempts,
+        "created_at": row.created_at,
+        "sent_at": row.sent_at,
+        "concluded_at": None,
+        "command": row.command,
+    }
+
+
+def _concluded_role_status(row: DeviceCommandLog) -> dict:
+    """One concluded half of a revocation, read off history — never off the
+    outbox being empty (E8's gate caught exactly that confusion once)."""
+    return {
+        "outstanding": False,
+        "state": commands.history_verdict(
+            row.outcome, row.return_code, row.last_error, row.command,
+        ),
+        "return_code": row.return_code,
+        "last_error": row.last_error,
+        "attempts": row.attempts,
+        "created_at": row.created_at,
+        "sent_at": row.sent_at,
+        "concluded_at": row.concluded_at,
+        "command": row.command,
+    }
+
+
+def revocation_groups(db: Session, device_sn: str, user_id: str = None) -> list:
+    """One entry per revocation this device still owes somebody — grouped by
+    the person it names, not by the two commands E8 sends to carry it out
+    (E13).
+
+    Only pins with at least one half still outstanding appear at all: that
+    matches what the panel has always shown (a fully concluded revocation has
+    nothing left to warn about), and keeps this cheap — no unbounded scan of
+    history. What changes is that the OTHER half is looked up honestly,
+    wherever it actually is, rather than assumed to be in the same state.
+    If it already concluded — acknowledged, refused, or cancelled — while its
+    sibling is still outstanding, that is reported as a split, not averaged
+    away into one tidy card. `still_open` is read straight off
+    `device_employees`, the single record of whether the terminal still
+    recognises this person (E8) — not inferred from either command's state,
+    which is exactly the inference that produced a false "confirmed removal"
+    once before.
+    """
+    pins = {}
+    for row in outstanding_revocations(db, device_sn, user_id):
+        role = "user" if pin_from_revocation_command(row.command) else "userauthorize"
+        pin = pin_from_any_delete_command(row.command)
+        pins.setdefault(pin, {})[role] = _outstanding_role_status(row)
+
+    groups = []
+    for pin, roles in pins.items():
+        for role, body in (
+            ("user", user_delete_command(pin)),
+            ("userauthorize", authorize_delete_command(pin)),
+        ):
+            if role in roles:
+                continue
+            log_row = (
+                db.query(DeviceCommandLog)
+                .filter(DeviceCommandLog.device_sn == device_sn,
+                        DeviceCommandLog.command == body)
+                .order_by(DeviceCommandLog.concluded_at.desc(), DeviceCommandLog.id.desc())
+                .first()
+            )
+            roles[role] = _concluded_role_status(log_row) if log_row else None
+        still_open = (
+            db.query(DeviceEmployee)
+            .filter_by(device_sn=device_sn, user_id=pin)
+            .first()
+            is not None
+        )
+        groups.append({
+            "device_sn": device_sn,
+            "user_id": pin,
+            "still_open": still_open,
+            "user": roles.get("user"),
+            "userauthorize": roles.get("userauthorize"),
+        })
+    return groups
 
 
 # ---------------------------------------------------------------------------

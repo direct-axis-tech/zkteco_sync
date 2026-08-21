@@ -142,6 +142,12 @@ export const api = {
     // The outbox: what this device still owes us. A row here is queued, not
     // delivered — the device collects it on its next poll.
     listCommands: (sn) => request('GET', `/devices/${sn}/commands`),
+    // One entry per revocation this device still owes somebody — the two
+    // `DATA DELETE` commands E8 sends already merged server-side (E13), so
+    // this is the one place both surfaces (Employees.jsx, CommandsDrawer.jsx)
+    // read the split-state judgement from, rather than each re-deriving it.
+    listRevocations: (sn, userId) =>
+      request('GET', `/devices/${sn}/revocations${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`),
     // Concluded commands: what the device said about each one. A `failed`
     // row with a return_code is the device having refused it.
     commandHistory: (sn) => request('GET', `/devices/${sn}/commands/history`),

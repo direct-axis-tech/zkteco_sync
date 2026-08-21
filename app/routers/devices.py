@@ -23,7 +23,7 @@ from app.schemas import (
     DeviceInfoOut, DeviceOut,
     DeviceProtocolUpdate, DeviceTimezoneUpdate, DeviceUpdate, EnrollRequest,
     FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
-    SetTimeRequest, UnlockRequest,
+    RevocationGroupOut, SetTimeRequest, UnlockRequest,
 )
 from app.services import commands, employee_sync, pairing, provisioning
 from app.services.poller import pull_attendance, pull_device, pull_employees
@@ -1255,6 +1255,22 @@ def remove_user_from_device(
         "status": "removed",
         "message": f"Removed from {sn}. The device confirmed it.",
     }
+
+
+@router.get("/{sn}/revocations", response_model=list[RevocationGroupOut],
+            dependencies=[Depends(require_admin)])
+def list_revocations(sn: str, user_id: Optional[str] = None, db: Session = Depends(get_db)):
+    """Revocations this device still owes somebody, one entry per person —
+    not one per underlying `DATA DELETE` command (E13).
+
+    A single source of truth for what used to be two client-side panels
+    (Employees.jsx, CommandsDrawer.jsx) independently re-deriving the same
+    grouping from the wire text. Optionally narrowed to one person, so a
+    detail page does not have to fetch every revocation on the device and
+    filter client-side.
+    """
+    _get_device_or_404(sn, db)
+    return provisioning.revocation_groups(db, sn, user_id)
 
 
 @router.delete("/{sn}/users/{user_id}/revocation", dependencies=[Depends(require_admin)])
