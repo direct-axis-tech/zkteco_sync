@@ -1,12 +1,20 @@
-"""The one place an employee row is written from a device.
+"""The one place an employee row is written. Every source comes through here.
 
-Two transports deliver the same fact — "this person exists on this terminal":
+Three sources now write people, and they do not mean the same thing by an
+empty field. Two of them are devices reporting what they hold — "this person
+exists on this terminal":
 
 * the **SDK pull** (``app/services/poller.pull_employees``), which reaches out
   over TCP 4370 and reads ``get_users()``;
 * the **Security PUSH bulk upload** (``tabledata&tablename=user``, handled in
   ``app/routers/adms.py``), which arrives unsolicited over HTTP because a
   NATted device can only ever push.
+
+The third is an **operator typing into the UI** (E3), who is the authority on
+the row rather than a witness to it, and for whom clearing a field is a real
+instruction. That difference is handled by having two entry points into this
+one module — see "The other kind of source" further down — not by a second
+writer somewhere else.
 
 A device behind NAT is reachable by exactly one of those. A device on the LAN
 can be reachable by both, and then the two must agree. If each transport had
@@ -161,6 +169,99 @@ def link_device_employee(db: Session, device_sn: str, user_id: str, uid=None):
 
     db.flush()
     return link
+
+
+# ---------------------------------------------------------------------------
+# The other kind of source: an operator, typing
+# ---------------------------------------------------------------------------
+#
+# Everything above is a *device* reporting what it holds, where silence means
+# "nothing to say" and may never erase what somebody typed. An operator is the
+# opposite kind of source: they are the authority on this row, and clearing a
+# field is a thing they are allowed to mean.
+#
+# So the two are told apart at the door, not inside the rule. A device calls
+# record_device_user() and gets fill-in-never-empty-out. An operator calls
+# create_employee()/apply_operator_edit() and gets exactly what they asked
+# for, including empty. Both still write through this one module, so there is
+# still exactly one thing that writes `employees` — which is the property E1
+# established by *removing* a competing writer, and which is worth more than
+# the convenience of a second one.
+#
+# The distinction is carried by the caller supplying a field at all: the API
+# layer passes only the keys the operator actually sent (Pydantic's
+# exclude_unset), so "" means clear this and absent means leave it alone.
+
+# Sentinel for "this key was not supplied". Distinct from None, because None
+# is a perfectly good way for an operator to mean "empty".
+_UNSET = object()
+
+
+def create_employee(db: Session, user_id, *, name="", privilege=0, card=""):
+    """Create one employee row from operator input.
+
+    Raises ValueError if the user_id is missing or already taken — a PIN is
+    the device's primary key for a person, so silently merging into somebody
+    else's row would be the worst possible outcome of a typo.
+    """
+    user_id = str(user_id or "").strip()[:_USER_ID_LIMIT]
+    if not user_id:
+        raise ValueError("A user ID (PIN) is required")
+
+    if db.query(Employee).filter_by(user_id=user_id).first():
+        raise ValueError(f"User ID {user_id} already exists")
+
+    emp = Employee(
+        user_id=user_id,
+        name=str(name or "").strip()[:_NAME_LIMIT],
+        privilege=_int_or_none(privilege) or 0,
+        # "0" not "": the column's own convention for "no card", shared with
+        # the device and with every fallback in the UI.
+        card=(str(card or "").strip()[:_CARD_LIMIT] or "0"),
+    )
+    db.add(emp)
+    db.flush()
+    log.info("employee %s created by an operator", user_id)
+    return emp
+
+
+def apply_operator_edit(db: Session, emp: Employee, *,
+                        name=_UNSET, privilege=_UNSET, card=_UNSET):
+    """Apply a deliberate edit. Unlike a device, an operator may empty a field.
+
+    Only the fields passed are touched. Returns the set of field names that
+    actually changed, so the caller can audit the edit rather than the
+    request.
+    """
+    changed = set()
+
+    if name is not _UNSET:
+        value = str(name or "").strip()[:_NAME_LIMIT]
+        if emp.name != value:
+            emp.name = value
+            changed.add("name")
+
+    if privilege is not _UNSET:
+        value = _int_or_none(privilege)
+        if value is not None and emp.privilege != value:
+            emp.privilege = value
+            changed.add("privilege")
+
+    if card is not _UNSET:
+        # An operator clearing the card field means "this person has no card",
+        # which the column spells "0" — the same value the device sends for it.
+        value = str(card or "").strip()[:_CARD_LIMIT] or "0"
+        if emp.card != value:
+            emp.card = value
+            changed.add("card")
+
+    if changed:
+        emp.updated_at = _now()
+        log.info("employee %s edited by an operator: %s",
+                 emp.user_id, ", ".join(sorted(changed)))
+
+    db.flush()
+    return changed
 
 
 def record_device_user(

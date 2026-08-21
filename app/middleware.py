@@ -228,7 +228,23 @@ class SpaNavigationMiddleware(BaseHTTPMiddleware):
         if not os.path.isfile(self.index_html):
             return await call_next(request)
 
-        return FileResponse(self.index_html)
+        # The cache headers are load-bearing, not hygiene. /employees is both
+        # a page and an API route, and the two are told apart by *headers*
+        # rather than by URL. FileResponse's default ETag/Last-Modified with
+        # no Vary tells the browser those two responses are interchangeable,
+        # so the shell HTML cached from the navigation gets replayed to the
+        # page's own fetch('/employees') — which then fails to parse as JSON
+        # and renders an empty list. Observed: a hard reload of /employees
+        # showing "0 employees" while the API itself was answering perfectly.
+        #
+        # `no-store` is what fixes it; `Vary` states the actual dependency for
+        # any cache in between. Nothing is lost by not caching the shell: it
+        # is a few hundred bytes and every asset it references is content-
+        # hashed and cached normally.
+        return FileResponse(self.index_html, headers={
+            "Cache-Control": "no-store",
+            "Vary": "X-Requested-With, Sec-Fetch-Mode, Accept",
+        })
 
     def _claims(self, request: Request) -> bool:
         # The single most dangerous line in this file. Devices are embedded

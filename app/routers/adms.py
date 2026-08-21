@@ -35,9 +35,9 @@ from sqlalchemy.orm import Session
 
 from app import audit, config
 from app.database import get_db
-from app.models import AttendanceLog, BiometricTemplate, Device
+from app.models import AttendanceLog, BiometricTemplate, Device, DeviceCommandOutbox
 from app.net import client_ip, ip_in_cidrs
-from app.services import commands, employee_sync, pairing
+from app.services import commands, employee_sync, pairing, provisioning
 
 router = APIRouter(tags=["adms"])
 
@@ -1082,6 +1082,24 @@ async def adms_devicecmd(
         return refusal
 
     raw = (await request.body()).decode("utf-8", errors="ignore")
+
+    # Logged in full, at INFO, on every single ack — not only on the ones that
+    # fail to parse. No acknowledgement from real hardware has ever been
+    # observed by this application: 469 getrequest polls in the operator's
+    # capture and not one devicecmd, because the queue was empty until E3
+    # started provisioning people. The spec (§3.9) says these fields arrive
+    # form-encoded in the body; §3.8's own example writes them as a query
+    # string. Both are parsed below and neither is confirmed, so the first
+    # real ack has to be readable from the log alone — which of the two the
+    # firmware used, exactly how it framed it, and what it said — while the
+    # operator is standing at the terminal watching. This costs one line per
+    # concluded command and nothing at all when the queue is idle.
+    log.info(
+        "devicecmd from %s: body=%r query=%r content_type=%r",
+        SN, raw[:500], str(request.query_params)[:500],
+        request.headers.get("content-type", ""),
+    )
+
     acks = _parse_devicecmd(raw)
 
     # The spec puts these in the body and that is what this parses first, but
@@ -1115,7 +1133,27 @@ async def adms_devicecmd(
                 SN, ack["id"],
             )
             continue
-        commands.acknowledge(db, SN, ack["id"], ack["return_code"], ack["cmd"])
+
+        # Read the command body before concluding it: acknowledging moves the
+        # row out of the outbox and deletes it, and what it *said* is how we
+        # know what the device just confirmed. The device's own CMD= field is
+        # no use for this — it carries "DATA UPDATE", not the record.
+        outstanding = (
+            db.query(DeviceCommandOutbox)
+            .filter_by(id=ack["id"], device_sn=SN)
+            .first()
+        )
+        body = outstanding.command if outstanding else ""
+
+        outcome = commands.acknowledge(db, SN, ack["id"], ack["return_code"], ack["cmd"])
+
+        if outcome == "acknowledged":
+            # A confirmed `DATA UPDATE user` is the one moment the ADMS
+            # transport learns that a person really is on this terminal, so it
+            # is where the device_employees link is written — through the same
+            # single writer the SDK path uses, never inline here.
+            provisioning.note_acknowledged(db, SN, body)
+            db.commit()
 
     # Always "OK": the device has already done the work, and refusing its
     # report only makes it repeat the command.

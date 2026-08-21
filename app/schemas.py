@@ -71,6 +71,35 @@ class EmployeeOut(BaseModel):
         from_attributes = True
 
 
+class EmployeeCreate(BaseModel):
+    """A person an operator is adding centrally, before any device knows them.
+
+    ``user_id`` is the device PIN and the key every other table joins on, so
+    it is required and immutable once set — renaming it would orphan the
+    person's attendance history and their enrolled biometrics.
+    """
+    user_id: str = Field(min_length=1, max_length=24)
+    name: str = Field(default="", max_length=100)
+    # 0 = ordinary user, 14 = device administrator. Defaulted to 0 rather than
+    # inherited from anything: 14 hands somebody the terminal's own menus.
+    privilege: int = 0
+    card: str = Field(default="", max_length=20)
+
+
+class EmployeeUpdate(BaseModel):
+    """A deliberate edit. Absent fields are left alone; empty ones are cleared.
+
+    That distinction is the whole point of this shape and it is carried by
+    ``exclude_unset`` at the router: a device may never empty a field it said
+    nothing about, but an operator deleting a name means it.
+
+    ``user_id`` is deliberately absent — see EmployeeCreate.
+    """
+    name: Optional[str] = Field(default=None, max_length=100)
+    privilege: Optional[int] = None
+    card: Optional[str] = Field(default=None, max_length=20)
+
+
 class DeviceEmployeeOut(BaseModel):
     device_sn: str
     user_id: str

@@ -2,7 +2,9 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import (
+    APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response,
+)
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
@@ -23,7 +25,7 @@ from app.schemas import (
     FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
     SetTimeRequest, UnlockRequest,
 )
-from app.services import commands, pairing
+from app.services import commands, employee_sync, pairing, provisioning
 from app.services.poller import pull_attendance, pull_device, pull_employees
 from app.services.sdk import device_connection, enroll_user_task
 
@@ -585,6 +587,44 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 # User sync: list enrolled, push/remove individual users on a device
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Provisioning a person onto a device: which wire, and who records the link
+# ---------------------------------------------------------------------------
+#
+# There are two ways to put a user on a terminal and they must never both be
+# used for the same one, because both would write `device_employees` and each
+# has a different idea of what a uid is. The choice is made from
+# Device.protocol — a stored fact an operator can correct (E6) — and never
+# guessed from whether a TCP connection happens to succeed:
+#
+#   att -> the SDK, TCP 4370, synchronous. Returns having actually written the
+#          device, so it records the link itself, with the real device-side
+#          uid it just learned.
+#   acc -> the ADMS command queue, asynchronous. Queues two commands and
+#          returns; the device collects them on its next poll (~10s) and
+#          acknowledges later. The link is written when that acknowledgement
+#          arrives (app/services/provisioning.note_acknowledged), not here,
+#          because until then "this person is on this device" is not true yet.
+#
+# A device has exactly one protocol at a time, so exactly one of these runs
+# for a given (device, user). Neither writes DeviceEmployee inline any more:
+# both go through employee_sync.link_device_employee, which is the single
+# writer E1 established.
+
+def _uses_command_queue(device: Device) -> bool:
+    """True if this device is provisioned over the ADMS queue rather than SDK.
+
+    Anything that is not explicitly `acc` — including a row whose protocol is
+    somehow unset — takes the SDK path. That is the safe default in the exact
+    sense that matters here: an SDK push to a device that cannot answer fails
+    loudly with a 503 in front of the operator, whereas queueing acc-shaped
+    commands to an attendance terminal would sit in the outbox looking
+    healthy, get collected, and be rejected or ignored by a device that has no
+    such tables. Failure should be visible, not silent.
+    """
+    return (device.protocol or "att") == "acc"
+
+
 @router.get("/{sn}/users")
 def list_device_users(sn: str, db: Session = Depends(get_db)):
     """Return user_ids enrolled on this device."""
@@ -594,11 +634,46 @@ def list_device_users(sn: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{sn}/users/push_bulk", dependencies=[Depends(require_admin)])
-def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get_db)):
-    """Push multiple employees to a device in one call."""
+def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
+                    db: Session = Depends(get_db)):
+    """Push several employees to one device. Same two transports, same rules.
+
+    On an `acc` device this is queueing, and the queue is deliberately slow:
+    COMMAND_BATCH_SIZE is 1 and a terminal polls about every 10 seconds, so
+    each person costs two commands and roughly 20 seconds. Ten people is
+    several minutes and it is not stuck. That number is not raised here on
+    spec — no real terminal has ever been observed acknowledging a
+    multi-command reply, and mis-acknowledging is the exact bug E7 fixed.
+    """
     device = _get_device_or_404(sn, db)
     pushed = []
     errors = []
+
+    if _uses_command_queue(device):
+        queued = []
+        for user_id in payload.user_ids:
+            emp = db.query(Employee).filter_by(user_id=user_id).first()
+            if not emp:
+                errors.append(f"{user_id}: employee not found in DB")
+                continue
+            queued.extend(r.id for r in provisioning.provision(db, sn, emp))
+            pushed.append(user_id)
+
+        response.status_code = 202
+        seconds = len(queued) * 10
+        return {
+            "device_sn": sn,
+            "transport": "adms_queue",
+            "status": "queued",
+            "pushed": pushed,
+            "errors": errors,
+            "command_ids": queued,
+            "message": (
+                f"Queued {len(queued)} commands for {len(pushed)} people. "
+                f"At one command per poll this takes roughly {seconds} seconds "
+                "to drain, and nothing is delivered until the device collects it."
+            ),
+        }
 
     try:
         with device_connection(device) as conn:
@@ -622,12 +697,7 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get
                         card=int(emp.card) if emp.card and emp.card != "0" else 0,
                     )
                     actual_uid = uid if uid is not None else pre_uid
-                    de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
-                    if de:
-                        de.uid = actual_uid
-                        de.synced_at = datetime.now(timezone.utc)
-                    else:
-                        db.add(DeviceEmployee(device_sn=sn, user_id=user_id, uid=actual_uid))
+                    employee_sync.link_device_employee(db, sn, user_id, uid=actual_uid)
                     pushed.append(user_id)
                 except Exception as e:
                     errors.append(f"{user_id}: {e}")
@@ -640,16 +710,47 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, db: Session = Depends(get
 
 
 @router.post("/{sn}/users/{user_id}/push", dependencies=[Depends(require_admin)])
-def push_user_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
-    """
-    Write an employee record from DB onto the device.
-    If the user already exists on the device, updates their record.
-    If new, the device auto-assigns a uid which we store in device_employees.
+def push_user_to_device(sn: str, user_id: str, response: Response, db: Session = Depends(get_db)):
+    """Put one employee onto one device. Explicit, per device, never fanned out.
+
+    Two transports, chosen by Device.protocol (see _uses_command_queue above),
+    and the response says which one ran and what actually happened:
+
+    * `att` — the SDK writes the device now. 200, `status: "written"`.
+    * `acc` — two commands are queued (the user record and the door
+      permission). **202, `status: "queued"`** — the device has not seen them
+      yet, will collect them on its next poll, and may still refuse them.
+      Calling that a success would be a lie the operator can only discover by
+      walking to the terminal.
+
+    In neither case does this enrol a biometric. The person walks up to the
+    terminal and registers their face or finger there; the device uploads the
+    template back by itself.
     """
     device = _get_device_or_404(sn, db)
     emp = db.query(Employee).filter_by(user_id=user_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    if _uses_command_queue(device):
+        rows = provisioning.provision(db, sn, emp)
+        response.status_code = 202
+        return {
+            "device_sn": sn,
+            "user_id": user_id,
+            "transport": "adms_queue",
+            "status": "queued",
+            "command_ids": [r.id for r in rows],
+            "commands": [r.command for r in rows],
+            # Said in the response rather than only in a docstring, because
+            # this string is what the UI shows and what stops "pushed" from
+            # being read as "done".
+            "message": (
+                f"Queued {len(rows)} commands for {sn}. The device collects "
+                "them on its next poll (about 10 seconds) and acknowledges "
+                "afterwards — this is not delivered yet."
+            ),
+        }
 
     try:
         with device_connection(device) as conn:
@@ -669,15 +770,19 @@ def push_user_to_device(sn: str, user_id: str, db: Session = Depends(get_db)):
 
             actual_uid = uid if uid is not None else pre_uid
 
-            de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
-            if de:
-                de.uid = actual_uid
-                de.synced_at = datetime.now(timezone.utc)
-            else:
-                db.add(DeviceEmployee(device_sn=sn, user_id=user_id, uid=actual_uid))
+            # One writer for this table, shared with the SDK pull, the ADMS
+            # upload ingest and the ADMS acknowledgement path (E1's rule).
+            employee_sync.link_device_employee(db, sn, user_id, uid=actual_uid)
             db.commit()
 
-        return {"device_sn": sn, "user_id": user_id, "uid": actual_uid, "message": "User pushed to device"}
+        return {
+            "device_sn": sn,
+            "user_id": user_id,
+            "uid": actual_uid,
+            "transport": "sdk",
+            "status": "written",
+            "message": "User written to device",
+        }
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 

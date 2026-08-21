@@ -68,6 +68,13 @@ export const api = {
   },
   employees: {
     list: () => request('GET', '/employees'),
+    // Admin-only. Creating a person here does NOT put them on any device —
+    // that is a separate, explicit per-device push.
+    create: (data) => request('POST', '/employees', data),
+    // Only the fields passed are touched; an empty string clears one. That is
+    // the difference between an operator edit and a device upload, which may
+    // never empty a field out.
+    update: (userId, data) => request('PATCH', `/employees/${userId}`, data),
     get: (userId) => request('GET', `/employees/${userId}`),
     getDevices: (userId) => request('GET', `/employees/${userId}/devices`),
     getTemplates: (userId) => request('GET', `/employees/${userId}/templates`),
@@ -123,6 +130,12 @@ export const api = {
     clearAttendance: (sn) => request('DELETE', `/devices/${sn}/attendance`),
     restart: (sn) => request('POST', `/devices/${sn}/restart`),
     queueCommand: (sn, command) => request('POST', `/devices/${sn}/commands`, { command }),
+    // The outbox: what this device still owes us. A row here is queued, not
+    // delivered — the device collects it on its next poll.
+    listCommands: (sn) => request('GET', `/devices/${sn}/commands`),
+    // Concluded commands: what the device said about each one. A `failed`
+    // row with a return_code is the device having refused it.
+    commandHistory: (sn) => request('GET', `/devices/${sn}/commands/history`),
     listUsers: (sn) => request('GET', `/devices/${sn}/users`),
     pushBulk: (sn, user_ids) => request('POST', `/devices/${sn}/users/push_bulk`, { user_ids }),
     pushUser: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/push`),

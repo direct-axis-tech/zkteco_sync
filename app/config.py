@@ -123,6 +123,44 @@ COMMAND_BATCH_SIZE = max(1, _get_int("COMMAND_BATCH_SIZE", 1))
 
 
 # ---------------------------------------------------------------------------
+# Central provisioning of people onto access-control terminals (E3)
+# ---------------------------------------------------------------------------
+# Creating a user on an `acc` terminal does NOT let that person through a
+# door. The user record and the door permission are two different tables, and
+# the permission one is `userauthorize` (§3.8):
+#
+#     DATA UPDATE userauthorize Pin=<n><HT>AuthorizeTimezoneId=<n>
+#
+# AuthorizeTimezoneId names one of the device's own stored access time zones —
+# a weekly schedule of intervals during which the holder may open the door.
+# The two values that matter:
+#
+#   0  is the ZKTeco convention for "no access time zone" — the person is
+#      known to the terminal, can enrol a face, verifies successfully, and is
+#      then refused at the door. That is the confusing half-success this
+#      setting exists to avoid, so it is NOT the default.
+#   1  is the factory-default time zone on ZKTeco access panels, defined as
+#      the whole week, 00:00-23:59 — i.e. "allowed at any time". It is what
+#      BioTime assigns a newly created person unless a schedule is chosen.
+#
+# So the default is 1: a person provisioned from here can open the door as
+# soon as they have enrolled a biometric, which is the workflow being built.
+# A site that runs real access schedules sets this to the id of the time zone
+# it has configured on the terminal. CAVEAT, stated plainly: no acknowledgement
+# from real hardware has ever been observed by this application, so "1 = 24/7"
+# is taken from the vendor's documented default and is not yet confirmed
+# against the operator's BioFace A1.
+PROVISION_AUTHORIZE_TIMEZONE_ID = _get_int("PROVISION_AUTHORIZE_TIMEZONE_ID", 1)
+
+# The `Group=` field of the user record. 0 is what ZKTeco's own SDK command
+# constants use in their worked example (§3.8), and access-group membership is
+# not how this application grants access — `userauthorize` above is. Exposed
+# because it is a device-semantics number, not a constant of nature: a site
+# that uses device access groups will need its own value here.
+PROVISION_USER_GROUP = _get_int("PROVISION_USER_GROUP", 0)
+
+
+# ---------------------------------------------------------------------------
 # Timezone provenance
 # ---------------------------------------------------------------------------
 # A ZKTeco device sends a bare wall-clock string with no offset and no zone

@@ -1,7 +1,24 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
+import { useAuth } from '../auth'
 
 const PRIVILEGE_LABELS = { 0: 'User', 2: 'Enroller', 14: 'Admin' }
+
+// A queued command names its subject in a `Pin=` field, TAB-separated from the
+// rest (§3.8). Matched field by field rather than by substring, so PIN 9001
+// does not pick up the commands belonging to PIN 19001.
+function commandIsAbout(command, userId) {
+  return String(command || '')
+    .split('\t')
+    .some((field) => field.trim().replace(/^DATA \w+ \w+ /, '') === `Pin=${userId}`)
+}
+
+// What a row in the outbox actually means, in the operator's words. `pending`
+// is not a failure: the device has simply not polled yet.
+const COMMAND_STATE = {
+  pending: 'Waiting for the device to poll',
+  sent: 'Delivered — waiting for the device to confirm',
+}
 
 // A terminal may enrol somebody with no name at all — every record in the
 // BioFace A1 capture arrived as `name=`. The ingest stores that as an empty
@@ -57,9 +74,145 @@ function Toast({ message, type, onDismiss }) {
   )
 }
 
-function DetailPanel({ employee, allDevices }) {
+function Field({ label, hint, children }) {
+  return (
+    <label className="block mb-3">
+      <span className="block text-xs font-medium text-gray-500 mb-1">{label}</span>
+      {children}
+      {hint && <span className="block text-xs text-gray-400 mt-1">{hint}</span>}
+    </label>
+  )
+}
+
+// Creating a person and editing one are the same six fields, minus the PIN:
+// the PIN is the key every attendance record and every biometric hangs off,
+// so it is set once and never renamed.
+function EmployeeForm({ employee, onDone, onCancel }) {
+  const editing = !!employee
+  const [form, setForm] = useState({
+    user_id: employee?.user_id || '',
+    name: employee?.name || '',
+    card: employee && employee.card !== '0' ? employee.card : '',
+    privilege: employee?.privilege ?? 0,
+  })
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+
+  const set = (key, value) => setForm((f) => ({ ...f, [key]: value }))
+
+  async function handleSubmit(e) {
+    e.preventDefault()
+    setSaving(true)
+    setError(null)
+    try {
+      const saved = editing
+        ? await api.employees.update(employee.user_id, {
+            name: form.name,
+            card: form.card,
+            privilege: Number(form.privilege),
+          })
+        : await api.employees.create({
+            user_id: form.user_id.trim(),
+            name: form.name,
+            card: form.card,
+            privilege: Number(form.privilege),
+          })
+      onDone(saved, editing)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto p-6">
+      <h2 className="text-lg font-semibold text-gray-900 mb-1">
+        {editing ? `Edit ${displayName(employee)}` : 'New employee'}
+      </h2>
+      <p className="text-sm text-gray-400 mb-5">
+        {editing
+          ? 'Saving changes here does not update any device. Push the person again to send the new details.'
+          : 'Adds the person to this server only. Push them to a device afterwards, then enrol their face or finger at that terminal.'}
+      </p>
+
+      <form onSubmit={handleSubmit} className="max-w-md">
+        {!editing && (
+          <Field
+            label="User ID (PIN)"
+            hint="The number the terminal knows this person by. Cannot be changed later."
+          >
+            <input
+              className="input w-full text-sm"
+              value={form.user_id}
+              onChange={(e) => set('user_id', e.target.value)}
+              required
+              maxLength={24}
+            />
+          </Field>
+        )}
+
+        <Field label="Name" hint="Optional — a person with no name shows as their PIN.">
+          <input
+            className="input w-full text-sm"
+            value={form.name}
+            onChange={(e) => set('name', e.target.value)}
+            maxLength={100}
+          />
+        </Field>
+
+        <Field label="Card number" hint="Optional. Leave empty for no card.">
+          <input
+            className="input w-full text-sm"
+            value={form.card}
+            onChange={(e) => set('card', e.target.value)}
+            maxLength={20}
+          />
+        </Field>
+
+        <Field
+          label="Privilege"
+          hint="Administrator gives this person the terminal's own menus."
+        >
+          <select
+            className="input w-full text-sm"
+            value={form.privilege}
+            onChange={(e) => set('privilege', e.target.value)}
+          >
+            <option value={0}>User</option>
+            <option value={2}>Enroller</option>
+            <option value={14}>Administrator</option>
+          </select>
+        </Field>
+
+        {error && <p className="text-sm text-red-600 mb-3">{error}</p>}
+
+        <div className="flex gap-2 mt-4">
+          <button
+            type="submit"
+            disabled={saving || (!editing && !form.user_id.trim())}
+            className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {saving ? 'Saving…' : editing ? 'Save changes' : 'Create employee'}
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="text-sm text-gray-500 hover:text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-50 transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
   const [enrolledDevices, setEnrolledDevices] = useState(null)
   const [templates, setTemplates] = useState(null)
+  const [queued, setQueued] = useState([])
+  const [refused, setRefused] = useState([])
   const [toast, setToast] = useState(null)
 
   // Push to device
@@ -83,7 +236,42 @@ function DetailPanel({ employee, allDevices }) {
     setTemplates(null)
     api.employees.getDevices(employee.user_id).then(setEnrolledDevices).catch(() => setEnrolledDevices([]))
     api.employees.getTemplates(employee.user_id).then(setTemplates).catch(() => setTemplates([]))
-  }, [employee?.user_id])
+
+    // What is still owed to a device for this person. Only `acc` terminals
+    // have an outbox — an SDK push is synchronous and has either happened or
+    // failed by the time the call returns.
+    const queueDevices = allDevices.filter((d) => d.protocol === 'acc')
+    Promise.all(
+      queueDevices.map((d) =>
+        api.devices
+          .listCommands(d.serial_number)
+          .then((rows) =>
+            rows
+              .filter((r) => commandIsAbout(r.command, employee.user_id))
+              .map((r) => ({ ...r, device_sn: d.serial_number }))
+          )
+          .catch(() => [])
+      )
+    ).then((lists) => setQueued(lists.flat()))
+
+    // Commands the device refused. Worth its own section rather than being
+    // left in the device's command history: a `user` record that landed and a
+    // `userauthorize` that was refused is a person the terminal recognises,
+    // lets enrol, verifies — and then will not open the door for. That is the
+    // hardest state in this whole workflow to diagnose from the outside.
+    Promise.all(
+      queueDevices.map((d) =>
+        api.devices
+          .commandHistory(d.serial_number)
+          .then((rows) =>
+            rows
+              .filter((r) => r.outcome === 'failed' && commandIsAbout(r.command, employee.user_id))
+              .map((r) => ({ ...r, device_sn: d.serial_number }))
+          )
+          .catch(() => [])
+      )
+    ).then((lists) => setRefused(lists.flat()))
+  }, [employee?.user_id, allDevices])
 
   useEffect(() => {
     reload()
@@ -99,14 +287,27 @@ function DetailPanel({ employee, allDevices }) {
 
   const enrolledSns = new Set((enrolledDevices || []).map((d) => d.device_sn))
   const unenrolledDevices = allDevices.filter((d) => !enrolledSns.has(d.serial_number))
+  // An access-control terminal is provisioned over the command queue, so the
+  // button must not promise something synchronous.
+  const pushIsQueued =
+    allDevices.find((d) => d.serial_number === pushDeviceSn)?.protocol === 'acc'
 
   async function handlePushToDevice(e) {
     e.preventDefault()
     if (!pushDeviceSn) return
     setPushing(true)
     try {
-      await api.devices.pushUser(pushDeviceSn, employee.user_id)
-      showToast(`Pushed to ${pushDeviceSn}`)
+      const result = await api.devices.pushUser(pushDeviceSn, employee.user_id)
+      // "Queued" and "written" are different things and the difference is
+      // visible to the operator, because only one of them means the device
+      // has actually got the person. An access-control terminal collects its
+      // commands on its next poll — about ten seconds — and confirms them
+      // afterwards; claiming success here would be a guess.
+      if (result?.status === 'queued') {
+        showToast(result.message || `Queued for ${pushDeviceSn} — not delivered yet`)
+      } else {
+        showToast(`Written to ${pushDeviceSn}`)
+      }
       setPushDeviceSn('')
       reload()
     } catch (err) {
@@ -186,7 +387,19 @@ function DetailPanel({ employee, allDevices }) {
       </div>
 
       {/* Profile */}
-      <Section title="Profile">
+      <Section
+        title="Profile"
+        action={
+          isAdmin && (
+            <button
+              onClick={() => onEdit(employee)}
+              className="text-xs text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 transition-colors"
+            >
+              Edit
+            </button>
+          )
+        }
+      >
         <div className="bg-gray-50 rounded-lg px-4 divide-y divide-gray-100">
           {[
             ['Name', employee.name || '—'],
@@ -202,6 +415,72 @@ function DetailPanel({ employee, allDevices }) {
           ))}
         </div>
       </Section>
+
+      {/* Queued, not delivered. An access-control terminal is never dialled:
+          it collects its commands on its own schedule, so this section is the
+          honest state between "pushed" and "on the device". */}
+      {queued.length > 0 && (
+        <Section title="Queued for delivery">
+          <p className="text-xs text-gray-400 mb-2">
+            Not on the device yet. Each terminal collects one command per poll
+            (about every 10 seconds) and confirms it afterwards.
+          </p>
+          <div className="space-y-2">
+            {queued.map((row) => {
+              const deviceName =
+                allDevices.find((x) => x.serial_number === row.device_sn)?.name
+              return (
+                <div key={row.id} className="bg-amber-50 rounded-lg px-3 py-2.5 text-sm">
+                  <div className="flex items-center gap-2">
+                    <p className="text-gray-800 font-medium flex-1 min-w-0 truncate">
+                      {deviceName || row.device_sn}
+                    </p>
+                    <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">
+                      {row.status === 'sent' ? 'Awaiting confirmation' : 'Queued'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {COMMAND_STATE[row.status] || row.status}
+                    {row.attempts > 0 && ` · attempt ${row.attempts}`}
+                  </p>
+                  <p className="text-xs text-gray-400 font-mono mt-1 truncate">
+                    {row.command.split('\t')[0]}
+                  </p>
+                </div>
+              )
+            })}
+          </div>
+        </Section>
+      )}
+
+      {/* What the device refused. */}
+      {refused.length > 0 && (
+        <Section title="Refused by the device">
+          <div className="space-y-2">
+            {refused.map((row) => {
+              const deviceName =
+                allDevices.find((x) => x.serial_number === row.device_sn)?.name
+              const isDoorPermission = row.command.startsWith('DATA UPDATE userauthorize')
+              return (
+                <div key={row.id} className="bg-red-50 rounded-lg px-3 py-2.5 text-sm">
+                  <p className="text-gray-800 font-medium truncate">
+                    {deviceName || row.device_sn}
+                  </p>
+                  <p className="text-xs text-red-700 mt-1">
+                    {isDoorPermission
+                      ? 'The door permission was refused. This person can be recognised by the terminal and will still not be let through.'
+                      : 'The device refused this command.'}
+                    {row.return_code != null && ` (Return=${row.return_code})`}
+                  </p>
+                  <p className="text-xs text-gray-400 font-mono mt-1 truncate">
+                    {row.command.split('\t')[0]}
+                  </p>
+                </div>
+              )
+            })}
+          </div>
+        </Section>
+      )}
 
       {/* Enrolled Devices */}
       <Section title="Enrolled Devices">
@@ -267,9 +546,23 @@ function DetailPanel({ employee, allDevices }) {
                   disabled={!pushDeviceSn || pushing}
                   className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
                 >
-                  {pushing ? 'Pushing…' : 'Push to Device'}
+                  {pushing
+                    ? pushIsQueued
+                      ? 'Queueing…'
+                      : 'Pushing…'
+                    : pushIsQueued
+                    ? 'Queue for Device'
+                    : 'Push to Device'}
                 </button>
               </form>
+            )}
+            {pushIsQueued && (
+              <p className="text-xs text-gray-400 mt-2">
+                This terminal is queued, not written directly: it collects the
+                person and their door permission on its next poll. They appear
+                above once the device confirms, and can enrol a face or finger
+                at the terminal from then on.
+              </p>
             )}
           </>
         )}
@@ -367,11 +660,25 @@ function DetailPanel({ employee, allDevices }) {
 }
 
 export default function Employees() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const [employees, setEmployees] = useState([])
   const [allDevices, setAllDevices] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState(null)
+  // null | 'create' | an employee being edited
+  const [editing, setEditing] = useState(null)
+
+  function handleSaved(saved, wasEditing) {
+    setEmployees((list) =>
+      wasEditing
+        ? list.map((e) => (e.user_id === saved.user_id ? saved : e))
+        : [...list, saved]
+    )
+    setSelected(saved)
+    setEditing(null)
+  }
 
   useEffect(() => {
     Promise.all([api.employees.list(), api.devices.list()])
@@ -402,6 +709,14 @@ export default function Employees() {
             placeholder="Search employees…"
             className="input w-full text-sm"
           />
+          {isAdmin && (
+            <button
+              onClick={() => setEditing('create')}
+              className="mt-2 w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+            >
+              New employee
+            </button>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto">
@@ -413,7 +728,10 @@ export default function Employees() {
             filtered.map((emp) => (
               <button
                 key={emp.user_id}
-                onClick={() => setSelected(emp)}
+                onClick={() => {
+                  setSelected(emp)
+                  setEditing(null)
+                }}
                 className={`w-full text-left px-4 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50 transition-colors ${
                   selected?.user_id === emp.user_id
                     ? 'bg-blue-50 border-l-2 border-l-blue-500'
@@ -433,7 +751,20 @@ export default function Employees() {
       </div>
 
       {/* Detail panel */}
-      <DetailPanel employee={selected} allDevices={allDevices} />
+      {editing ? (
+        <EmployeeForm
+          employee={editing === 'create' ? null : editing}
+          onDone={handleSaved}
+          onCancel={() => setEditing(null)}
+        />
+      ) : (
+        <DetailPanel
+          employee={selected}
+          allDevices={allDevices}
+          isAdmin={isAdmin}
+          onEdit={setEditing}
+        />
+      )}
     </div>
   )
 }

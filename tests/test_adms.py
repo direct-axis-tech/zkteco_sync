@@ -3362,5 +3362,716 @@ class CommandSchemaTests(unittest.TestCase):
             db.close()
 
 
+# ---------------------------------------------------------------------------
+# 20. E3 — creating a person centrally and provisioning them onto a terminal
+# ---------------------------------------------------------------------------
+#
+# This is the first code in the application that writes to physical
+# access-control hardware, so the assertions below are about literal bytes and
+# about which table a row does *not* appear in, not about status codes.
+#
+# The two failure modes being guarded:
+#
+#   1. A command shape the terminal refuses, or — worse — accepts with the
+#      wrong meaning. Hence the exact-string assertions against §3.8, taken
+#      from the vendor's own worked example rather than from the code.
+#   2. Both transports writing device_employees for the same (device, user),
+#      which is the collision the whole bulk-data programme is routed around.
+
+
+class ProvisioningTestCase(CommandDeliveryTestCase):
+    """Devices + ADMS + employees routers over one database.
+
+    Inherits the two `acc` terminals and the admin session from the E7 case
+    and adds an `att` one, because the point of these tests is the difference
+    between them.
+    """
+
+    ATT_SN = "E3ATTTEST00001"
+    DEFAULT_SN = "E3DEFAULT00001"
+
+    def setUp(self):
+        super().setUp()
+        from app.routers import employees as employees_router
+        # The app object the E7 fixture built; routes are consulted per
+        # request, so including another router now is enough.
+        self.client.app.include_router(employees_router.router)
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=self.ATT_SN, ip_address="203.0.113.11",
+                          port=4370, name="Attendance terminal",
+                          status="approved", protocol="att"))
+            # Deliberately does NOT set protocol: this is what a device row
+            # that nobody has classified looks like.
+            db.add(Device(serial_number=self.DEFAULT_SN, ip_address="203.0.113.12",
+                          port=4370, name="Unclassified terminal",
+                          status="approved"))
+            db.commit()
+        finally:
+            db.close()
+
+    # -- helpers ---------------------------------------------------------
+
+    def create_employee(self, user_id="9001", **fields):
+        payload = {"user_id": user_id}
+        payload.update(fields)
+        return self.client.post("/employees", json=payload)
+
+    def links(self, sn=None):
+        db = self.Session()
+        try:
+            query = db.query(DeviceEmployee)
+            if sn:
+                query = query.filter_by(device_sn=sn)
+            return query.order_by(DeviceEmployee.id).all()
+        finally:
+            db.close()
+
+    def employee(self, user_id):
+        db = self.Session()
+        try:
+            return db.query(Employee).filter_by(user_id=user_id).first()
+        finally:
+            db.close()
+
+    def push(self, sn, user_id):
+        return self.client.post(f"/devices/{sn}/users/{user_id}/push")
+
+
+class FakeConnection:
+    """Just enough pyzk for the SDK push path, and a record of what it wrote."""
+
+    def __init__(self, next_uid=5, users=()):
+        self.next_uid = next_uid
+        self._users = list(users)
+        self.written = []
+
+    def get_users(self):
+        return self._users
+
+    def set_user(self, **kwargs):
+        self.written.append(kwargs)
+
+
+def fake_sdk(conn):
+    """Patch for app.routers.devices.device_connection."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _connect(device):
+        yield conn
+
+    return _connect
+
+
+# ---------------------------------------------------------------------------
+# 20a. The command shapes, against the vendor's own text
+# ---------------------------------------------------------------------------
+
+class ProvisioningCommandShapeTests(unittest.TestCase):
+    """The literal bytes. §3.8 is the authority; this file is not.
+
+    Verbatim from the protocol reference, with <HT> spelled as the tab it is::
+
+        DATA UPDATE user Pin=1<HT>CardNo=<n><HT>Password=234<HT>Group=0<HT>
+        StartTime=0<HT>EndTime=0<HT>Name=<s><HT>Privilege=0
+        DATA UPDATE userauthorize Pin=<n><HT>AuthorizeTimezoneId=<n>
+
+    If a refactor reorders or renames a field, or turns one separator into a
+    space, this fails — which is the only warning available before a real
+    terminal either misreads the record or refuses it.
+    """
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def employee(self, **fields):
+        values = dict(user_id="9001", name="Aisha Rahman", privilege=0, card="0")
+        values.update(fields)
+        return Employee(**values)
+
+    def test_the_user_command_is_exactly_the_documented_shape(self):
+        self.assertEqual(
+            self.provisioning.user_command(self.employee()),
+            "DATA UPDATE user Pin=9001\tCardNo=0\tPassword=\tGroup=0\t"
+            "StartTime=0\tEndTime=0\tName=Aisha Rahman\tPrivilege=0",
+        )
+
+    def test_the_authorize_command_is_exactly_the_documented_shape(self):
+        self.assertEqual(
+            self.provisioning.authorize_command("9001"),
+            "DATA UPDATE userauthorize Pin=9001\tAuthorizeTimezoneId=1",
+        )
+
+    def test_the_command_name_is_space_separated_and_the_fields_are_tabs(self):
+        """§3.8, verbatim: 'the command name is space-separated, its fields are
+        TAB-separated'. Getting this backwards produces a command the device
+        parses as one enormous field."""
+        command = self.provisioning.user_command(self.employee())
+        head, _, rest = command.partition("Pin=")
+        self.assertEqual(head, "DATA UPDATE user ")
+        self.assertNotIn("\t", head)
+        self.assertEqual(len(command.split("\t")), 8)
+
+    def test_every_documented_field_is_present_in_order(self):
+        fields = self.provisioning.user_command(self.employee()).split("\t")
+        names = [f.split("=")[0] for f in fields]
+        names[0] = names[0].replace("DATA UPDATE user ", "")
+        self.assertEqual(names, [
+            "Pin", "CardNo", "Password", "Group",
+            "StartTime", "EndTime", "Name", "Privilege",
+        ])
+
+    def test_a_card_number_is_carried_and_a_missing_one_becomes_zero(self):
+        self.assertIn("CardNo=778899",
+                      self.provisioning.user_command(self.employee(card="778899")))
+        for empty in ("", "0", None):
+            self.assertIn("CardNo=0",
+                          self.provisioning.user_command(self.employee(card=empty)))
+
+    def test_privilege_zero_is_written_not_dropped(self):
+        """0 is a real privilege (ordinary user), not a missing one."""
+        self.assertTrue(
+            self.provisioning.user_command(self.employee(privilege=0))
+            .endswith("Privilege=0")
+        )
+        self.assertTrue(
+            self.provisioning.user_command(self.employee(privilege=14))
+            .endswith("Privilege=14")
+        )
+
+    def test_a_tab_in_a_name_cannot_forge_an_extra_field(self):
+        """Field injection. A name is operator input; a raw TAB inside it would
+        invent a field boundary and could hand somebody Privilege=14."""
+        command = self.provisioning.user_command(
+            self.employee(name="Aisha\tPrivilege=14")
+        )
+        fields = command.split("\t")
+        # Still eight fields, and the injected text is a value inside the Name
+        # field rather than a field of its own — the device splits on TAB and
+        # then on the first "=", so it reads this person's name as the whole
+        # string "Aisha Privilege=14".
+        self.assertEqual(len(fields), 8)
+        self.assertEqual(fields[6], "Name=Aisha Privilege=14")
+        self.assertEqual(fields[7], "Privilege=0")
+
+    def test_a_newline_in_a_name_cannot_forge_an_extra_record(self):
+        """Records are LF-separated, so a newline is a second command."""
+        command = self.provisioning.user_command(
+            self.employee(name="Aisha\nDATA DELETE user Pin=1")
+        )
+        fields = command.split("\t")
+        # One line, one command, eight fields: the injected text is carried as
+        # part of the name, not as a second record the device would execute.
+        self.assertNotIn("\n", command)
+        self.assertNotIn("\r", command)
+        self.assertEqual(len(fields), 8)
+        self.assertEqual(fields[6], "Name=Aisha DATA DELETE user Pin=1")
+        self.assertTrue(command.startswith("DATA UPDATE user Pin=9001\t"))
+
+    def test_the_authorize_timezone_is_configurable(self):
+        original = config.PROVISION_AUTHORIZE_TIMEZONE_ID
+        try:
+            config.PROVISION_AUTHORIZE_TIMEZONE_ID = 7
+            self.assertEqual(
+                self.provisioning.authorize_command("9001"),
+                "DATA UPDATE userauthorize Pin=9001\tAuthorizeTimezoneId=7",
+            )
+        finally:
+            config.PROVISION_AUTHORIZE_TIMEZONE_ID = original
+
+    def test_the_default_authorize_timezone_is_not_zero(self):
+        """0 means 'no access time zone': the person verifies and the door
+        stays shut. That half-success is the thing this unit exists to avoid,
+        so it must not be what an operator gets by doing nothing."""
+        self.assertNotEqual(config.PROVISION_AUTHORIZE_TIMEZONE_ID, 0)
+
+    def test_both_commands_are_produced_in_delivery_order(self):
+        bodies = self.provisioning.commands_for(self.employee())
+        self.assertEqual(len(bodies), 2)
+        self.assertTrue(bodies[0].startswith("DATA UPDATE user "))
+        self.assertTrue(bodies[1].startswith("DATA UPDATE userauthorize "))
+
+    def test_only_the_user_command_identifies_a_provisioned_person(self):
+        """An acknowledged door permission is not evidence that the terminal
+        accepted the person, so it must not create a device link."""
+        self.assertEqual(
+            self.provisioning.pin_from_user_command(
+                "DATA UPDATE user Pin=9001\tCardNo=0"), "9001")
+        self.assertIsNone(self.provisioning.pin_from_user_command(
+            "DATA UPDATE userauthorize Pin=9001\tAuthorizeTimezoneId=1"))
+        self.assertIsNone(self.provisioning.pin_from_user_command(
+            "DATA UPDATE biophoto PIN=9001\tContent=xx"))
+        self.assertIsNone(self.provisioning.pin_from_user_command("REBOOT"))
+
+
+# ---------------------------------------------------------------------------
+# 20b. Employee creation and editing
+# ---------------------------------------------------------------------------
+
+class EmployeeCreationTests(ProvisioningTestCase):
+    """Admin-authored people, written through the one employee writer."""
+
+    def test_an_operator_can_create_an_employee(self):
+        response = self.create_employee("9001", name="Aisha Rahman", card="778899")
+        self.assertEqual(response.status_code, 201, response.text)
+        emp = self.employee("9001")
+        self.assertEqual((emp.name, emp.card, emp.privilege),
+                         ("Aisha Rahman", "778899", 0))
+
+    def test_a_created_employee_is_on_no_device_yet(self):
+        """Creating somebody centrally must not put them on a door. Which
+        doors a person may open is an explicit, per-device decision."""
+        self.create_employee("9001", name="Aisha Rahman")
+        self.assertEqual(self.links(), [])
+        self.assertEqual(self.outbox(), [])
+
+    def test_a_missing_card_is_stored_as_the_no_card_convention(self):
+        self.create_employee("9002", name="Bilal")
+        self.assertEqual(self.employee("9002").card, "0")
+
+    def test_a_duplicate_pin_is_refused_rather_than_merged(self):
+        """The PIN is the device's key for a person. Merging a typo into
+        somebody else's row would attach the wrong face to the wrong name."""
+        self.create_employee("9001", name="Aisha Rahman")
+        response = self.create_employee("9001", name="Someone Else")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.employee("9001").name, "Aisha Rahman")
+
+    def test_creation_and_editing_go_through_the_shared_writer(self):
+        """Structural, not behavioural: E1 removed a competing writer to make
+        employee_sync the only one. This fails if anyone adds a third."""
+        import inspect as _inspect
+        from app.routers import employees as employees_router
+
+        source = _inspect.getsource(employees_router)
+        self.assertIn("employee_sync.create_employee", source)
+        self.assertIn("employee_sync.apply_operator_edit", source)
+        self.assertNotIn("db.add(Employee(", source)
+
+    def test_employee_sync_is_the_only_module_that_writes_employees(self):
+        """Repo-wide. The guard E1 put on the poller, widened to everything."""
+        import pathlib
+        offenders = []
+        for path in pathlib.Path("app").rglob("*.py"):
+            if path.name == "employee_sync.py":
+                continue
+            text_ = path.read_text()
+            if "db.add(Employee(" in text_ or "db.add(DeviceEmployee(" in text_:
+                offenders.append(str(path))
+        self.assertEqual(offenders, [])
+
+    def test_creating_and_editing_are_admin_only(self):
+        """The endpoints are proved to require an admin by their declaration,
+        which is testable without a session; require_admin itself is D1's."""
+        import inspect as _inspect
+        from fastapi import params
+        from app.deps import require_admin
+        from app.routers import employees as employees_router
+
+        for endpoint in (employees_router.create_employee,
+                         employees_router.update_employee):
+            dependencies = [
+                p.default.dependency
+                for p in _inspect.signature(endpoint).parameters.values()
+                if isinstance(p.default, params.Depends)
+            ]
+            self.assertIn(require_admin, dependencies, endpoint.__name__)
+
+    # -- editing ---------------------------------------------------------
+
+    def test_a_deliberate_edit_can_clear_a_name(self):
+        """The difference between the two kinds of source. A device saying
+        `name=` means 'nothing to say'; an operator emptying the field means
+        'remove it', and both go through the same module."""
+        self.create_employee("9001", name="Aisha Rahman")
+        response = self.client.patch("/employees/9001", json={"name": ""})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.employee("9001").name, "")
+
+    def test_a_device_still_cannot_clear_what_an_operator_typed(self):
+        """E1's rule survives the new writer."""
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+        self.client.post(
+            f"/iclock/cdata?SN={self.SN}&table=tabledata&tablename=user&count=1",
+            content="user uid=1\tpin=9001\tname=\tcardno=\n",
+        )
+        emp = self.employee("9001")
+        self.assertEqual(emp.name, "Aisha Rahman")
+        self.assertEqual(emp.card, "778899")
+
+    def test_an_edit_touches_only_the_fields_that_were_sent(self):
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+        self.client.patch("/employees/9001", json={"card": "112233"})
+        emp = self.employee("9001")
+        self.assertEqual(emp.card, "112233")
+        self.assertEqual(emp.name, "Aisha Rahman")
+
+    def test_an_edit_can_clear_a_card(self):
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+        self.client.patch("/employees/9001", json={"card": ""})
+        self.assertEqual(self.employee("9001").card, "0")
+
+    def test_privilege_can_be_lowered_to_zero(self):
+        """0 is a value, not an absence — demoting a device admin has to work."""
+        self.create_employee("9001", name="Aisha Rahman", privilege=14)
+        self.client.patch("/employees/9001", json={"privilege": 0})
+        self.assertEqual(self.employee("9001").privilege, 0)
+
+    def test_editing_somebody_who_does_not_exist_is_a_404(self):
+        self.assertEqual(
+            self.client.patch("/employees/nobody", json={"name": "X"}).status_code, 404)
+
+    def test_an_edit_does_not_push_anything_to_any_device(self):
+        """A silent fan-out to every terminal is exactly the auto-push the
+        operator ruled out. The device keeps the old record until pushed."""
+        self.create_employee("9001", name="Aisha Rahman")
+        self.push(self.SN, "9001")
+        before = len(self.outbox())
+        self.client.patch("/employees/9001", json={"name": "Aisha R"})
+        self.assertEqual(len(self.outbox()), before)
+
+
+# ---------------------------------------------------------------------------
+# 20c. Provisioning onto an `acc` terminal, over the queue
+# ---------------------------------------------------------------------------
+
+class AccProvisioningTests(ProvisioningTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+
+    def test_a_push_queues_the_user_record_and_the_door_permission(self):
+        """Both, in order. A user command without an authorize command is a
+        person the terminal recognises and refuses."""
+        response = self.push(self.SN, "9001")
+        self.assertEqual(response.status_code, 202, response.text)
+
+        queued = [row.command for row in self.outbox(self.SN)]
+        self.assertEqual(queued, [
+            "DATA UPDATE user Pin=9001\tCardNo=778899\tPassword=\tGroup=0\t"
+            "StartTime=0\tEndTime=0\tName=Aisha Rahman\tPrivilege=0",
+            "DATA UPDATE userauthorize Pin=9001\tAuthorizeTimezoneId=1",
+        ])
+
+    def test_the_bytes_the_device_is_handed_carry_the_id_envelope(self):
+        """§3.8 on the wire: C:<id>:<command>. Without the id the device has
+        nothing to quote back and the acknowledgement cannot be matched."""
+        self.push(self.SN, "9001")
+        ids = [row.id for row in self.outbox(self.SN)]
+
+        self.assertEqual(
+            self.poll(),
+            f"C:{ids[0]}:DATA UPDATE user Pin=9001\tCardNo=778899\tPassword=\t"
+            "Group=0\tStartTime=0\tEndTime=0\tName=Aisha Rahman\tPrivilege=0",
+        )
+        self.assertEqual(
+            self.poll(),
+            f"C:{ids[1]}:DATA UPDATE userauthorize Pin=9001\tAuthorizeTimezoneId=1",
+        )
+
+    def test_the_response_says_queued_and_does_not_claim_success(self):
+        body = self.push(self.SN, "9001").json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertIn("not delivered yet", body["message"])
+        self.assertEqual(len(body["command_ids"]), 2)
+
+    def test_pushing_somebody_who_does_not_exist_is_a_404(self):
+        self.assertEqual(self.push(self.SN, "nobody").status_code, 404)
+        self.assertEqual(self.outbox(), [])
+
+    def test_pushing_to_an_unknown_device_is_a_404(self):
+        self.assertEqual(self.push("NOSUCHSERIAL", "9001").status_code, 404)
+        self.assertEqual(self.outbox(), [])
+
+    def test_a_push_is_per_device_and_never_fans_out(self):
+        """Manual and explicit, per the operator's decision."""
+        self.push(self.SN, "9001")
+        self.assertEqual(len(self.outbox(self.SN)), 2)
+        self.assertEqual(self.outbox(self.OTHER_SN), [])
+
+    def test_an_unnamed_person_is_pushed_as_their_pin_not_an_invented_name(self):
+        self.create_employee("9002")
+        self.push(self.SN, "9002")
+        self.assertIn("Name=\tPrivilege=0", self.outbox(self.SN)[0].command)
+
+    # -- what an acknowledgement means --------------------------------------
+
+    def test_no_device_link_exists_until_the_device_acknowledges(self):
+        """Queued is not delivered, so `enrolled on this device` is not yet
+        true and the table must not say it is."""
+        self.push(self.SN, "9001")
+        self.assertEqual(self.links(), [])
+
+        self.poll()          # device collects the user command
+        self.assertEqual(self.links(), [])   # collected, not yet confirmed
+
+    def test_the_link_appears_when_the_user_command_is_acknowledged(self):
+        self.push(self.SN, "9001")
+        user_id_command = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(user_id_command, return_code=0)
+
+        links = self.links(self.SN)
+        self.assertEqual([l.user_id for l in links], ["9001"])
+        # Un-slotted: the terminal assigns its own uid and never tells us
+        # what it chose. Inventing one would make a later SDK write address
+        # the wrong user.
+        self.assertEqual(links[0].uid, 0)
+
+    def test_acknowledging_the_authorize_command_adds_no_second_link(self):
+        self.push(self.SN, "9001")
+        first, second = [row.id for row in self.outbox(self.SN)]
+        self.poll()
+        self.ack(first, return_code=0)
+        self.poll()
+        self.ack(second, return_code=0)
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+    def test_a_refused_user_command_leaves_no_link_behind(self):
+        """A non-zero Return is the device rejecting the record. Recording the
+        person as provisioned anyway would be the lie that matters most."""
+        self.push(self.SN, "9001")
+        command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(command_id, return_code=-14)
+
+        self.assertEqual(self.links(), [])
+        concluded = [r for r in self.history(self.SN) if r.outcome == "failed"]
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].return_code, -14)
+
+    def test_an_acknowledgement_in_the_query_string_also_provisions(self):
+        """Which of the two framings this firmware uses is unverified — §3.9
+        says body, §3.8's example reads as a query string. Both must work."""
+        self.push(self.SN, "9001")
+        command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(command_id, return_code=0, in_query=True)
+        self.assertEqual([l.user_id for l in self.links(self.SN)], ["9001"])
+
+    def test_an_ack_for_a_command_that_was_never_issued_provisions_nobody(self):
+        self.ack(4242, return_code=0)
+        self.assertEqual(self.links(), [])
+
+    def test_a_second_push_of_the_same_person_does_not_duplicate_the_link(self):
+        for _ in range(2):
+            self.push(self.SN, "9001")
+        for row in list(self.outbox(self.SN)):
+            self.poll()
+            self.ack(row.id, return_code=0)
+        self.assertEqual(len(self.links(self.SN)), 1)
+
+    def test_bulk_provisioning_queues_everyone_and_reports_the_wait(self):
+        """Batching is not raised speculatively: one command per ~10s poll, so
+        the honest thing to report is how long the queue will take to drain."""
+        self.create_employee("9002", name="Bilal Khan")
+        response = self.client.post(f"/devices/{self.SN}/users/push_bulk",
+                                    json={"user_ids": ["9001", "9002", "nobody"]})
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["pushed"], ["9001", "9002"])
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertEqual(len(self.outbox(self.SN)), 4)
+        self.assertIn("40 seconds", body["message"])
+        self.assertEqual(config.COMMAND_BATCH_SIZE, 1)
+
+
+# ---------------------------------------------------------------------------
+# 20d. Transport routing: never both, for the same (device, user)
+# ---------------------------------------------------------------------------
+
+class TransportRoutingTests(ProvisioningTestCase):
+    """The collision the whole bulk-data programme is routed around.
+
+    The SDK path writes device_employees synchronously; the ADMS path writes
+    it on acknowledgement. If a device could take both, the two would race and
+    disagree about uid. It cannot: the transport is a function of
+    Device.protocol, and a device has exactly one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("9001", name="Aisha Rahman", card="778899")
+
+    def test_an_att_device_uses_the_sdk_and_never_touches_the_outbox(self):
+        from unittest import mock
+        conn = FakeConnection(next_uid=5)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.push(self.ATT_SN, "9001")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["transport"], "sdk")
+        self.assertEqual(response.json()["status"], "written")
+        self.assertEqual(len(conn.written), 1)
+        self.assertEqual(conn.written[0]["user_id"], "9001")
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual([l.uid for l in self.links(self.ATT_SN)], [5])
+
+    def test_an_acc_device_uses_the_queue_and_never_opens_a_socket(self):
+        from unittest import mock
+        conn = FakeConnection()
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            self.push(self.SN, "9001")
+
+        self.assertEqual(conn.written, [])
+        self.assertEqual(len(self.outbox(self.SN)), 2)
+        self.assertEqual(self.links(self.SN), [])
+
+    def test_a_device_with_no_protocol_set_takes_the_sdk_path(self):
+        """Predictable, and deliberately the loud direction: an SDK push to a
+        device that cannot answer fails with a 503 in front of the operator,
+        whereas acc-shaped commands queued to an attendance terminal would sit
+        in the outbox looking healthy and be refused on collection."""
+        from unittest import mock
+        conn = FakeConnection(next_uid=9)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.push(self.DEFAULT_SN, "9001")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["transport"], "sdk")
+        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+
+    def test_the_routing_function_is_total_and_defaults_to_the_sdk(self):
+        """Including for values no column constraint allows but a stale row
+        might still hold."""
+        from app.routers import devices as devices_router
+
+        class Stub:
+            def __init__(self, protocol):
+                self.protocol = protocol
+
+        self.assertTrue(devices_router._uses_command_queue(Stub("acc")))
+        for value in ("att", None, "", "ACC-ish", "unknown"):
+            self.assertFalse(devices_router._uses_command_queue(Stub(value)), value)
+
+    def test_neither_transport_writes_device_employees_inline(self):
+        """Both go through employee_sync.link_device_employee. This is the
+        structural half of the proof; the behavioural half is above."""
+        import inspect as _inspect
+        from app.routers import devices as devices_router
+        from app.services import provisioning
+
+        for module in (devices_router, provisioning):
+            source = _inspect.getsource(module)
+            self.assertNotIn("db.add(DeviceEmployee(", source, module.__name__)
+        self.assertIn("employee_sync.link_device_employee",
+                      _inspect.getsource(devices_router))
+        self.assertIn("employee_sync.link_device_employee",
+                      _inspect.getsource(provisioning))
+
+    def test_one_pair_ends_with_one_link_even_if_the_protocol_is_corrected(self):
+        """The only way a pair could see both transports is an operator
+        correcting the protocol between two pushes (E6). The link converges on
+        one row rather than growing a second."""
+        from unittest import mock
+
+        self.push(self.SN, "9001")
+        user_command_id = self.outbox(self.SN)[0].id
+        self.poll()
+        self.ack(user_command_id, return_code=0)
+        self.assertEqual(len(self.links(self.SN)), 1)
+        self.assertEqual(self.links(self.SN)[0].uid, 0)
+
+        db = self.Session()
+        try:
+            db.query(Device).filter_by(serial_number=self.SN).first().protocol = "att"
+            db.commit()
+        finally:
+            db.close()
+
+        conn = FakeConnection(next_uid=11)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            self.push(self.SN, "9001")
+
+        links = self.links(self.SN)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0].uid, 11)   # converged on the real slot number
+
+    def test_an_unreachable_att_device_reports_a_failure_rather_than_queueing(self):
+        """Asymmetric fallback, per the shared constraint: SDK failure is
+        detectable, so it is reported. It does NOT silently become a queued
+        acc-shaped command the terminal has no tables for."""
+        from unittest import mock
+        from zk.exception import ZKNetworkError
+
+        def _boom(device):
+            raise ZKNetworkError("unreachable")
+
+        with mock.patch("app.routers.devices.device_connection", _boom):
+            response = self.push(self.ATT_SN, "9001")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(self.links(self.ATT_SN), [])
+
+
+# ---------------------------------------------------------------------------
+# 21. The SPA shell must not be cached over its own API path
+# ---------------------------------------------------------------------------
+
+class SpaShellCachingTests(unittest.TestCase):
+    """/employees is a page AND an API route, told apart by request headers.
+
+    Found while exercising E3 in a real browser: after a hard reload of
+    /employees the page showed "0 employees" while the API was answering
+    correctly. FileResponse had served the shell with an ETag and no Vary, so
+    the browser reused that cached HTML for the page's own
+    fetch('/employees') — which is not JSON, so the list came back empty. The
+    same trap applies to /devices, /attendance and /users.
+    """
+
+    def setUp(self):
+        import tempfile
+        from app.middleware import SpaNavigationMiddleware
+
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w")
+        self.tmp.write("<!doctype html><title>shell</title>")
+        self.tmp.close()
+
+        app = FastAPI()
+
+        @app.get("/employees")
+        def _employees():
+            return [{"user_id": "1"}]
+
+        app.add_middleware(SpaNavigationMiddleware, index_html=self.tmp.name)
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def navigate(self):
+        return self.client.get("/employees", headers={
+            "Sec-Fetch-Mode": "navigate",
+            "Accept": "text/html,application/xhtml+xml",
+        })
+
+    def test_a_navigation_still_gets_the_shell(self):
+        response = self.navigate()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/html", response.headers["content-type"])
+
+    def test_the_shell_is_not_stored_by_the_browser_cache(self):
+        self.assertEqual(self.navigate().headers.get("cache-control"), "no-store")
+
+    def test_the_shell_declares_what_it_varies_on(self):
+        vary = self.navigate().headers.get("vary", "").lower()
+        for header in ("x-requested-with", "sec-fetch-mode", "accept"):
+            self.assertIn(header, vary)
+
+    def test_the_api_answer_on_the_same_path_is_untouched(self):
+        response = self.client.get("/employees",
+                                   headers={"X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("application/json", response.headers["content-type"])
+        self.assertEqual(response.json(), [{"user_id": "1"}])
+
+
 if __name__ == "__main__":
     unittest.main()
