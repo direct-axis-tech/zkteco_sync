@@ -188,7 +188,7 @@ def verdict_for(return_code, command_name: str = "") -> str:
     why the old single rule had to be wrong about one of them.
 
     ``0``              SUCCESS.     Observed, and documented.
-    negative           REFUSAL.     Inference; see below.
+    negative           REFUSAL.     Observed; see below.
     any other non-zero UNREADABLE.  Never observed on an update. Not claimed.
 
     No non-zero ``DATA UPDATE`` acknowledgement has been seen, so a positive
@@ -198,11 +198,18 @@ def verdict_for(return_code, command_name: str = "") -> str:
     safe way to be wrong: a missed alarm is worse than a spurious one on a
     door, so an unconfirmed revocation still shouts.
 
-    The negative branch is an inference — that vendor error codes are negative,
-    which this codebase has assumed since E7 (``Return=-14``) and which our
-    documents do not attest either way. It is kept because it is the pessimistic
-    direction (it never turns a failure into a success) and because withdrawing
-    it would silently disable behaviour E4, E8 and E10 built on refusals.
+    The negative branch is no longer an inference. It was one until
+    2026-08-21 11:06:06, when the operator deliberately queued a command the
+    terminal could not satisfy — a query against a table that does not exist —
+    to find out what a refusal actually looks like:
+
+        cmdid 9   DATA QUERY tablename=nosuchtable,fielddesc=*,filter=*
+                  ID=9&Return=-629&CMD=DATA QUERY
+
+    So vendor error codes on this firmware *are* negative, and ``-629`` is a
+    real one. The rule was already pointing the right way; it is now pointing
+    that way for a reason rather than out of caution, and the behaviour E4, E8
+    and E10 build on refusals rests on evidence.
 
     ``DATA DELETE``: status, and ``0`` is success — also confirmed
     --------------------------------------------------------------
