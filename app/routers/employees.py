@@ -1,4 +1,8 @@
+import base64
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -6,7 +10,8 @@ from app import audit
 from app.database import get_db
 from app.deps import require_admin, require_auth
 from app.models import (
-    BiometricTemplate, DeviceEmployee, Employee, FingerprintTemplate, User,
+    BiometricTemplate, DeviceEmployee, Employee, EmployeePhoto,
+    FingerprintTemplate, User,
 )
 from app.net import client_ip
 from app.schemas import (
@@ -15,7 +20,16 @@ from app.schemas import (
 )
 from app.services import employee_sync
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/employees", tags=["employees"], dependencies=[Depends(require_auth)])
+
+# Preference order when both tables have a photo for the same person: `biophoto`
+# first. E5's own capture shows the two are the same image on real hardware, so
+# this only matters on a firmware that genuinely diverges from that, and
+# `biophoto` is the table §3.7 documents as the comparison photo — the one the
+# terminal itself treats as canonical for matching.
+_PHOTO_SOURCE_PREFERENCE = ("biophoto", "userpic")
 
 
 @router.get("", response_model=List[EmployeeOut])
@@ -158,3 +172,48 @@ def get_employee_biometrics(user_id: str, db: Session = Depends(get_db)):
         }
         for r in rows
     ]
+
+
+@router.get("/{user_id}/photo")
+def get_employee_photo(user_id: str, db: Session = Depends(get_db)):
+    """The person's captured face photo, decoded and served as an image.
+
+    Deliberately its own endpoint rather than a field on EmployeeOut. A photo
+    is ~100 KB of base64 on the wire; inlining that into every row of the
+    employee list would turn a 45-person listing into several megabytes on
+    every load. This way the browser's own <img> tag fetches and caches it
+    exactly once, and the list response stays small.
+
+    biophoto and userpic hold the same image on every capture seen so far
+    (E5) — biophoto is preferred, userpic served as a fallback for a device
+    that only ever pushes one of the two. See EmployeePhoto and
+    _PHOTO_SOURCE_PREFERENCE.
+    """
+    if not db.query(Employee).filter_by(user_id=user_id).first():
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    row = None
+    for source in _PHOTO_SOURCE_PREFERENCE:
+        row = db.query(EmployeePhoto).filter_by(user_id=user_id, source=source).first()
+        if row is not None:
+            break
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="No photo captured for this employee")
+
+    try:
+        image_bytes = base64.b64decode(row.content, validate=False)
+    except Exception:
+        log.warning(
+            "employee photo for %s (source=%s): stored content is not decodable base64",
+            user_id, row.source,
+        )
+        raise HTTPException(status_code=404, detail="Stored photo is not decodable")
+
+    return Response(
+        content=image_bytes,
+        # Every capture seen so far is a `.jpg` upload (§3.7's own examples
+        # too); there is no stored mime type to read back instead.
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=300"},
+    )

@@ -31,6 +31,38 @@ const FINGER_NAMES = [
   'Right Thumb', 'Right Index', 'Right Middle', 'Right Ring', 'Right Little',
 ]
 
+// The face photo a terminal uploaded, if any — a real <img>, not a data:
+// URI (CSP's default-src 'self' covers a same-origin request; a data: URI
+// would need img-src loosened, which buys nothing here). The list JSON
+// never carries these bytes; each row's img tag fetches and caches its own
+// copy from GET /employees/{id}/photo, and a 404 falls back to initials
+// exactly the way the detail header always rendered before this existed.
+function Avatar({ employee, size = 'md' }) {
+  const [failed, setFailed] = useState(false)
+  const initial = displayName(employee).charAt(0).toUpperCase() || '?'
+  const dims = size === 'sm' ? 'w-8 h-8 text-xs' : 'w-12 h-12 text-lg'
+
+  if (failed || !employee?.user_id) {
+    return (
+      <div
+        className={`${dims} rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-semibold flex-shrink-0`}
+      >
+        {initial}
+      </div>
+    )
+  }
+
+  return (
+    <img
+      key={employee.user_id}
+      src={api.employees.photoUrl(employee.user_id)}
+      alt=""
+      onError={() => setFailed(true)}
+      className={`${dims} rounded-full object-cover flex-shrink-0 bg-gray-100`}
+    />
+  )
+}
+
 function PrivilegeBadge({ privilege }) {
   const label = PRIVILEGE_LABELS[privilege] || `Level ${privilege}`
   const style =
@@ -423,8 +455,8 @@ function DetailPanel({ employee, allDevices, onEdit, isAdmin }) {
     <div className="flex-1 overflow-y-auto p-6">
       {/* Header */}
       <div className="mb-6">
-        <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-semibold text-lg mb-3">
-          {displayName(employee).charAt(0).toUpperCase()}
+        <div className="mb-3">
+          <Avatar employee={employee} />
         </div>
         <h2 className="text-lg font-semibold text-gray-900">{displayName(employee)}</h2>
         <p className="text-sm text-gray-400 font-mono">{employee.user_id}</p>
@@ -889,14 +921,17 @@ export default function Employees() {
                   setSelected(emp)
                   setEditing(null)
                 }}
-                className={`w-full text-left px-4 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50 transition-colors ${
+                className={`w-full text-left px-4 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50 transition-colors flex items-center gap-3 ${
                   selected?.user_id === emp.user_id
                     ? 'bg-blue-50 border-l-2 border-l-blue-500'
                     : ''
                 }`}
               >
-                <p className="text-sm font-medium text-gray-900 truncate">{displayName(emp)}</p>
-                <p className="text-xs text-gray-400 font-mono mt-0.5">{emp.user_id}</p>
+                <Avatar employee={emp} size="sm" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-gray-900 truncate">{displayName(emp)}</p>
+                  <p className="text-xs text-gray-400 font-mono mt-0.5">{emp.user_id}</p>
+                </div>
               </button>
             ))
           )}

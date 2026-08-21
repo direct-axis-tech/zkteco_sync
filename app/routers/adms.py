@@ -35,7 +35,9 @@ from sqlalchemy.orm import Session
 
 from app import audit, config
 from app.database import get_db
-from app.models import AttendanceLog, BiometricTemplate, Device, DeviceCommandOutbox
+from app.models import (
+    AttendanceLog, BiometricTemplate, Device, DeviceCommandOutbox, EmployeePhoto,
+)
 from app.net import client_ip, ip_in_cidrs
 from app.services import commands, employee_sync, pairing, provisioning
 
@@ -74,12 +76,18 @@ _TABLEDATA_LOG_LIMIT = 20000
 # ...except for the tables whose payload is base64 blob. One `biophoto` record
 # is ~100 KB and a push may carry dozens; a journal is not a blob store. These
 # are summarised by size and record count instead, which is what an operator
-# and the units that will parse them (E2, E5) actually need from the log.
+# needs from the log — storing the content (E2's `biodata`, E5's `biophoto`
+# and `userpic`) is not a reason to start dumping it into the journal too.
 # Lowercased for comparison — `ATTPHOTO` is the one table the vendor spells in
 # capitals.
 _BLOB_TABLES = frozenset({
     "biodata", "biophoto", "userpic", "identitycard", "templatev10", "attphoto",
 })
+
+# Which of the blob tables are actually parsed and written to a row, rather
+# than summarised in the log and dropped. Only affects the "(stored)" /
+# "(not stored)" note on that log line.
+_STORED_BLOB_TABLES = frozenset({"biodata", "biophoto", "userpic"})
 
 # How much of a device's raw capability line is kept on its row. The real ones
 # run to about 2 KB; the cap exists so a malformed push cannot fill the column.
@@ -518,10 +526,10 @@ async def adms_receive(
 
         low = tablename.lower()
         if low in _BLOB_TABLES:
-            # `biodata` (E2) is stored below; every other blob table
-            # (biophoto, userpic, identitycard, templatev10, attphoto) is
-            # still out of scope and genuinely discarded after this summary.
-            stored_note = "stored" if low == "biodata" else "not stored"
+            # `biodata` (E2) and `biophoto`/`userpic` (E5) are stored below;
+            # `identitycard`, `templatev10` and `attphoto` are still out of
+            # scope and genuinely discarded after this summary.
+            stored_note = "stored" if low in _STORED_BLOB_TABLES else "not stored"
             log.info(
                 "ADMS tabledata from %s: tablename=%s count=%s (%s) "
                 "body=%d bytes in %d record(s) [base64, not logged]",
@@ -556,6 +564,17 @@ async def adms_receive(
                 log.exception(
                     "ADMS tabledata from %s: biodata upload could not be stored; "
                     "acknowledging anyway so the device does not retry forever", SN,
+                )
+                db.rollback()
+        elif low in ("biophoto", "userpic"):
+            try:
+                _store_photo_table(db, SN, body, low)
+            except Exception:
+                # Same rule again: a ~100 KB photo upload must not become an
+                # infinite retry loop just because storage hiccupped.
+                log.exception(
+                    "ADMS tabledata from %s: %s upload could not be stored; "
+                    "acknowledging anyway so the device does not retry forever", SN, low,
                 )
                 db.rollback()
 
@@ -944,6 +963,80 @@ def _store_biodata_table(db: Session, sn: str, body: str) -> None:
     log.info(
         "ADMS biodata upload from %s: %d template(s) stored, %d record(s) skipped",
         sn, len(stored), skipped,
+    )
+
+
+def _store_photo_table(db: Session, sn: str, body: str, tablename: str) -> None:
+    """``tabledata&tablename=biophoto`` / ``tablename=userpic`` — face photos
+    pushed by a Security PUSH terminal (E5).
+
+    On the operator's own capture (VGU6254600603, pins 1/2/3) the two tables
+    carry the SAME image: identical ``filename``, identical ``size``, and
+    every byte the log kept before its own line-length cap is character-for-
+    character identical between the two for every pin observed. Rather than
+    guessing which upload should win, both are stored — see
+    ``EmployeePhoto`` for why a shared table keyed on ``(user_id, source)``
+    is safer than collapsing them into one row.
+
+    Upserted like ``_store_biodata_table``: a device resending its whole
+    photo set on reconnect converges instead of accumulating. ``content`` is
+    the base64 text the device sent, stored as-is — never decoded, re-encoded
+    or re-compressed.
+
+    ``pin`` and ``content`` are the identity of a usable record — without a
+    person to attach it to, or any bytes at all, there is nowhere to store it
+    — so a record missing either is skipped rather than guessed at, same as
+    every other table parser in this module.
+    """
+    stored = set()
+    skipped = 0
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        fields = _tabledata_fields(line, tablename)
+        pin = fields.get("pin", "").strip()[:24]
+        content = fields.get("content", "").strip()
+
+        if not pin or not content:
+            log.warning(
+                "ADMS %s upload from %s: skipping unusable record %r",
+                tablename, sn, _clip(line, 300),
+            )
+            skipped += 1
+            continue
+
+        row = (
+            db.query(EmployeePhoto)
+            .filter_by(user_id=pin, source=tablename)
+            .first()
+        )
+        if row is None:
+            row = EmployeePhoto(user_id=pin, source=tablename)
+            db.add(row)
+
+        row.filename = fields.get("filename", "").strip()[:255] or None
+        # `type` only appears on biophoto records; a re-upload under the same
+        # source that omits it must not clobber a previously-seen value with
+        # None, so absence — not falsiness — decides whether it is touched.
+        if "type" in fields:
+            row.type = _to_int(fields.get("type"), default=None)
+        row.size = _to_int(fields.get("size"), default=None)
+        row.content = content
+        row.source_device_sn = sn
+
+        # Same reason as _store_biodata_table: makes the row visible to the
+        # next line in this same batch, so two records for the same key merge
+        # instead of racing the unique constraint.
+        db.flush()
+        stored.add(pin)
+
+    db.commit()
+    log.info(
+        "ADMS %s upload from %s: %d photo(s) stored, %d record(s) skipped",
+        tablename, sn, len(stored), skipped,
     )
 
 

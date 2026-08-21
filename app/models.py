@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import Column, Integer, String, Boolean, Index, UniqueConstraint, Enum, Text
+from sqlalchemy.dialects import mysql
 from app import config
 from app.database import Base, UTCDateTime as DateTime
 
@@ -351,6 +352,53 @@ class BiometricTemplate(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "type", "no", name="uq_biometric_template"),
+    )
+
+
+class EmployeePhoto(Base):
+    """Face photos from Security PUSH's `tabledata` bulk upload — §3.7's
+    `biophoto` (comparison photo, carries `type`) and `userpic` (user
+    profile photo, no `type`).
+
+    E5's own capture (VGU6254600603, pins 1/2/3) shows these are the SAME
+    image sent twice under two table names: identical filename, identical
+    `size`, and every byte the operator's log kept before its own line-length
+    cap is character-for-character identical between the two for every pin
+    observed. Rather than two near-duplicate tables — or collapsing them into
+    one row and guessing which upload should win — both land here with
+    `source` recording which table produced the row. That is deliberately
+    cheap insurance: a firmware revision that ever does send genuinely
+    different bytes under the two names is not silently made to lose one of
+    them.
+
+    Keyed on `(user_id, source)` and upserted, exactly like BiometricTemplate:
+    a device that resends its whole photo set on reconnect converges instead
+    of accumulating. `content` is the base64 the device sent, stored as-is —
+    never decoded, re-encoded or re-compressed — and only decoded at the
+    point the photo is served to a browser (see GET /employees/{id}/photo).
+    """
+    __tablename__ = "employee_photos"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(24), nullable=False, index=True)   # the device's `pin`
+    source = Column(Enum("biophoto", "userpic", name="employee_photo_source"), nullable=False)
+    filename = Column(String(255), nullable=True)
+    type = Column(Integer, nullable=True)   # biophoto only (9 = visible-light face); null for userpic
+    size = Column(Integer, nullable=True)   # device-reported byte size of the decoded image
+    # Base64 text, ~130-190KB for a ~100KB JPEG — plain TEXT tops out at 64KB
+    # on MariaDB/MySQL, which a real photo already exceeds, so those two
+    # dialects get MEDIUMTEXT (16MB) instead. PostgreSQL/MSSQL TEXT has no
+    # such ceiling and is left alone.
+    content = Column(
+        Text().with_variant(mysql.MEDIUMTEXT(), "mysql", "mariadb"),
+        nullable=False,
+    )
+    source_device_sn = Column(String(50), nullable=False)
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "source", name="uq_employee_photo"),
     )
 
 

@@ -22,6 +22,7 @@ never touches MariaDB, and it never reads or writes a live device, user or
 configuration row.
 """
 
+import base64
 import hashlib
 import os
 import unittest
@@ -164,6 +165,18 @@ class AdmsTestCase(unittest.TestCase):
             return {
                 (t.user_id, t.type, t.no): t
                 for t in db.query(BiometricTemplate).all()
+            }
+        finally:
+            db.close()
+
+    def photos(self):
+        """All EmployeePhoto rows, keyed the same way the table is."""
+        from app.models import EmployeePhoto
+        db = self.Session()
+        try:
+            return {
+                (p.user_id, p.source): p
+                for p in db.query(EmployeePhoto).all()
             }
         finally:
             db.close()
@@ -1264,6 +1277,197 @@ class BiodataTableUploadTests(AdmsTestCase):
         self.post_biodata(CAPTURED_BIODATA_UPLOAD, count=6)
         self.assertEqual(self.employees(), {})
         self.assertEqual(self.device_links(ACC_SN), {})
+
+
+
+# ---------------------------------------------------------------------------
+# 4d. `tabledata&tablename=biophoto` / `tablename=userpic` — face photos (E5)
+# ---------------------------------------------------------------------------
+
+# A realistic base64 payload — sized and structured like the operator's own
+# captures (VGU6254600603, ~100KB decoded per photo, filename "1.jpg"), not a
+# three-character stub. Large enough to prove the round trip survives real
+# scale: this is what pushed EmployeePhoto.content past MariaDB/MySQL's plain
+# TEXT ceiling (65,535 bytes) and onto MEDIUMTEXT.
+_REALISTIC_PHOTO_BYTES = (b"\xff\xd8\xff" + bytes(range(256)) * 410)[:104904]
+REALISTIC_PHOTO_B64 = base64.b64encode(_REALISTIC_PHOTO_BYTES).decode()
+
+
+class PhotoTableUploadTests(AdmsTestCase):
+    """Face photos stored verbatim, keyed on (user_id, source)."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_device(ACC_SN, protocol="acc")
+
+    def post_photo(self, tablename, body, count=None, serial=ACC_SN):
+        url = f"/iclock/cdata?SN={serial}&table=tabledata&tablename={tablename}"
+        if count is not None:
+            url += f"&count={count}"
+        return self.client.post(url, content=body)
+
+    def biophoto_line(self, pin="1", content=REALISTIC_PHOTO_B64, **extra):
+        fields = dict(pin=pin, filename="1.jpg", type="9", size="104904")
+        fields.update(extra)
+        pairs = "\t".join(f"{k}={v}" for k, v in fields.items())
+        return f"biophoto {pairs}\tcontent={content}\n"
+
+    def userpic_line(self, pin="1", content=REALISTIC_PHOTO_B64, **extra):
+        fields = dict(pin=pin, filename="1.jpg", size="104904")
+        fields.update(extra)
+        pairs = "\t".join(f"{k}={v}" for k, v in fields.items())
+        return f"userpic {pairs}\tcontent={content}\n"
+
+    # -- both tables parse and store --------------------------------------
+
+    def test_a_biophoto_upload_is_stored(self):
+        response = self.post_photo("biophoto", self.biophoto_line(), count=1)
+        self.assertEqual(response.status_code, 200)
+        photos = self.photos()
+        self.assertEqual(list(photos), [("1", "biophoto")])
+        self.assertEqual(photos[("1", "biophoto")].type, 9)
+        self.assertEqual(photos[("1", "biophoto")].size, 104904)
+
+    def test_a_userpic_upload_is_stored(self):
+        response = self.post_photo("userpic", self.userpic_line(), count=1)
+        self.assertEqual(response.status_code, 200)
+        photos = self.photos()
+        self.assertEqual(list(photos), [("1", "userpic")])
+        # userpic carries no `type` field on the wire.
+        self.assertIsNone(photos[("1", "userpic")].type)
+        self.assertEqual(photos[("1", "userpic")].size, 104904)
+
+    def test_both_tables_for_the_same_pin_coexist_as_two_rows(self):
+        """biophoto and userpic are confirmed to carry the same image on the
+        operator's own capture, but they are stored as two rows (one per
+        `source`) rather than collapsed into one — see EmployeePhoto."""
+        self.post_photo("biophoto", self.biophoto_line(), count=1)
+        self.post_photo("userpic", self.userpic_line(), count=1)
+        photos = self.photos()
+        self.assertEqual(sorted(photos), [("1", "biophoto"), ("1", "userpic")])
+        self.assertEqual(photos[("1", "biophoto")].content, photos[("1", "userpic")].content)
+
+    def test_fields_are_read_by_key_and_never_by_position(self):
+        body = f"biophoto content={REALISTIC_PHOTO_B64}\tsize=104904\tpin=21\ttype=9\tfilename=1.jpg\n"
+        self.post_photo("biophoto", body, count=1)
+        row = self.photos()[("21", "biophoto")]
+        self.assertEqual(row.size, 104904)
+        self.assertEqual(row.type, 9)
+        self.assertEqual(row.filename, "1.jpg")
+
+    # -- verbatim round-trip ------------------------------------------------
+
+    def test_content_round_trips_byte_identical(self):
+        self.post_photo("biophoto", self.biophoto_line(), count=1)
+        row = self.photos()[("1", "biophoto")]
+        self.assertEqual(row.content, REALISTIC_PHOTO_B64)
+        self.assertEqual(base64.b64decode(row.content), _REALISTIC_PHOTO_BYTES)
+        self.assertEqual(row.source_device_sn, ACC_SN)
+
+    def test_the_acknowledgement_is_byte_exact(self):
+        response = self.post_photo("biophoto", self.biophoto_line(), count=1)
+        self.assertEqual(response.content, b"biophoto=1")
+        response = self.post_photo("userpic", self.userpic_line(), count=1)
+        self.assertEqual(response.content, b"userpic=1")
+
+    # -- upsert semantics -----------------------------------------------
+
+    def test_a_repeat_upload_is_idempotent(self):
+        """Devices resend their whole photo set on reconnect. A replay must
+        converge on the same row, not accumulate duplicates."""
+        self.post_photo("biophoto", self.biophoto_line(), count=1)
+        first = self.photos()
+
+        response = self.post_photo("biophoto", self.biophoto_line(), count=1)
+
+        self.assertEqual(response.content, b"biophoto=1")
+        again = self.photos()
+        self.assertEqual(sorted(again), sorted(first))
+        self.assertEqual(len(again), 1)
+
+    def test_a_changed_photo_on_reupload_updates_the_row_not_a_new_one(self):
+        other_bytes = (b"\xff\xd8\xff" + bytes(range(255, -1, -1)) * 5)[:1000]
+        other_b64 = base64.b64encode(other_bytes).decode()
+        self.post_photo("biophoto", self.biophoto_line(content=REALISTIC_PHOTO_B64), count=1)
+        self.post_photo("biophoto", self.biophoto_line(content=other_b64), count=1)
+        photos = self.photos()
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(photos[("1", "biophoto")].content, other_b64)
+
+    def test_multiple_pins_in_one_batch_are_all_stored(self):
+        body = (
+            self.biophoto_line(pin="1", filename="1.jpg")
+            + self.biophoto_line(pin="2", filename="2.jpg")
+            + self.biophoto_line(pin="3", filename="3.jpg")
+        )
+        response = self.post_photo("biophoto", body, count=3)
+        self.assertEqual(response.content, b"biophoto=3")
+        self.assertEqual(
+            sorted(self.photos()),
+            [("1", "biophoto"), ("2", "biophoto"), ("3", "biophoto")],
+        )
+
+    # -- malformed records ---------------------------------------------
+
+    def test_a_malformed_record_is_skipped_and_logged_without_dropping_the_batch(self):
+        body = (
+            self.biophoto_line(pin="1", filename="1.jpg")
+            + "total garbage with no equals sign at all\n"
+            + "biophoto pin=\tfilename=2.jpg\ttype=9\tsize=1\tcontent=AAAA\n"   # no pin
+            + "biophoto pin=4\tfilename=4.jpg\ttype=9\tsize=1\tcontent=\n"      # no content
+            + self.biophoto_line(pin="5", filename="5.jpg")
+        )
+        with self.assertLogs("app.routers.adms", level="WARNING") as captured:
+            response = self.post_photo("biophoto", body, count=5)
+
+        self.assertEqual(response.content, b"biophoto=5")
+        self.assertEqual(sorted(self.photos()), [("1", "biophoto"), ("5", "biophoto")])
+        joined = "\n".join(captured.output)
+        self.assertIn("total garbage", joined)
+
+    def test_an_unapproved_serial_cannot_inject_photos(self):
+        response = self.post_photo(
+            "biophoto", self.biophoto_line(), count=1, serial="NOTAPPROVED01",
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.photos(), {})
+
+    def test_a_storage_failure_still_acknowledges_so_the_device_stops_retrying(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated storage failure")
+
+        original = adms._store_photo_table
+        adms._store_photo_table = boom
+        try:
+            with self.assertLogs("app.routers.adms", level="ERROR"):
+                response = self.post_photo("biophoto", self.biophoto_line(), count=1)
+        finally:
+            adms._store_photo_table = original
+
+        self.assertEqual(response.content, b"biophoto=1")
+
+    def test_photo_upload_does_not_touch_employees_or_device_links(self):
+        """Collision guard: this table must not become a second writer of
+        `employees` or `device_employees`."""
+        self.post_photo("biophoto", self.biophoto_line(), count=1)
+        self.assertEqual(self.employees(), {})
+        self.assertEqual(self.device_links(ACC_SN), {})
+
+    # -- the log summarises rather than dumps ------------------------------
+
+    def test_a_photo_upload_is_summarised_in_the_log_not_dumped(self):
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_photo("biophoto", self.biophoto_line(), count=1)
+        joined = "\n".join(captured.output)
+        self.assertIn("not logged", joined)
+        self.assertIn("stored", joined)
+        self.assertNotIn(REALISTIC_PHOTO_B64, joined)
+
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_photo("userpic", self.userpic_line(), count=1)
+        joined = "\n".join(captured.output)
+        self.assertIn("not logged", joined)
+        self.assertNotIn(REALISTIC_PHOTO_B64, joined)
 
 
 class SdkAndPushAgreeTests(AdmsTestCase):
@@ -4815,3 +5019,88 @@ class SpaShellCachingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 22. E5 — faces visible in the UI: serving a captured photo
+# ---------------------------------------------------------------------------
+
+
+class EmployeePhotoEndpointTests(ProvisioningTestCase):
+    """GET /employees/{id}/photo — the endpoint the browser's <img> tag hits.
+
+    Built on ProvisioningTestCase rather than AdmsTestCase deliberately: this
+    exercises the real flow end to end on one app/database — a device
+    uploads a photo through /iclock/cdata, an operator's authenticated
+    browser fetches it back through the employees router.
+    """
+
+    def push_photo(self, tablename, pin, content=REALISTIC_PHOTO_B64, sn=None, **extra):
+        fields = dict(pin=pin, filename="1.jpg", size=str(len(base64.b64decode(content))))
+        if tablename == "biophoto":
+            fields["type"] = "9"
+        fields.update(extra)
+        pairs = "\t".join(f"{k}={v}" for k, v in fields.items())
+        body = f"{tablename} {pairs}\tcontent={content}\n"
+        return self.client.post(
+            f"/iclock/cdata?SN={sn or self.SN}&table=tabledata&tablename={tablename}&count=1",
+            content=body,
+        )
+
+    def test_a_pushed_photo_is_served_decoded_and_byte_identical(self):
+        self.create_employee("1")
+        response = self.push_photo("biophoto", "1")
+        self.assertEqual(response.status_code, 200)
+
+        photo = self.client.get("/employees/1/photo")
+        self.assertEqual(photo.status_code, 200)
+        self.assertEqual(photo.headers["content-type"], "image/jpeg")
+        self.assertEqual(photo.content, _REALISTIC_PHOTO_BYTES)
+
+    def test_userpic_is_served_when_biophoto_is_absent(self):
+        self.create_employee("2")
+        self.push_photo("userpic", "2")
+
+        photo = self.client.get("/employees/2/photo")
+        self.assertEqual(photo.status_code, 200)
+        self.assertEqual(photo.content, _REALISTIC_PHOTO_BYTES)
+
+    def test_biophoto_is_preferred_over_userpic_when_both_exist(self):
+        """Both are the same image on every real capture (E5), but if a
+        firmware ever sends genuinely different bytes under the two names,
+        `biophoto` — the table §3.7 documents as the comparison photo — wins
+        rather than whichever upload happened to arrive last."""
+        biophoto_bytes = b"\xff\xd8\xff" + b"\x01" * 500
+        userpic_bytes = b"\xff\xd8\xff" + b"\x02" * 500
+        self.create_employee("3")
+        self.push_photo("biophoto", "3", content=base64.b64encode(biophoto_bytes).decode())
+        self.push_photo("userpic", "3", content=base64.b64encode(userpic_bytes).decode())
+
+        photo = self.client.get("/employees/3/photo")
+        self.assertEqual(photo.content, biophoto_bytes)
+
+    def test_an_employee_with_no_photo_is_404(self):
+        self.create_employee("4")
+        photo = self.client.get("/employees/4/photo")
+        self.assertEqual(photo.status_code, 404)
+
+    def test_an_unknown_employee_is_404(self):
+        photo = self.client.get("/employees/nope/photo")
+        self.assertEqual(photo.status_code, 404)
+
+    def test_the_employee_list_response_does_not_carry_photo_bytes(self):
+        """The whole reason this endpoint exists: inlining ~100KB of base64
+        per person into GET /employees would turn a modest roster into a
+        multi-megabyte response on every load."""
+        self.create_employee("5", name="Aisha Rahman")
+        self.push_photo("biophoto", "5")
+
+        response = self.client.get("/employees")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body), 1)
+        self.assertNotIn("content", body[0])
+        self.assertNotIn("photo", body[0])
+        # The list response as a whole must stay small — nowhere near the
+        # ~140,000-character base64 payload a single photo carries.
+        self.assertLess(len(response.content), 2000)
