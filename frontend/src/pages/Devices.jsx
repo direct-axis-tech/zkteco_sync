@@ -237,7 +237,7 @@ export default function Devices() {
       { label: 'Set Clock', onClick: () => setDrawer({ type: 'clock', device }) },
       { label: 'Write LCD', onClick: () => setDrawer({ type: 'lcd', device }) },
       { label: 'Unlock Door', onClick: () => handleUnlock(device) },
-      { label: 'Queue Command', onClick: () => setDrawer({ type: 'commands', device }) },
+      { label: 'Commands', onClick: () => setDrawer({ type: 'commands', device }) },
       'divider',
       {
         label: 'Clear Attendance',
@@ -553,6 +553,7 @@ export default function Devices() {
           device={drawer.device}
           onClose={() => setDrawer(null)}
           showToast={showToast}
+          onChange={loadDevices}
         />
       )}
 

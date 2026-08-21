@@ -210,6 +210,62 @@ def conclude(
 
 
 # ---------------------------------------------------------------------------
+# Operator control — cancel and retry (E10)
+# ---------------------------------------------------------------------------
+
+def cancel(db: Session, row: DeviceCommandOutbox, by: str) -> bool:
+    """Withdraw one outstanding command from the outbox, by operator request.
+
+    Concluded ``failed`` rather than deleted outright — same move as an
+    unacknowledged command running out of attempts — so the log row is where
+    an operator later finds out this happened, when and why.
+
+    What "cancel" actually means depends on ``row.status``, and the two cases
+    are not the same claim:
+
+    * ``pending`` — never handed to the device. Cancelling here is the whole
+      truth: nothing was sent, there is nothing at the device end to undo.
+    * ``sent`` — handed to the device at least once already. The device may
+      already have collected and acted on it before this call landed;
+      cancelling only removes *our record* of owing it. For a
+      ``DATA DELETE`` this is the difference between access still being
+      revoked at the door and access quietly being restored — the caller
+      (the router, then the UI) must say so and never imply the delivery
+      itself was recalled, which is the false-reassurance mistake E8's
+      browser gate caught in a different shape.
+    """
+    was_sent = row.status == "sent"
+    last_error = (
+        f"cancelled by {by} — already delivered to the device at least once "
+        "before this cancellation; the device may already have acted on it, "
+        "only our record of owing it was removed"
+        if was_sent else
+        f"cancelled by {by} before delivery — never sent to the device"
+    )
+    return conclude(db, row, "failed", last_error=last_error)
+
+
+def retry(db: Session, log_row: DeviceCommandLog) -> DeviceCommandOutbox:
+    """Requeue a concluded command as a brand-new outbox row.
+
+    Decision: **copy, don't resurrect.** ``log_row`` is left exactly as it
+    was concluded — the record of what happened the first time is never
+    edited — and a fresh ``device_command_outbox`` row starts its own
+    lifecycle at ``attempts=0``. Two independent rows means two independent
+    outcomes stay visible: a retry that also fails does not overwrite what
+    the first attempt showed, and a retry that succeeds sits next to the
+    refusal it followed rather than erasing it.
+
+    Does not judge whether retrying is wise. A device refusal
+    (``return_code`` not null) will very likely earn the identical refusal
+    again, since nothing about the device changed — the warning is the
+    caller's job (the retry endpoint's response, and the UI), not this
+    function's. It only ever does what it is asked.
+    """
+    return queue(db, log_row.device_sn, log_row.command)
+
+
+# ---------------------------------------------------------------------------
 # Dispatch — the /iclock/getrequest hot path
 # ---------------------------------------------------------------------------
 

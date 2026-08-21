@@ -471,6 +471,149 @@ def list_concluded_commands(sn: str, limit: int = 100, db: Session = Depends(get
     )
 
 
+@router.delete("/{sn}/commands/{command_id}", dependencies=[Depends(require_admin)])
+def cancel_command(
+    sn: str,
+    command_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Withdraw one outstanding command from the outbox.
+
+    What this can honestly promise depends on whether the device has already
+    been offered this command (``status``), which is why it is read and
+    reported here rather than left for the caller to infer:
+
+    * ``pending`` — never sent. Cancelling genuinely prevents delivery.
+    * ``sent`` — delivered at least once already. Cancelling only removes our
+      record of owing it; the device may already have collected and acted on
+      it. This is loudest for a revocation (`DATA DELETE`), where it is the
+      difference between access still being revoked at the door and access
+      quietly being restored — the response says so plainly rather than
+      implying anything was recalled.
+    """
+    _get_device_or_404(sn, db)
+    row = (
+        db.query(DeviceCommandOutbox)
+        .filter(DeviceCommandOutbox.id == command_id, DeviceCommandOutbox.device_sn == sn)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No outstanding command with that id on this device",
+        )
+
+    # Snapshot before conclude() deletes the row — its attributes are gone
+    # once that commit lands.
+    was_sent = row.status == "sent"
+    revocation = commands.is_revocation(row.command)
+    command_text = row.command
+
+    cancelled = commands.cancel(db, row, by=admin.username)
+    if not cancelled:
+        raise HTTPException(
+            status_code=409,
+            detail="Already concluded by the device — nothing left to cancel",
+        )
+
+    audit.record(db, admin.username, "device_command_cancel",
+                 target=f"{sn}/{command_id}", ip=client_ip(request),
+                 detail=f"status={'sent' if was_sent else 'pending'} "
+                        f"revocation={revocation} command={command_text[:120]}")
+
+    return {
+        "id": command_id,
+        "device_sn": sn,
+        "was_sent": was_sent,
+        "is_revocation": revocation,
+        "message": (
+            "This command was already delivered to the device at least once "
+            "— cancelling only removes our record of owing it. The device "
+            "may already have collected and acted on it; nothing was "
+            "recalled." + (
+                " That person's access may already be gone — check the "
+                "terminal directly if this needs to be certain."
+                if revocation else ""
+            )
+            if was_sent else
+            "Cancelled before delivery. This command was never sent to the "
+            "device."
+        ),
+    }
+
+
+@router.post("/{sn}/commands/history/{log_id}/retry", status_code=201,
+             dependencies=[Depends(require_admin)])
+def retry_command(
+    sn: str,
+    log_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Requeue a failed command as a brand-new outbox row.
+
+    Decision (documented in ``commands.retry``): this **copies** the command
+    into a fresh outbox row rather than resurrecting the concluded one, so
+    the original history row is untouched — what happened the first time
+    stays on the record no matter what the retry does.
+
+    Only a ``failed`` history row can be retried — an ``acknowledged`` one
+    already succeeded, and requeueing it would just repeat a command the
+    device already carried out (harmless per E7's idempotency note, but not
+    what "retry" should mean here).
+
+    Does not block a retry of a device refusal (``return_code`` set), but
+    warns loudly: a refusal is the device having understood the command and
+    declined it, and nothing about the device changed in between, so the
+    same bytes will very likely earn the same refusal again.
+    """
+    _get_device_or_404(sn, db)
+    log_row = (
+        db.query(DeviceCommandLog)
+        .filter(DeviceCommandLog.id == log_id, DeviceCommandLog.device_sn == sn)
+        .first()
+    )
+    if log_row is None:
+        raise HTTPException(
+            status_code=404, detail="No history row with that id on this device",
+        )
+    if log_row.outcome != "failed":
+        raise HTTPException(
+            status_code=400,
+            detail="Only a failed command can be retried; this one was acknowledged",
+        )
+
+    was_refusal = log_row.return_code is not None
+    return_code = log_row.return_code
+
+    new_row = commands.retry(db, log_row)
+
+    audit.record(db, admin.username, "device_command_retry",
+                 target=f"{sn}/{log_id}", ip=client_ip(request),
+                 detail=f"new_command_id={new_row.id} "
+                        f"return_code={return_code if was_refusal else 'none'}")
+
+    return {
+        "id": new_row.id,
+        "device_sn": sn,
+        "command": new_row.command,
+        "retried_from_log_id": log_id,
+        "was_device_refusal": was_refusal,
+        "message": (
+            f"Requeued. The device refused this with Return={return_code} "
+            "last time — unless something changed at the device, it will "
+            "very likely refuse again the same way."
+            if was_refusal else
+            "Requeued as a new command. The previous attempt was never "
+            "acknowledged; this one starts its own delivery attempts from "
+            "zero."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Device info
 # ---------------------------------------------------------------------------

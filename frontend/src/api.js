@@ -145,6 +145,17 @@ export const api = {
     // Concluded commands: what the device said about each one. A `failed`
     // row with a return_code is the device having refused it.
     commandHistory: (sn) => request('GET', `/devices/${sn}/commands/history`),
+    // Withdraws an outstanding command. Cancelling `pending` genuinely stops
+    // delivery; cancelling `sent` only removes our record — the device may
+    // already have collected and acted on it. The response `message` says
+    // which happened; render that, do not infer success from an empty list.
+    cancelCommand: (sn, commandId) =>
+      request('DELETE', `/devices/${sn}/commands/${commandId}`),
+    // Requeues a failed command as a brand-new outbox row; the history row
+    // being retried is left untouched. `was_device_refusal` is true when the
+    // device rejected it last time — very likely to be refused again.
+    retryCommand: (sn, logId) =>
+      request('POST', `/devices/${sn}/commands/history/${logId}/retry`),
     listUsers: (sn) => request('GET', `/devices/${sn}/users`),
     pushBulk: (sn, user_ids) => request('POST', `/devices/${sn}/users/push_bulk`, { user_ids }),
     pushUser: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/push`),

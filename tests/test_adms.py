@@ -3466,6 +3466,201 @@ class CommandVisibilityTests(CommandDeliveryTestCase):
         self.assertEqual([i["command"] for i in items], ["DATA UPDATE user Pin=1"])
 
 
+class CommandCancelTests(CommandDeliveryTestCase):
+    """The escape hatch this unit adds: withdrawing an outstanding command."""
+
+    def test_cancelling_a_pending_command_removes_it_and_is_audited(self):
+        from app.models import AuditLog
+
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        response = self.client.delete(f"/devices/{self.SN}/commands/{command_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertFalse(body["was_sent"])
+        self.assertEqual(self.outbox(self.SN), [])
+
+        concluded = self.history(self.SN)
+        self.assertEqual(len(concluded), 1)
+        self.assertEqual(concluded[0].outcome, "failed")
+        self.assertIn("cancelled by tester", concluded[0].last_error)
+        self.assertIn("never sent", concluded[0].last_error)
+
+        db = self.Session()
+        try:
+            entry = db.query(AuditLog).filter_by(action="device_command_cancel").first()
+        finally:
+            db.close()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.actor, "tester")
+        self.assertEqual(entry.target, f"{self.SN}/{command_id}")
+        self.assertIn("status=pending", entry.detail)
+
+    def test_cancelling_a_sent_command_is_recorded_distinctly(self):
+        """Permitted, but the record — and the response — say something
+        different than a pending cancel: this did not recall anything."""
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+
+        response = self.client.delete(f"/devices/{self.SN}/commands/{command_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["was_sent"])
+        self.assertIn("already delivered", body["message"])
+        self.assertIn("nothing was recalled", body["message"])
+
+        concluded = self.history(self.SN)
+        self.assertEqual(len(concluded), 1)
+        self.assertIn("cancelled by tester", concluded[0].last_error)
+        self.assertIn("already delivered", concluded[0].last_error)
+        # Distinct wording from the pending case above.
+        self.assertNotIn("never sent", concluded[0].last_error)
+
+        db = self.Session()
+        try:
+            from app.models import AuditLog
+            entry = db.query(AuditLog).filter_by(action="device_command_cancel").first()
+        finally:
+            db.close()
+        self.assertIn("status=sent", entry.detail)
+
+    def test_cancelling_a_revoking_command_is_flagged_as_a_revocation(self):
+        command_id = self.queue("DATA DELETE user Pin=1")
+        response = self.client.delete(f"/devices/{self.SN}/commands/{command_id}")
+        self.assertTrue(response.json()["is_revocation"])
+
+    def test_cancelling_an_unknown_id_is_a_404(self):
+        response = self.client.delete(f"/devices/{self.SN}/commands/999999")
+        self.assertEqual(response.status_code, 404)
+
+    def test_cancelling_someone_elses_command_is_a_404(self):
+        command_id = self.queue("DATA UPDATE user Pin=1", sn=self.OTHER_SN)
+        response = self.client.delete(f"/devices/{self.SN}/commands/{command_id}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_cancelling_an_already_acknowledged_command_is_a_404(self):
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+        self.ack(command_id)
+        response = self.client.delete(f"/devices/{self.SN}/commands/{command_id}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_cancel_works_when_the_outbox_is_otherwise_empty(self):
+        """Nothing else outstanding — proves the endpoint does not depend on
+        other rows being present, and that an empty outbox afterwards is
+        exactly what it should be."""
+        command_id = self.queue("DATA UPDATE user Pin=1")
+        self.assertEqual(len(self.outbox(self.SN)), 1)
+        response = self.client.delete(f"/devices/{self.SN}/commands/{command_id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class CommandRetryEndpointTests(CommandDeliveryTestCase):
+    """Requeueing a failed command — a fresh outbox row, history preserved.
+
+    Named -EndpointTests, not -Tests, to avoid colliding with the earlier
+    CommandRetryTests above (E7's sent-but-unacked backoff-retry tests) — a
+    module-level class name collision silently drops the earlier class from
+    unittest discovery with no error, which is exactly what nearly happened
+    here."""
+
+    def test_retry_creates_a_fresh_outbox_row_and_preserves_history(self):
+        refused = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+        self.ack(refused, return_code=-14)
+
+        before_history = self.history(self.SN)
+        self.assertEqual(len(before_history), 1)
+
+        response = self.client.post(f"/devices/{self.SN}/commands/history/{refused}/retry")
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(body["command"], "DATA UPDATE user Pin=1")
+        self.assertTrue(body["was_device_refusal"])
+        self.assertIn("Return=-14", body["message"])
+
+        # History untouched — still exactly the one concluded row, unchanged.
+        after_history = self.history(self.SN)
+        self.assertEqual(len(after_history), 1)
+        self.assertEqual(after_history[0].id, before_history[0].id)
+        self.assertEqual(after_history[0].return_code, -14)
+
+        # A brand new outbox row, at the start of its own lifecycle.
+        outstanding = self.outbox(self.SN)
+        self.assertEqual(len(outstanding), 1)
+        self.assertEqual(outstanding[0].command, "DATA UPDATE user Pin=1")
+        self.assertEqual(outstanding[0].status, "pending")
+        self.assertEqual(outstanding[0].attempts, 0)
+
+    def test_retry_of_a_give_up_is_not_flagged_as_a_refusal(self):
+        from unittest import mock
+        with mock.patch.object(config, "COMMAND_MAX_ATTEMPTS", 1):
+            gave_up = self.queue("DATA UPDATE user Pin=2")
+            self.poll()
+            self.rewind_backoff(gave_up)
+            self.poll()  # exhausts it -> concluded failed, return_code None
+
+        log_id = self.history(self.SN)[0].id
+        response = self.client.post(f"/devices/{self.SN}/commands/history/{log_id}/retry")
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertFalse(response.json()["was_device_refusal"])
+
+    def test_retrying_an_acknowledged_command_is_refused(self):
+        acked = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+        self.ack(acked, return_code=0)
+        log_id = self.history(self.SN)[0].id
+
+        response = self.client.post(f"/devices/{self.SN}/commands/history/{log_id}/retry")
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_retrying_an_unknown_id_is_a_404(self):
+        response = self.client.post(f"/devices/{self.SN}/commands/history/999999/retry")
+        self.assertEqual(response.status_code, 404)
+
+    def test_retry_is_audited(self):
+        from app.models import AuditLog
+
+        refused = self.queue("DATA UPDATE user Pin=1")
+        self.poll()
+        self.ack(refused, return_code=-14)
+        log_id = self.history(self.SN)[0].id
+
+        self.client.post(f"/devices/{self.SN}/commands/history/{log_id}/retry")
+
+        db = self.Session()
+        try:
+            entry = db.query(AuditLog).filter_by(action="device_command_retry").first()
+        finally:
+            db.close()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.actor, "tester")
+        self.assertEqual(entry.target, f"{self.SN}/{log_id}")
+        self.assertIn("return_code=-14", entry.detail)
+
+
+class CommandCancelRetryAdminOnlyTests(unittest.TestCase):
+    """Structural proof, the same pattern already used elsewhere in this file
+    (see EmployeeCreationTests): testable without standing up a non-admin
+    session, because require_admin itself is D1's and is overridden globally
+    to an admin in every fixture in this module."""
+
+    def test_cancel_and_retry_require_admin(self):
+        import inspect as _inspect
+        from fastapi import params
+        from app.deps import require_admin
+        from app.routers import devices as devices_router
+
+        for endpoint in (devices_router.cancel_command, devices_router.retry_command):
+            dependencies = [
+                p.default.dependency
+                for p in _inspect.signature(endpoint).parameters.values()
+                if isinstance(p.default, params.Depends)
+            ]
+            self.assertIn(require_admin, dependencies, endpoint.__name__)
+
+
 class DeadCommandTableTests(CommandDeliveryTestCase):
     """device_commands is superseded. Nothing may quietly start using it again."""
 
