@@ -187,8 +187,15 @@ export default function Devices() {
       templates: () => api.devices.pullTemplates(device.serial_number),
     }
     try {
-      await calls[type]()
-      showToast(`${labels[type]} started for ${device.name || device.serial_number}`)
+      const result = await calls[type]()
+      // An `acc` terminal is never dialled: the server queues a DATA QUERY and
+      // the device answers on its next poll, so the response says what really
+      // happened and that is what gets shown. Reporting "started" for work
+      // that has only been enqueued is the thing this avoids.
+      showToast(
+        result?.message ||
+          `${labels[type]} started for ${device.name || device.serial_number}`
+      )
     } catch (err) {
       showToast(err.message, 'error')
     }
@@ -226,10 +233,24 @@ export default function Devices() {
   }
 
   function menuItems(device) {
+    // Which sync actions exist at all depends on the protocol, because the two
+    // families are read over different transports. An access-control terminal
+    // has no pull for attendance — it pushes punches up by itself — so that
+    // item is shown unavailable WITH THE REASON rather than hidden (an
+    // operator cannot troubleshoot a menu entry that is not there) and rather
+    // than left clickable (it would dial TCP 4370 and time out).
+    const isAcc = (device.protocol || 'att') === 'acc'
+
     return [
       { label: 'Sync All', onClick: () => handleSync(device, 'all') },
       { label: 'Sync Employees', onClick: () => handleSync(device, 'employees') },
-      { label: 'Sync Attendance', onClick: () => handleSync(device, 'attendance') },
+      isAcc
+        ? {
+            label: 'Sync Attendance',
+            disabled: true,
+            hint: 'Not applicable — this terminal pushes punches up by itself, including anything it buffered while offline.',
+          }
+        : { label: 'Sync Attendance', onClick: () => handleSync(device, 'attendance') },
       { label: 'Sync Templates', onClick: () => handleSync(device, 'templates') },
       'divider',
       { label: 'Manage Users', onClick: () => setDrawer({ type: 'users', device }) },

@@ -7310,3 +7310,416 @@ class AckSemanticsFieldEvidenceTests(QueryDataTestCase):
                     command_service.history_verdict(outcome, code, error, command),
                     expected,
                 )
+
+
+# ---------------------------------------------------------------------------
+# 27. E12 — the Sync menu on an access-control terminal
+# ---------------------------------------------------------------------------
+#
+# Before E12 all four pull endpoints dialled TCP 4370 unconditionally, so on an
+# `acc` terminal behind NAT every one of them was a timeout the operator saw as
+# a hung menu item. The failure these tests exist to prevent is subtler than
+# that, though: a pull that *looks* like it worked. Three of the four
+# replacements are commands the operator's own hardware answered on 2026-08-21
+# and are asserted here as literal bytes; the fourth does not exist and must
+# not be invented.
+
+# Copied from the field capture, NOT from app/services/provisioning.py — a test
+# that imports the constant it is checking asserts nothing. Note the capital
+# `Type` on biophoto and the lowercase `type` on biodata: that is how the
+# device was actually asked, and how it answered.
+CONFIRMED_USER_QUERY = "DATA QUERY tablename=user,fielddesc=*,filter=*"
+CONFIRMED_PHOTO_QUERY = "DATA QUERY tablename=biophoto,fielddesc=*,filter=Type=9"
+CONFIRMED_TEMPLATE_QUERY = "DATA QUERY tablename=biodata,fielddesc=*,filter=type=9"
+
+
+class PullRoutingTestCase(ProvisioningTestCase):
+    """The four Sync actions, over one acc terminal, one att and one unset."""
+
+    def sync_all(self, sn):
+        return self.client.post(f"/devices/{sn}/pull")
+
+    def sync_employees(self, sn):
+        return self.client.post(f"/devices/{sn}/pull/employees")
+
+    def sync_attendance(self, sn):
+        return self.client.post(f"/devices/{sn}/pull/attendance")
+
+    def sync_templates(self, sn):
+        return self.client.post(f"/devices/{sn}/templates/pull")
+
+    def no_sdk(self):
+        """Patch every SDK entry point this router can reach into a tripwire.
+
+        Background tasks really run under TestClient, so a stray
+        `background_tasks.add_task(pull_employees, sn)` would fire here rather
+        than being quietly dropped.
+        """
+        from unittest import mock
+
+        calls = []
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                calls.append((name, args, kwargs))
+                raise AssertionError(f"{name} was called on an acc device")
+            return _fn
+
+        patches = [
+            mock.patch(f"app.routers.devices.{name}", _record(name))
+            for name in ("pull_device", "pull_employees", "pull_attendance",
+                         "device_connection")
+        ]
+        return patches, calls
+
+
+class EmptyTemplateConnection(FakeConnection):
+    """A terminal the SDK can read that simply holds no templates."""
+
+    def get_templates(self):
+        return []
+
+
+class PullCommandShapeTests(PullRoutingTestCase):
+    """The literal bytes queued for each action."""
+
+    def test_sync_employees_queues_the_confirmed_user_query(self):
+        response = self.sync_employees(self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [CONFIRMED_USER_QUERY])
+
+    def test_sync_templates_queues_the_confirmed_biodata_query(self):
+        response = self.sync_templates(self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [CONFIRMED_TEMPLATE_QUERY])
+
+    def test_sync_all_queues_exactly_the_three_confirmed_queries_in_order(self):
+        response = self.sync_all(self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(
+            [r.command for r in self.outbox(self.SN)],
+            [CONFIRMED_USER_QUERY, CONFIRMED_PHOTO_QUERY, CONFIRMED_TEMPLATE_QUERY],
+        )
+
+    def test_the_queued_query_reaches_the_device_inside_E7s_envelope(self):
+        """End to end: what the terminal actually reads off getrequest.
+
+        E7's `C:<id>:` framing is what makes the answer correlatable, and the
+        device quotes that id back as `cmdid` on /iclock/querydata.
+        """
+        self.sync_employees(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+
+        self.assertEqual(self.poll(self.SN), f"C:{command_id}:{CONFIRMED_USER_QUERY}")
+
+    def test_one_biodata_query_not_one_per_modality(self):
+        """The device IGNORES the type filter — `filter=type=9` and
+        `filter=type=1` returned byte-identical bodies, 6 records and 7002
+        bytes both times, covering face and fingerprint together. A loop over
+        modalities would spend a second poll cycle asking the same question."""
+        self.sync_templates(self.SN)
+
+        rows = self.outbox(self.SN)
+        self.assertEqual(len(rows), 1, [r.command for r in rows])
+        self.assertNotIn("type=1", rows[0].command)
+
+    def test_sync_all_issues_one_biodata_query_too(self):
+        self.sync_all(self.SN)
+
+        biodata = [r.command for r in self.outbox(self.SN) if "biodata" in r.command]
+        self.assertEqual(len(biodata), 1, biodata)
+
+
+class PullHonestyTests(PullRoutingTestCase):
+    """Queued is not done, and the response has to say so."""
+
+    def test_an_acc_sync_answers_202_queued_and_never_claims_it_read_anything(self):
+        for action in (self.sync_employees, self.sync_templates, self.sync_all):
+            with self.subTest(action=action.__name__):
+                response = action(self.SN)
+                body = response.json()
+
+                self.assertEqual(response.status_code, 202, response.text)
+                self.assertEqual(body["status"], "queued")
+                self.assertEqual(body["transport"], "adms_queue")
+                self.assertIn("nothing has been read yet", body["message"])
+                # "started" is what the old synchronous-sounding endpoints
+                # said, and it is the word this unit exists to stop saying.
+                self.assertNotIn("started", body["message"].lower())
+
+    def test_the_response_names_the_command_ids_the_outbox_will_show(self):
+        body = self.sync_all(self.SN).json()
+
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.SN)])
+        self.assertEqual(body["commands"],
+                         [CONFIRMED_USER_QUERY, CONFIRMED_PHOTO_QUERY,
+                          CONFIRMED_TEMPLATE_QUERY])
+
+    def test_sync_all_says_roughly_thirty_seconds_and_not_that_it_is_instant(self):
+        """Three commands at COMMAND_BATCH_SIZE=1 and one poll per ten seconds."""
+        body = self.sync_all(self.SN).json()
+
+        self.assertIn("30 seconds", body["message"])
+
+    def test_clicking_sync_twice_does_not_queue_the_same_question_twice(self):
+        """A query carries no arguments: a second identical one outstanding
+        asks a question already asked and just puts the answer ten seconds
+        further away."""
+        first = self.sync_employees(self.SN).json()
+        second = self.sync_employees(self.SN).json()
+
+        self.assertEqual(len(self.outbox(self.SN)), 1)
+        self.assertEqual(second["command_ids"], first["command_ids"])
+        self.assertEqual(second["queued"], 0)
+        self.assertEqual(second["already_outstanding"], 1)
+        self.assertIn("already waiting", second["message"])
+
+    def test_asking_again_after_the_first_answer_arrived_does_queue_again(self):
+        """A concluded query is history. Asking again is what Sync means."""
+        from app.models import DeviceCommandOutbox
+        from app.services import commands as command_service
+
+        self.sync_employees(self.SN)
+        db = self.Session()
+        try:
+            row = db.query(DeviceCommandOutbox).filter_by(device_sn=self.SN).first()
+            command_service.conclude(db, row, "acknowledged", return_code=3)
+        finally:
+            db.close()
+
+        self.sync_employees(self.SN)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [CONFIRMED_USER_QUERY])
+
+    def test_a_queued_query_is_not_queued_against_the_other_terminal(self):
+        self.sync_all(self.SN)
+
+        self.assertEqual(self.outbox(self.OTHER_SN), [])
+
+
+class PullTransportRoutingTests(PullRoutingTestCase):
+    """acc goes to the outbox, att goes to the SDK, never both."""
+
+    def test_an_acc_sync_never_opens_a_socket(self):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        for action in (self.sync_employees, self.sync_templates, self.sync_all):
+            with self.subTest(action=action.__name__):
+                response = action(self.SN)
+                self.assertEqual(response.status_code, 202, response.text)
+
+        self.assertEqual(calls, [])
+
+    def test_an_att_sync_uses_the_sdk_and_leaves_the_outbox_empty(self):
+        from unittest import mock
+
+        seen = []
+        with mock.patch("app.routers.devices.pull_employees",
+                        lambda sn: seen.append(("employees", sn))):
+            response = self.sync_employees(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(),
+                         {"message": "Employee sync started", "device": self.ATT_SN})
+        self.assertEqual(seen, [("employees", self.ATT_SN)])
+        self.assertEqual(self.outbox(), [])
+
+    def test_att_sync_all_and_attendance_still_reach_the_poller_unchanged(self):
+        from unittest import mock
+
+        seen = []
+        with mock.patch("app.routers.devices.pull_device",
+                        lambda sn: seen.append(("all", sn))), \
+             mock.patch("app.routers.devices.pull_attendance",
+                        lambda sn: seen.append(("attendance", sn))):
+            self.assertEqual(self.sync_all(self.ATT_SN).status_code, 200)
+            self.assertEqual(self.sync_attendance(self.ATT_SN).status_code, 200)
+
+        self.assertEqual(seen, [("all", self.ATT_SN), ("attendance", self.ATT_SN)])
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_att_template_pull_still_reads_the_device_over_the_sdk(self):
+        from unittest import mock
+
+        class Finger:
+            uid, fid, valid = 5, 1, 1
+
+            def json_pack(self):
+                return {"template": "0a0b0c"}
+
+        class Conn(FakeConnection):
+            def get_templates(self):
+                return [Finger()]
+
+        conn = Conn(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.sync_templates(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(len(body), 1)
+        # The `att` body shape is unchanged by E12: still FingerprintTemplateOut.
+        self.assertEqual(body[0]["user_id"], "9001")
+        self.assertEqual(body[0]["template"], "0a0b0c")
+        self.assertEqual(body[0]["source_device_sn"], self.ATT_SN)
+        self.assertEqual(self.outbox(), [])
+
+    def test_a_device_with_no_protocol_set_takes_the_sdk_path_for_every_action(self):
+        """Unclassified is not acc. An SDK pull to a device that cannot answer
+        fails loudly; queueing acc-shaped commands to an attendance terminal
+        would sit in the outbox looking healthy."""
+        from unittest import mock
+
+        seen = []
+        with mock.patch("app.routers.devices.pull_device",
+                        lambda sn: seen.append("all")), \
+             mock.patch("app.routers.devices.pull_employees",
+                        lambda sn: seen.append("employees")), \
+             mock.patch("app.routers.devices.pull_attendance",
+                        lambda sn: seen.append("attendance")), \
+             mock.patch("app.routers.devices.device_connection",
+                        fake_sdk(EmptyTemplateConnection())):
+            self.assertEqual(self.sync_all(self.DEFAULT_SN).status_code, 200)
+            self.assertEqual(self.sync_employees(self.DEFAULT_SN).status_code, 200)
+            self.assertEqual(self.sync_attendance(self.DEFAULT_SN).status_code, 200)
+            self.sync_templates(self.DEFAULT_SN)
+
+        self.assertEqual(sorted(seen), ["all", "attendance", "employees"])
+        self.assertEqual(self.outbox(), [])
+
+    def test_approving_an_acc_terminal_queues_the_queries_instead_of_dialling(self):
+        """The fifth caller of the SDK pull, and it had the same defect."""
+        from unittest import mock
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number="E12NEWACC00001", ip_address="203.0.113.20",
+                          port=4370, name="New terminal", status="pending",
+                          protocol="acc"))
+            db.commit()
+        finally:
+            db.close()
+
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        try:
+            response = self.client.post("/devices/E12NEWACC00001/approve")
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            [r.command for r in self.outbox("E12NEWACC00001")],
+            [CONFIRMED_USER_QUERY, CONFIRMED_PHOTO_QUERY, CONFIRMED_TEMPLATE_QUERY],
+        )
+
+    def test_approving_an_att_terminal_still_dials_it_and_queues_nothing(self):
+        from unittest import mock
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number="E12NEWATT00001", ip_address="203.0.113.21",
+                          port=4370, name="New terminal", status="pending",
+                          protocol="att"))
+            db.commit()
+        finally:
+            db.close()
+
+        seen = []
+        with mock.patch("app.routers.devices.pull_device", lambda sn: seen.append(sn)):
+            response = self.client.post("/devices/E12NEWATT00001/approve")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(seen, ["E12NEWATT00001"])
+        self.assertEqual(self.outbox("E12NEWATT00001"), [])
+
+
+class AttendancePullRefusalTests(PullRoutingTestCase):
+    """No confirmed command exists, so none is invented — and the refusal says so."""
+
+    def test_sync_attendance_on_an_acc_terminal_is_refused_not_queued(self):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        try:
+            response = self.sync_attendance(self.SN)
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(response.status_code, 501, response.text)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.outbox(), [])
+
+    def test_the_refusal_explains_that_punches_arrive_on_their_own(self):
+        """An operator has to be able to tell 'does not apply here' from
+        'broken', and to know that doing nothing is the correct action."""
+        detail = self.sync_attendance(self.SN).json()["detail"]
+
+        self.assertIn(self.SN, detail)
+        self.assertIn("rtlog", detail)
+        self.assertIn("Nothing was queued", detail)
+        self.assertIn("buffered", detail)
+
+    def test_no_transaction_query_is_invented_anywhere_in_the_app(self):
+        """The whole point of the refusal. If a later change ever fabricates a
+        `DATA QUERY tablename=transaction`, this fails — it would be a command
+        no hardware has ever been observed answering, on a queue that retries
+        on backoff until it exhausts."""
+        import ast
+        import pathlib
+
+        def string_literals(tree):
+            """Every str constant in the module except its docstrings.
+
+            Comments and docstrings are excluded deliberately: this file, the
+            router and the service all *discuss* the command that must not
+            exist, at length and on purpose. What must not exist is a string
+            the program could put on a wire.
+            """
+            docstrings = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                     ast.AsyncFunctionDef)):
+                    body = getattr(node, "body", None)
+                    if (body and isinstance(body[0], ast.Expr)
+                            and isinstance(body[0].value, ast.Constant)
+                            and isinstance(body[0].value.value, str)):
+                        docstrings.add(id(body[0].value))
+            return [n.value for n in ast.walk(tree)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                    and id(n) not in docstrings]
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "app"
+        offenders = []
+        for path in sorted(root.rglob("*.py")):
+            for literal in string_literals(ast.parse(path.read_text())):
+                for marker in ("tablename=transaction", "tablename=ATTLOG",
+                               "tablename=attlog"):
+                    if marker in literal:
+                        offenders.append(f"{path}: {marker}")
+        self.assertEqual(offenders, [])
+
+    def test_sync_all_on_an_acc_terminal_does_not_smuggle_in_an_attendance_query(self):
+        self.sync_all(self.SN)
+
+        for row in self.outbox(self.SN):
+            self.assertNotIn("transaction", row.command)
+            self.assertNotIn("ATTLOG", row.command)
+
+    def test_sync_all_says_out_loud_that_attendance_is_not_in_it(self):
+        body = self.sync_all(self.SN).json()
+
+        self.assertIn("Attendance is not included", body["message"])
+        self.assertIn("rtlog", body["attendance"])

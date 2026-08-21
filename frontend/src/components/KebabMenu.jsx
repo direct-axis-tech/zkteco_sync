@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 
-function MenuItem({ label, onClick, danger, disabled }) {
+function MenuItem({ label, onClick, danger, disabled, hint }) {
+  // `hint` is rendered, not hovered: an action that is unavailable has to say
+  // why on the face of it, or an operator cannot tell "does not apply to this
+  // device" from "broken". Disabled elements swallow mouse events in some
+  // browsers, so a title tooltip alone would be no explanation at all.
   return (
     <button
       type="button"
@@ -8,13 +12,20 @@ function MenuItem({ label, onClick, danger, disabled }) {
       onClick={() => {
         if (!disabled) onClick()
       }}
-      className={`w-full text-left px-3 py-2 text-sm rounded-md transition-colors disabled:opacity-40 ${
-        danger
-          ? 'text-red-600 hover:bg-red-50'
-          : 'text-gray-700 hover:bg-gray-100'
+      className={`w-full text-left px-3 py-2 text-sm rounded-md transition-colors ${
+        disabled
+          ? 'text-gray-400 cursor-default'
+          : danger
+            ? 'text-red-600 hover:bg-red-50'
+            : 'text-gray-700 hover:bg-gray-100'
       }`}
     >
       {label}
+      {hint && (
+        <span className="block text-xs leading-snug text-gray-400 mt-0.5">
+          {hint}
+        </span>
+      )}
     </button>
   )
 }
@@ -62,6 +73,7 @@ export default function KebabMenu({ items }) {
                 label={item.label}
                 danger={item.danger}
                 disabled={item.disabled}
+                hint={item.hint}
                 onClick={() => {
                   setOpen(false)
                   item.onClick()

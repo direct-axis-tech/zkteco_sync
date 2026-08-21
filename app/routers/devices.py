@@ -365,8 +365,15 @@ def approve_device(
     audit.record(db, admin.username, "device_approve", target=sn, ip=client_ip(request))
     if not was_approved:
         # Same first-contact sync auto-registration used to do, moved to the
-        # moment a human actually vouches for the device.
-        background_tasks.add_task(pull_device, sn)
+        # moment a human actually vouches for the device — and routed on
+        # protocol for the same reason the Sync menu is (E12). This is the
+        # fifth caller of the SDK pull and it had the same defect: on an `acc`
+        # terminal it dialled TCP 4370 and timed out, silently, in a
+        # background task nobody was watching.
+        if _uses_command_queue(device):
+            provisioning.query_everything(db, sn)
+        else:
+            background_tasks.add_task(pull_device, sn)
     return device
 
 
@@ -393,26 +400,119 @@ def delete_device(sn: str, request: Request, db: Session = Depends(get_db), admi
 
 
 # ---------------------------------------------------------------------------
-# SDK pull (background)
+# Pulling what a device holds — two transports (E12)
 # ---------------------------------------------------------------------------
+#
+# Same rule as every write to a terminal (see `_uses_command_queue` further
+# down): the transport is a total function of Device.protocol, never of what
+# happens to answer a socket. Until E12 these four endpoints had no protocol
+# check at all — every one of them dialled TCP 4370 through
+# app/services/poller.py. On an `acc` terminal behind NAT that is a timeout,
+# which is exactly what the operator saw when they clicked Sync Employees.
+#
+#   att -> the SDK poller, unchanged, in a background task. It really does
+#          read the device, so it reports what it read.
+#   acc -> a `DATA QUERY` on the E7 outbox. **202 and the word "queued"**: the
+#          device collects it on its next poll (~10s) and answers by POSTing
+#          the table to /iclock/querydata, where E9 ingests it. Nothing has
+#          been read at the moment this returns, so nothing here says it has.
+#
+# Attendance has no `acc` branch on purpose — see provisioning.NO_ATTENDANCE_QUERY.
+
+def _queued_query_response(sn: str, rows, created: int, response: Response,
+                           what: str, extra: str = "") -> dict:
+    """The one shape every queued-pull answer takes. Says queued, not done."""
+    response.status_code = 202
+    seconds = max(len(rows), 1) * 10
+    reused = len(rows) - created
+    return {
+        "device_sn": sn,
+        "transport": "adms_queue",
+        "status": "queued",
+        "command_ids": [r.id for r in rows],
+        "commands": [r.command for r in rows],
+        "queued": created,
+        "already_outstanding": reused,
+        "message": (
+            f"Asked {sn} for {what}: {len(rows)} command"
+            f"{'' if len(rows) == 1 else 's'} on the queue"
+            + (f" ({reused} of which {'was' if reused == 1 else 'were'} already "
+               "waiting from an earlier click)" if reused else "")
+            + f". The device collects one per poll, so this takes roughly "
+              f"{seconds} seconds, and nothing has been read yet — watch "
+              "Commands for the outcome." + extra
+        ),
+    }
+
 
 @router.post("/{sn}/pull", dependencies=[Depends(require_admin)])
-def trigger_pull(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    _get_device_or_404(sn, db)
+def trigger_pull(sn: str, background_tasks: BackgroundTasks, response: Response,
+                 db: Session = Depends(get_db)):
+    """Sync everything this device can be asked for.
+
+    On `acc` that is three confirmed queries — users, photos, templates — and
+    NOT attendance, which is not pulled from these terminals at all because it
+    arrives on its own over the push channel. Three commands at one per poll
+    is roughly thirty seconds and shows as three rows in Commands.
+    """
+    device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        rows, created = provisioning.query_everything(db, sn)
+        body = _queued_query_response(
+            sn, rows, created, response, "its people, photos and templates",
+            extra=" Attendance is not included — these terminals push punches "
+                  "up by themselves.",
+        )
+        # The full reasoning, for a caller that wants it. Not in `message`,
+        # which is what the UI shows in a toast.
+        body["attendance"] = provisioning.NO_ATTENDANCE_QUERY
+        return body
     background_tasks.add_task(pull_device, sn)
     return {"message": "Pull started", "device": sn}
 
 
 @router.post("/{sn}/pull/employees", dependencies=[Depends(require_admin)])
-def trigger_pull_employees(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    _get_device_or_404(sn, db)
+def trigger_pull_employees(sn: str, background_tasks: BackgroundTasks, response: Response,
+                           db: Session = Depends(get_db)):
+    """Read the device's user table into `employees`."""
+    device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        row, created = provisioning.query_users(db, sn)
+        return _queued_query_response(sn, [row], int(created), response, "its user table")
     background_tasks.add_task(pull_employees, sn)
     return {"message": "Employee sync started", "device": sn}
 
 
 @router.post("/{sn}/pull/attendance", dependencies=[Depends(require_admin)])
-def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    _get_device_or_404(sn, db)
+def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks,
+                            db: Session = Depends(get_db)):
+    """Read buffered punches off the device (`att` only).
+
+    On an `acc` terminal this is REFUSED — 501 — and, as with the per-template
+    delete E8 refused for the same kind of reason, the refusal is a finding
+    rather than a gap somebody forgot to fill.
+
+    No server-issued query for an access-control terminal's transaction table
+    has ever been observed answering, and it is unknown whether the firmware
+    supports one. What is known is that these devices do not need to be asked:
+    they push every punch up as an `rtlog` record as it happens, and the
+    operator has already watched punches buffered through an outage arrive by
+    themselves once the server came back. So the honest answer is that this
+    action does not apply here — not a fabricated `DATA QUERY
+    tablename=transaction` that would look like it worked while doing nothing,
+    or wedge the outbox retrying a command the device never answers.
+    """
+    device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"{sn} is an access-control terminal. "
+                + provisioning.NO_ATTENDANCE_QUERY
+                + " Nothing was queued and nothing was guessed at. Punches "
+                "from this device appear in Attendance without any action here."
+            ),
+        )
     background_tasks.add_task(pull_attendance, sn)
     return {"message": "Attendance sync started", "device": sn}
 
@@ -1224,13 +1324,28 @@ def clear_device_attendance(
 # Fingerprint templates
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/templates/pull", response_model=List[FingerprintTemplateOut], dependencies=[Depends(require_admin)])
-def pull_templates(sn: str, db: Session = Depends(get_db)):
-    """
-    Pull all fingerprint templates from device and save to DB.
-    Overwrites existing DB record for the same (user_id, finger_id) pair.
+@router.post("/{sn}/templates/pull", response_model=None, dependencies=[Depends(require_admin)])
+def pull_templates(sn: str, response: Response, db: Session = Depends(get_db)):
+    """Read the biometrics a device holds. Two transports, as everywhere else.
+
+    * `att` — the SDK reads templates over TCP 4370 now and saves them to
+      `fingerprint_templates`. 200, and the list it read, exactly as before.
+    * `acc` — ONE `DATA QUERY tablename=biodata` on the outbox. **202,
+      `status: "queued"`** — the device answers on /iclock/querydata a poll
+      later and E9 writes `biometric_templates`.
+
+    One query, not one per modality. The terminal ignores the type filter:
+    `filter=type=9` and `filter=type=1` came back byte-identical, six records
+    and 7002 bytes both times, covering face and fingerprint together. Asking
+    twice would occupy the queue for a second poll to be told the same thing.
     """
     device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        row, created = provisioning.query_templates(db, sn)
+        return _queued_query_response(sn, [row], int(created), response,
+                                      "its biometric templates")
+
     try:
         with device_connection(device) as conn:
             users = conn.get_users()
@@ -1264,7 +1379,10 @@ def pull_templates(sn: str, db: Session = Depends(get_db)):
             db.commit()
             for r in result:
                 db.refresh(r)
-            return result
+            # Serialised here rather than by `response_model`, which this
+            # endpoint gave up when it grew a second transport that answers
+            # with a queue receipt. The `att` body is unchanged.
+            return [FingerprintTemplateOut.model_validate(r) for r in result]
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 

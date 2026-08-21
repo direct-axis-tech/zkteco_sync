@@ -796,3 +796,139 @@ def cancel_revocation(db: Session, device_sn: str, user_id: str, by: str) -> lis
                 row_id, name, user_id, device_sn, by,
             )
     return cancelled
+
+
+# ---------------------------------------------------------------------------
+# Asking the terminal for what it already holds (E12)
+# ---------------------------------------------------------------------------
+#
+# Everything above pushes *down*. This section pulls *up*, and it is here
+# rather than in a module of its own for one reason: every byte this
+# application ever puts on an `acc` wire should be greppable in one file, next
+# to the evidence that justifies it.
+#
+# There is no synchronous read on this transport. A `DATA QUERY` is queued
+# like any other command, collected on the device's next `GET
+# /iclock/getrequest`, and answered by the device POSTing the table back to
+# `/iclock/querydata` — possibly across several packets — where E9 reassembles
+# and ingests it and concludes the command by its `cmdid`. So a caller here
+# gets an outbox row, never data, and must say *queued*.
+#
+# EVIDENCE GRADES. These three strings are not extrapolations. Each was
+# collected by the operator's own BioFace A1 (VGU6254600603) on 2026-08-21 and
+# answered with real records, so they are reproduced verbatim — including the
+# capital `Type` on biophoto and the lowercase `type` on biodata, which is how
+# the device was actually asked. Do not "normalise" them.
+#
+#   user     -> 3 records, one packet
+#   biophoto -> 3 photos across 3 packets, reassembled and stored
+#   biodata  -> 6 templates, one packet
+#
+# ONE BIODATA QUERY, NOT ONE PER MODALITY. The device IGNORES the type filter:
+# `filter=type=9` and `filter=type=1` returned byte-identical bodies (6
+# records, 7002 bytes both times), covering face and fingerprint together. A
+# loop over modalities would ask the same question twice, occupy the queue for
+# a second poll cycle, and re-ingest rows E2's upsert would only overwrite
+# with themselves.
+
+# The user table: name, card, privilege, password — the person records.
+QUERY_USERS = "DATA QUERY tablename=user,fielddesc=*,filter=*"
+
+# Enrolled photographs. Large, and the one query observed to arrive in
+# multiple packets.
+QUERY_PHOTOS = "DATA QUERY tablename=biophoto,fielddesc=*,filter=Type=9"
+
+# Biometric templates, ALL modalities in one answer (see above).
+QUERY_TEMPLATES = "DATA QUERY tablename=biodata,fielddesc=*,filter=type=9"
+
+# Why there is no attendance entry here, in the module an author would grep
+# before adding one.
+#
+# It is NOT known whether an `acc` terminal will answer a server-issued query
+# for its transaction table, and no such command has ever been observed. What
+# IS known is that these devices push punches up on their own as `rtlog`, and
+# that the operator has already watched punches from a period when this server
+# was unreachable arrive afterwards — so the buffer drains over the push
+# channel without being asked.
+#
+# Inventing `DATA QUERY tablename=transaction` and wiring it to a menu item
+# would therefore produce, at best, a button that appears to work and does
+# nothing, and at worst one that wedges the outbox on a command the firmware
+# never answers, retrying on backoff until it exhausts. An honest "not
+# applicable here" is strictly better than either. A test greps this package
+# and fails if such a command ever appears.
+NO_ATTENDANCE_QUERY = (
+    "Attendance is not pulled from an access-control terminal. It arrives by "
+    "itself: the device pushes each punch up as an rtlog record as it happens, "
+    "and re-sends what it buffered once it can reach the server again. There "
+    "is no confirmed command for asking one of these terminals for its "
+    "transaction table, and none has been invented here — a button that "
+    "silently does nothing would be worse than one that says it does not apply."
+)
+
+
+def queue_query(db: Session, device_sn: str, command: str) -> tuple:
+    """Queue one ``DATA QUERY``, reusing an identical one already outstanding.
+
+    Returns ``(row, created)``.
+
+    Clicking Sync twice should not cost two poll cycles. A query carries no
+    arguments and no state, so a second identical one outstanding on the same
+    device asks a question already asked and answers it with the same rows —
+    it just puts the real work ten seconds further away, at
+    COMMAND_BATCH_SIZE=1. Reusing the outstanding row is honest about that:
+    the caller is told which command id to watch, and it is the one that will
+    actually answer.
+
+    Only ``pending`` and ``sent`` rows are reused. A concluded query is
+    history; asking again is exactly what the operator means.
+    """
+    existing = (
+        db.query(DeviceCommandOutbox)
+        .filter(DeviceCommandOutbox.device_sn == device_sn,
+                DeviceCommandOutbox.command == command,
+                DeviceCommandOutbox.status.in_(("pending", "sent")))
+        .order_by(DeviceCommandOutbox.id)
+        .first()
+    )
+    if existing:
+        log.info("query already outstanding for %s as command %s: %s",
+                 device_sn, existing.id, command)
+        return existing, False
+    return commands.queue(db, device_sn, command), True
+
+
+def query_users(db: Session, device_sn: str) -> tuple:
+    """Ask an `acc` terminal for its user table."""
+    return queue_query(db, device_sn, QUERY_USERS)
+
+
+def query_photos(db: Session, device_sn: str) -> tuple:
+    """Ask an `acc` terminal for its enrolled photographs."""
+    return queue_query(db, device_sn, QUERY_PHOTOS)
+
+
+def query_templates(db: Session, device_sn: str) -> tuple:
+    """Ask an `acc` terminal for its biometric templates — one query, all types."""
+    return queue_query(db, device_sn, QUERY_TEMPLATES)
+
+
+def query_everything(db: Session, device_sn: str) -> tuple:
+    """All three confirmed queries, in the order they are worth having.
+
+    Returns ``(rows, created_count)``. Attendance is deliberately not among
+    them; see :data:`NO_ATTENDANCE_QUERY`.
+
+    People first, because a photo or a template whose Pin we cannot name is
+    not much use; photos before templates only because the operator can see a
+    photo went wrong and cannot see that about a template.
+    """
+    rows, created = [], 0
+    for command in (QUERY_USERS, QUERY_PHOTOS, QUERY_TEMPLATES):
+        row, was_new = queue_query(db, device_sn, command)
+        rows.append(row)
+        created += 1 if was_new else 0
+    log.info("sync-all queued for %s: command ids %s (%s new) — "
+             "awaiting the device's next getrequest",
+             device_sn, [r.id for r in rows], created)
+    return rows, created
