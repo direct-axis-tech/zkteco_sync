@@ -38,7 +38,11 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
-Base.metadata.create_all(bind=engine)
+# Schema creation happens in the lifespan handler, NOT at import time.
+# Importing this module must not open a database connection: the test
+# suite imports it, and at import time `.env` names the operator's real
+# database, so a module-level create_all() made `import app.main` touch
+# production from a unit test.
 
 _scheduler = None
 
@@ -112,8 +116,10 @@ def _start_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # create_all above only builds missing tables; run_migrations brings
-    # existing ones up to date before anything queries them.
+    # create_all builds missing tables; run_migrations then brings existing
+    # ones up to date before anything queries them. Both are deferred to
+    # startup so that importing this module stays side-effect free.
+    Base.metadata.create_all(bind=engine)
     run_migrations(engine)
     seed_first_admin()
     _start_scheduler()
