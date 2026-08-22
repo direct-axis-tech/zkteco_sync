@@ -138,7 +138,14 @@ export const api = {
     info: (sn) => request('GET', `/devices/${sn}/info`),
     getTime: (sn) => request('GET', `/devices/${sn}/time`),
     setTime: (sn, data) => request('POST', `/devices/${sn}/time`, data),
-    unlock: (sn, seconds = 3) => request('POST', `/devices/${sn}/unlock`, { seconds }),
+    // `door` only means anything on an access-control terminal, where the
+    // command addresses a numbered door on the controller. Door 1 is the
+    // default and door 0 — which the protocol reads as "every door" — is
+    // rejected by the server rather than being reachable from here.
+    unlock: (sn, seconds = 3, door = 1) =>
+      request('POST', `/devices/${sn}/unlock`, { seconds, door }),
+    // Ask an `acc` terminal to re-send its parameters. Queued, not immediate.
+    refreshInfo: (sn) => request('POST', `/devices/${sn}/info/refresh`),
     writeLcd: (sn, line, text) => request('POST', `/devices/${sn}/lcd`, { line, text }),
     clearLcd: (sn) => request('DELETE', `/devices/${sn}/lcd`),
     clearAttendance: (sn) => request('DELETE', `/devices/${sn}/attendance`),

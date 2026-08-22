@@ -325,6 +325,17 @@ class DeviceInfoOut(BaseModel):
 class UnlockRequest(BaseModel):
     seconds: int = 3
 
+    # Which door on the controller (E15). Only the `acc` transport can address
+    # more than one — the SDK path has always opened the terminal's own lock
+    # and ignores this.
+    #
+    # Defaults to 1, and 0 is NOT accepted even though the protocol defines it,
+    # because in this protocol door 0 means EVERY door on the controller. A
+    # single-door face terminal would not notice the difference; a multi-door
+    # controller would open the whole building. That is not a default anyone
+    # should be able to reach by omitting a field.
+    door: int = Field(default=1, ge=1, le=10)
+
 
 class LcdRequest(BaseModel):
     line: int = 1

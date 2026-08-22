@@ -85,6 +85,13 @@ class Device(Base):
     # to understand it yet and a parser would be a guess.
     capabilities = Column(Text, nullable=True)
 
+    # When that line last arrived (E15). Without it, the Device Info drawer on
+    # an `acc` terminal could say "last known" but not "last known as of when",
+    # and an unfalsifiable "last known" is barely better than presenting stale
+    # values as live. Nullable and additive: an existing row keeps its
+    # capabilities and reads "time not recorded", which is true.
+    capabilities_at = Column(DateTime, nullable=True)
+
     # What the digits on this device's clock mean. The device sends a bare
     # wall-clock string with no offset, so without this column the server is
     # guessing — and it guessed UTC, which is how a 14:48 punch came to be
@@ -233,6 +240,19 @@ class DeviceCommandOutbox(Base):
     # When a delivered-but-unacknowledged command may be offered again. Null
     # while pending — there is nothing to wait for until it has been sent once.
     next_attempt_at = Column(DateTime, nullable=True)
+
+    # A hard deadline after which this command must never be delivered (E15).
+    #
+    # NULL for almost everything, and NULL means what it has always meant: the
+    # queue is patient, and a command waits as long as the device takes to come
+    # back. It is set only for commands where being late is worse than not
+    # happening at all — door control, where the person who asked for the door
+    # has walked away by the time a slow queue drains.
+    #
+    # Nullable and additive, so an existing database gains the column with
+    # every historic row reading "no deadline", which is exactly the prior
+    # behaviour. No backfill is needed or wanted.
+    expires_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, nullable=False, default=_now)
     sent_at = Column(DateTime, nullable=True)   # most recent delivery

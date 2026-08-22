@@ -607,6 +607,16 @@ def _store_bulk_table(db: Session, sn: str, tablename: str, body: str,
         handler, args = _store_biodata_table, (db, sn, body)
     elif low in ("biophoto", "userpic"):
         handler, args = _store_photo_table, (db, sn, body, low)
+    elif low == "options":
+        # A device answering `GET OPTIONS` (E15). The spec routes that answer
+        # here rather than inline: §12.5.2 has the client POST the parameters
+        # to /iclock/querydata with type=options&tablename=options, then
+        # acknowledge separately.
+        #
+        # The body is the same comma-separated parameter line the device
+        # pushes unprompted to cdata?table=options, so it goes to the same
+        # store and no second parser exists to disagree with the first.
+        handler, args = _store_options_table, (db, sn, body)
     else:
         return False
 
@@ -625,6 +635,23 @@ def _store_bulk_table(db: Session, sn: str, tablename: str, body: str,
 # ---------------------------------------------------------------------------
 # Table parsers
 # ---------------------------------------------------------------------------
+
+def _store_options_table(db: Session, sn: str, body: str) -> None:
+    """A `GET OPTIONS` answer, stored exactly like a pushed options line.
+
+    Looks the device up by serial rather than taking one, because
+    `_store_bulk_table` dispatches on a serial and every other parser it owns
+    does the same. A serial with no row cannot happen on this path — the
+    request was authorised before the body was read — but it is checked rather
+    than assumed, since the alternative is an AttributeError inside a handler
+    whose whole contract is that it must not raise.
+    """
+    device = db.query(Device).filter_by(serial_number=sn).first()
+    if device is None:
+        log.warning("ADMS querydata options from unknown serial %s — dropped", sn)
+        return
+    _store_capabilities(db, device, body)
+
 
 def _store_attlog(db: Session, sn: str, body: str, tz: str) -> None:
     """Attendance PUSH punches: positional TSV.
@@ -1087,6 +1114,7 @@ def _store_capabilities(db: Session, device: Device, body: str) -> None:
     if not text or device is None:
         return
     device.capabilities = text[:_CAPABILITIES_LIMIT]
+    device.capabilities_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
 
 

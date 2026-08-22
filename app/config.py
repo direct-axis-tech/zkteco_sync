@@ -113,6 +113,23 @@ COMMAND_LOG_RETENTION_DAYS = _get_int("COMMAND_LOG_RETENTION_DAYS", 90)
 # How often the retry/expiry/prune sweep runs on the existing scheduler.
 COMMAND_SWEEP_MINUTES = max(1, _get_int("COMMAND_SWEEP_MINUTES", 15))
 
+# How long a DOOR command stays deliverable, in seconds (E15).
+#
+# Every other command in this system benefits from the queue's patience — a
+# provisioning upsert collected an hour late is still correct. A door unlock
+# is the exception: somebody asked for a door to open *now*, and a terminal
+# that collects the command minutes later opens a door at which nobody is
+# standing. Late is worse than never here, so door commands get a short
+# absolute life and are concluded honestly as undelivered when it runs out.
+#
+# This also makes a door command effectively one-shot. The shortest retry
+# backoff is COMMAND_BACKOFF_SECONDS[0] (60s), so a TTL at or below that means
+# an unacknowledged unlock can never reach a second delivery — the door cannot
+# be re-opened an hour later by a retry of a command whose acknowledgement was
+# lost. Raising this above the first backoff value gives that behaviour back,
+# so don't, unless that is genuinely what is wanted.
+DOOR_COMMAND_TTL_SECONDS = max(1, _get_int("DOOR_COMMAND_TTL_SECONDS", 60))
+
 # How many commands one getrequest poll may carry. The protocol allows several
 # LF-separated commands in one reply (§3.8), but no device in this install has
 # ever been sent a command at all, so the ack behaviour for a batch is

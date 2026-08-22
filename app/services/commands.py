@@ -302,19 +302,29 @@ def history_detail(outcome: str, return_code=None, command: str = ""):
 # Queueing
 # ---------------------------------------------------------------------------
 
-def queue(db: Session, device_sn: str, command: str) -> DeviceCommandOutbox:
+def queue(db: Session, device_sn: str, command: str,
+          ttl_seconds: int = None) -> DeviceCommandOutbox:
     """Put one command in the outbox for a device. Delivered on its next poll.
 
     Deliberately does not care whether the device is reachable, approved or
     even switched on: queueing is not delivery, and a device that is offline
     right now is the ordinary case, not an error.
+
+    ``ttl_seconds`` sets a hard deadline after which the command must never be
+    delivered. It is None for everything except door control (E15), and None
+    keeps the queue's original patience: wait as long as the device takes.
+    Pass it only where arriving late is worse than not arriving — see
+    ``config.DOOR_COMMAND_TTL_SECONDS``.
     """
+    created = _now()
     row = DeviceCommandOutbox(
         device_sn=device_sn,
         command=strip_envelope(command),
         status="pending",
         attempts=0,
-        created_at=_now(),
+        created_at=created,
+        expires_at=(created + timedelta(seconds=ttl_seconds)
+                    if ttl_seconds else None),
     )
     db.add(row)
     db.commit()
@@ -475,10 +485,23 @@ def _eligible(db: Session, device_sn: str, now: datetime):
     Either never delivered, or delivered and past its retry time. A command
     that was sent and is still inside its backoff window is deliberately
     invisible here — that is the whole point of the backoff.
+
+    A command past its ``expires_at`` is invisible here too, and that is the
+    stronger rule: it is not offered to the device however long the device has
+    been away. Only door commands carry a deadline (E15), and for those,
+    delivering late is the failure being prevented. The expired row is left
+    for the sweep to conclude — this function is on the getrequest hot path
+    and does not write.
     """
     return (
         db.query(DeviceCommandOutbox)
         .filter(DeviceCommandOutbox.device_sn == device_sn)
+        .filter(
+            or_(
+                DeviceCommandOutbox.expires_at.is_(None),
+                DeviceCommandOutbox.expires_at > now,
+            )
+        )
         .filter(
             or_(
                 DeviceCommandOutbox.status == "pending",
@@ -744,7 +767,7 @@ def sweep(db: Session, now: datetime = None) -> dict:
     Runs on the app's existing APScheduler (see app/main.py), infrequently —
     none of this is on a request path.
 
-    Three jobs, in the order they matter:
+    Four jobs, in the order they matter:
 
     1. **Exhausted deliveries.** A command handed to a device the maximum
        number of times, whose last retry window has passed, is concluded
@@ -752,6 +775,11 @@ def sweep(db: Session, now: datetime = None) -> dict:
        device that stopped polling part-way through its retries, so the
        failure surfaces on a timer instead of waiting for a device that may
        never return.
+
+    1b. **Door deadlines (E15).** A door command past its ``expires_at`` is
+       concluded failed and never offered again. `_eligible` already refuses
+       to hand it out; this is what turns that silence into a visible outcome
+       saying the door did not open.
 
     2. **Absolute expiry.** An outstanding command older than
        COMMAND_PENDING_EXPIRY_DAYS is abandoned regardless of status. This is
@@ -767,7 +795,7 @@ def sweep(db: Session, now: datetime = None) -> dict:
     being undelivered. That is the queue working.
     """
     now = now or _now()
-    result = {"exhausted": 0, "expired": 0, "pruned": 0}
+    result = {"exhausted": 0, "door_expired": 0, "expired": 0, "pruned": 0}
 
     # 1. Delivered the maximum number of times, retry window elapsed, silent.
     exhausted = (
@@ -786,6 +814,37 @@ def sweep(db: Session, now: datetime = None) -> dict:
             ),
         ):
             result["exhausted"] += 1
+
+    # 1b. Door commands past their short deadline (E15). Concluded failed with
+    # a reason that says the door did NOT open, which is the only thing the
+    # operator actually needs to know. Kept separate from the absolute expiry
+    # below because the two answer different questions on wildly different
+    # clocks — a minute versus a month — and because collapsing them would let
+    # a future change to the long one silently lengthen the short one.
+    for row in (
+        db.query(DeviceCommandOutbox)
+        .filter(DeviceCommandOutbox.expires_at.isnot(None))
+        .filter(DeviceCommandOutbox.expires_at <= now)
+        .all()
+    ):
+        row_id, sn, attempts = row.id, row.device_sn, row.attempts
+        if conclude(
+            db, row, "failed",
+            last_error=(
+                "expired before the device collected it — the door was not "
+                "opened"
+                if attempts == 0 else
+                f"expired after {attempts} delivery"
+                f"{'' if attempts == 1 else 'ies'} without an acknowledgement "
+                "— it is not known whether the door opened"
+            ),
+        ):
+            result["door_expired"] += 1
+            log.warning(
+                "door command %s for %s expired after %s delivery attempt(s) "
+                "— not retried and not delivered again",
+                row_id, sn, attempts,
+            )
 
     # 2. Outstanding too long in absolute terms, whatever its status.
     if config.COMMAND_PENDING_EXPIRY_DAYS > 0:

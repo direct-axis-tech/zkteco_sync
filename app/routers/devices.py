@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import (
     APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response,
@@ -25,7 +26,9 @@ from app.schemas import (
     FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
     RevocationGroupOut, SetTimeRequest, UnlockRequest,
 )
-from app.services import commands, employee_sync, pairing, provisioning
+from app.services import (
+    commands, devicecontrol, employee_sync, pairing, provisioning,
+)
 from app.services.poller import pull_attendance, pull_device, pull_employees
 from app.services.sdk import device_connection, enroll_user_task
 
@@ -49,6 +52,29 @@ def _safe(fn, default=None):
         return fn()
     except ZKErrorResponse:
         return default
+
+
+def _as_device_local(dt: datetime, zone: str) -> datetime:
+    """The wall-clock time this instant shows in ``zone``, as a naive datetime.
+
+    Used only for the `acc` clock command (E15), which carries a bare
+    wall-clock value with no offset in it. A naive input is taken to already
+    BE device-local and is returned untouched — that is what an operator
+    typing a time into the Set Clock box means, and converting it would move a
+    time they had just chosen.
+
+    An unknown zone label falls back to the instant as given rather than
+    raising: a device row with a typo'd timezone should still be settable, and
+    the response says which zone was used either way.
+    """
+    if dt.tzinfo is None:
+        return dt
+    try:
+        return dt.astimezone(ZoneInfo(zone)).replace(tzinfo=None)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning("device timezone %r not recognised — sending the time "
+                    "as supplied", zone)
+        return dt.replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -737,12 +763,99 @@ def retry_command(
 
 
 # ---------------------------------------------------------------------------
+# Device control — two transports (E15)
+# ---------------------------------------------------------------------------
+#
+# The same total-function-of-Device.protocol rule as everywhere else. What is
+# different here is that for the first time the `acc` commands come from the
+# vendor's own specification rather than from an SDK constant table or a
+# capture: the complete Security PUSH 3.1.2 document, whose command chapters
+# live on pages 100-150 and were missing from every truncated copy available
+# when push-protocol.md §3.8 was written. app/services/devicecontrol.py holds
+# the shapes and the evidence for each one.
+#
+# Five of these actions have a documented `acc` command and are implemented.
+# Four do not exist in the protocol at all and REFUSE with 501 rather than
+# guessing: reading the clock, reading the lock state, and the two LCD
+# actions. The refusals name the reason, because "not supported here" and
+# "broken" look identical from a menu.
+
+def _queued_control_response(sn: str, row, response: Response, what: str,
+                             extra: str = "") -> dict:
+    """The one shape every queued device-control answer takes.
+
+    Says *queued*, never *done*. Nothing on this transport is synchronous, and
+    an operator who is told "restarting" for a command that is still sitting
+    in an outbox has been told something false.
+    """
+    response.status_code = 202
+    return {
+        "device_sn": sn,
+        "transport": "adms_queue",
+        "status": "queued",
+        "command_id": row.id,
+        "command": row.command,
+        "message": (
+            f"Queued: {what}. This terminal is not dialled — it collects "
+            "commands when it next polls, about every 10 seconds, and nothing "
+            "has happened yet. Watch Commands for the outcome." + extra
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Device info
 # ---------------------------------------------------------------------------
 
-@router.get("/{sn}/info", response_model=DeviceInfoOut)
+@router.get("/{sn}/info", response_model=None)
 def get_device_info(sn: str, db: Session = Depends(get_db)):
+    """What this device is.
+
+    * `att` — read live over TCP 4370, unchanged.
+    * `acc` — the **last known** parameter line the device sent us, parsed.
+      Not a live read and labelled as such, with the time it arrived.
+
+    Why last-known rather than a refusal: this is the one read where the value
+    can be sourced from something the device volunteers. Every `acc` terminal
+    pushes a complete comma-separated parameter inventory at registration, and
+    again whenever it re-sends its options (`PushOptionsFlag=1`, which this
+    hardware sets). That line is already stored verbatim in `capabilities`.
+    Rendering it is reporting what the device said; the only dishonesty
+    available would be presenting it as current, which is why the response
+    carries `source: "last_known"` and `as_of`, and why the drawer says so.
+
+    There is also a live path — `GET OPTIONS`, §12.5.2 — but it is a *queued*
+    command answered a poll later, so it cannot serve a synchronous GET. It is
+    offered separately as Refresh, below.
+    """
     device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        options = devicecontrol.parse_options(device.capabilities or "")
+        info = devicecontrol.options_as_info(options)
+        info.update({
+            "device_sn": sn,
+            "transport": "adms_last_known",
+            "source": "last_known",
+            "as_of": device.capabilities_at,
+            "parameter_count": len(options),
+            "message": (
+                "Last known values, reported by the terminal itself — not a "
+                "live reading. An access-control terminal cannot be dialled "
+                "for this; it sends its parameters when it registers and "
+                "whenever they change. Use Refresh to ask it again, which is "
+                "queued and answers on its next poll."
+                if options else
+                "This terminal has not sent its parameters yet, so there is "
+                "nothing to show. They arrive when it registers; Refresh asks "
+                "for them now, which is queued and answers on its next poll."
+            ),
+        })
+        # The serial is the one field we always know for certain, whatever the
+        # device has or has not told us about itself.
+        info["serial_number"] = info.get("serial_number") or sn
+        return info
+
     try:
         with device_connection(device) as conn:
             conn.read_sizes()
@@ -772,13 +885,67 @@ def get_device_info(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
+@router.post("/{sn}/info/refresh", dependencies=[Depends(require_admin)])
+def refresh_device_info(sn: str, response: Response, db: Session = Depends(get_db)):
+    """Ask an `acc` terminal to re-send its parameters (`GET OPTIONS`).
+
+    §12.5.2. The device does not answer inline: it POSTs the parameters to
+    /iclock/querydata with `tablename=options` and acknowledges separately, so
+    this returns 202 and the values appear in Device Info a poll later.
+
+    `att` has no equivalent and does not need one — its Device Info is read
+    live over the SDK every time the drawer opens, so there is nothing to
+    refresh.
+    """
+    device = _get_device_or_404(sn, db)
+    if not _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"{sn} is read live over the SDK every time Device Info is "
+                "opened, so there is nothing to refresh — close and reopen it. "
+                "Refresh exists for access-control terminals, which cannot be "
+                "dialled and answer on their next poll instead."
+            ),
+        )
+    row, created = provisioning.queue_query(
+        db, sn, devicecontrol.QUERY_OPTIONS)
+    return _queued_control_response(
+        sn, row, response, "asked the terminal to re-send its parameters",
+        extra="" if created else
+        " (an identical request was already waiting, so this reuses it "
+        "rather than costing another poll cycle.)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Device clock
 # ---------------------------------------------------------------------------
 
 @router.get("/{sn}/time")
 def get_device_time(sn: str, db: Session = Depends(get_db)):
+    """Read the device's clock (`att` only).
+
+    REFUSED on `acc` — 501 — and the refusal is a finding, not a gap.
+
+    The vendor protocol has no command for asking an access-control terminal
+    what time it holds. The traffic runs the other way: §12.5.1 documents the
+    DEVICE fetching the time from the SERVER (`GET /iclock/rtdata?type=time`),
+    which is the opposite direction to this endpoint. Setting the clock is
+    supported and implemented below; reading it is not, and does not need to
+    be, since setting it does not depend on knowing what it was.
+    """
     device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"{sn} is an access-control terminal. "
+                + devicecontrol.NO_DEVICE_TIME_READ
+                + " Nothing was queued and nothing was guessed at. Setting "
+                "the clock does work — use Set Clock."
+            ),
+        )
     try:
         with device_connection(device) as conn:
             t = conn.get_time()
@@ -787,8 +954,23 @@ def get_device_time(sn: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
-@router.post("/{sn}/time", dependencies=[Depends(require_admin)])
-def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_db)):
+@router.post("/{sn}/time", response_model=None, dependencies=[Depends(require_admin)])
+def set_device_time(sn: str, payload: SetTimeRequest, response: Response,
+                    db: Session = Depends(get_db)):
+    """Set the device's clock.
+
+    * `att` — set live over the SDK, unchanged.
+    * `acc` — `SET OPTIONS DateTime=<encoded>` on the outbox (§12.5.1). 202.
+
+    **The two branches send different instants on purpose.** The SDK path has
+    always sent UTC and is left exactly as it was. The `acc` path sends the
+    device's own local wall-clock time, taken from `Device.timezone`, because
+    that is what makes the terminal's display and its `rtlog` timestamps
+    correct — these devices push local time with no offset (which is the whole
+    reason `Device.timezone` exists), so handing one UTC would silently shift
+    every punch it reports. Changing the `att` branch to match is a separate
+    decision about live hardware and is not made here.
+    """
     device = _get_device_or_404(sn, db)
     if payload.sync:
         target = datetime.now(timezone.utc)
@@ -799,6 +981,19 @@ def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_
             raise HTTPException(status_code=400, detail="Invalid datetime format — use ISO 8601")
     else:
         raise HTTPException(status_code=400, detail="Provide sync=true or a dt value")
+
+    if _uses_command_queue(device):
+        zone = device.timezone or config.DEFAULT_DEVICE_TIMEZONE
+        local = _as_device_local(target, zone)
+        row = commands.queue(db, sn, devicecontrol.set_time_command(local))
+        body = _queued_control_response(
+            sn, row, response,
+            f"set the clock to {local.strftime('%Y-%m-%d %H:%M:%S')} ({zone})",
+        )
+        body["time_set"] = local.isoformat()
+        body["timezone"] = zone
+        return body
+
     try:
         with device_connection(device) as conn:
             conn.set_time(target)
@@ -811,28 +1006,110 @@ def set_device_time(sn: str, payload: SetTimeRequest, db: Session = Depends(get_
 # Door control
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/unlock")
+@router.post("/{sn}/unlock", response_model=None)
 def unlock_door(
     sn: str,
     payload: UnlockRequest,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
+    """Open the door.
+
+    * `att` — the SDK opens it synchronously. Unchanged: the call returns when
+      the door has opened, and the response says so.
+    * `acc` — `CONTROL DEVICE 01<door>01<secs>` on the outbox (§12.4). **202,
+      and the response says queued, not unlocked**, because on this transport
+      it genuinely is not open yet.
+
+    THE TWO TRANSPORTS ARE NOT EQUIVALENT AND THIS ENDPOINT DOES NOT PRETEND
+    THEY ARE. An SDK unlock is a round trip to the door. An ADMS unlock is a
+    row in a queue that the terminal collects when it next polls — normally
+    within about ten seconds, but behind anything else already queued for that
+    device, because delivery is FIFO at one command per poll. Somebody is
+    standing at the door while that happens.
+
+    Which is why an `acc` unlock is given a short deadline
+    (`DOOR_COMMAND_TTL_SECONDS`, 60s) instead of the queue's usual patience.
+    Past it the command is never delivered and is concluded as "the door was
+    not opened". Two failure modes go away with it: a door that opens minutes
+    later at nobody, and — because the deadline is no longer than the shortest
+    retry backoff — a lost acknowledgement re-opening the door repeatedly over
+    the following hour. A door command from here is one-shot by construction.
+    """
     device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        try:
+            command = devicecontrol.unlock_command(
+                door=payload.door, seconds=payload.seconds)
+        except devicecontrol.UnsafeDoorCommand as e:
+            # 400, not 500: the caller asked for something specific and this
+            # says exactly which part of it will not be sent to a door.
+            raise HTTPException(status_code=400, detail=str(e))
+
+        row = commands.queue(
+            db, sn, command,
+            ttl_seconds=config.DOOR_COMMAND_TTL_SECONDS,
+        )
+        audit.record(db, admin.username, "door_unlock_queued", target=sn,
+                     ip=client_ip(request),
+                     detail=f"door={payload.door} seconds={payload.seconds} "
+                            f"command_id={row.id}")
+        body = _queued_control_response(
+            sn, row, response,
+            f"open door {payload.door} for {payload.seconds} seconds",
+            extra=(
+                f" THIS IS NOT AN IMMEDIATE UNLOCK: the door opens when the "
+                f"terminal next polls, usually within about 10 seconds. If it "
+                f"has not collected the command within "
+                f"{config.DOOR_COMMAND_TTL_SECONDS} seconds the command is "
+                "cancelled and the door will NOT open later."
+            ),
+        )
+        body.update({
+            "door": payload.door,
+            "unlocked_for_seconds": None,
+            "requested_seconds": payload.seconds,
+            "expires_at": row.expires_at,
+            "synchronous": False,
+        })
+        return body
+
     try:
         with device_connection(device) as conn:
             conn.unlock(time=payload.seconds)
             audit.record(db, admin.username, "door_unlock", target=sn,
                          ip=client_ip(request), detail=f"seconds={payload.seconds}")
-            return {"device_sn": sn, "unlocked_for_seconds": payload.seconds}
+            return {"device_sn": sn, "unlocked_for_seconds": payload.seconds,
+                    "synchronous": True}
     except (ZKErrorConnection, ZKNetworkError):
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 
 @router.get("/{sn}/lock")
 def get_lock_state(sn: str, db: Session = Depends(get_db)):
+    """Is the door locked? (`att` only.)
+
+    REFUSED on `acc` — 501. Two independent reasons, either of which alone
+    would be enough:
+
+    1. The protocol defines no command for asking. Door, relay and alarm state
+       arrive only when the device chooses to push an `rtstate` record; there
+       is no server-initiated read of it anywhere in the specification.
+    2. Even the pushed record could not honestly answer this. Its `sensor`,
+       `relay` and `alarm` fields are raw hex bytes whose meaning the
+       specification never defines. Decoding them would be guessing about
+       whether a door is open, which is the last thing to guess about.
+    """
     device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=f"{sn} is an access-control terminal. "
+                   + devicecontrol.NO_LOCK_STATE_READ,
+        )
     try:
         with device_connection(device) as conn:
             locked = conn.get_lock_state()
@@ -845,9 +1122,31 @@ def get_lock_state(sn: str, db: Session = Depends(get_db)):
 # Device control
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/restart")
-def restart_device(sn: str, request: Request, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+@router.post("/{sn}/restart", response_model=None)
+def restart_device(sn: str, request: Request, response: Response,
+                   db: Session = Depends(get_db),
+                   admin: User = Depends(require_admin)):
+    """Reboot the device.
+
+    * `att` — SDK, synchronous, unchanged.
+    * `acc` — `CONTROL DEVICE 03000000` on the outbox (§12.4 example (3),
+      "restarting the current device"). 202: queued, not restarting.
+
+    No deadline on this one, unlike the door. A reboot collected late is still
+    a reboot, and there is no equivalent of "the person has walked away".
+    """
     device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        row = commands.queue(db, sn, devicecontrol.restart_command())
+        audit.record(db, admin.username, "device_restart_queued", target=sn,
+                     ip=client_ip(request), detail=f"command_id={row.id}")
+        return _queued_control_response(
+            sn, row, response, "restart the terminal",
+            extra=" It will go offline briefly once it collects this, and "
+                  "reconnect by itself.",
+        )
+
     try:
         with device_connection(device) as conn:
             conn.restart()
@@ -859,7 +1158,21 @@ def restart_device(sn: str, request: Request, db: Session = Depends(get_db), adm
 
 @router.post("/{sn}/lcd", dependencies=[Depends(require_admin)])
 def write_lcd(sn: str, payload: LcdRequest, db: Session = Depends(get_db)):
+    """Write a line of text to the device screen (`att` only).
+
+    REFUSED on `acc` — 501. The vendor protocol defines eight server-to-device
+    commands and not one of them addresses the display. See
+    `devicecontrol.NO_LCD_COMMAND` for what was searched and what was found
+    instead (a capability bit for resource files whose delivery command the
+    specification never defines).
+    """
     device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=f"{sn} is an access-control terminal. "
+                   + devicecontrol.NO_LCD_COMMAND,
+        )
     try:
         with device_connection(device) as conn:
             conn.write_lcd(payload.line, payload.text)
@@ -870,7 +1183,14 @@ def write_lcd(sn: str, payload: LcdRequest, db: Session = Depends(get_db)):
 
 @router.delete("/{sn}/lcd", status_code=204, dependencies=[Depends(require_admin)])
 def clear_lcd(sn: str, db: Session = Depends(get_db)):
+    """Clear the device screen (`att` only). REFUSED on `acc` — see write_lcd."""
     device = _get_device_or_404(sn, db)
+    if _uses_command_queue(device):
+        raise HTTPException(
+            status_code=501,
+            detail=f"{sn} is an access-control terminal. "
+                   + devicecontrol.NO_LCD_COMMAND,
+        )
     try:
         with device_connection(device) as conn:
             conn.clear_lcd()
@@ -1319,15 +1639,44 @@ def cancel_user_revocation(
 # Attendance: clear device memory
 # ---------------------------------------------------------------------------
 
-@router.delete("/{sn}/attendance", status_code=204)
+@router.delete("/{sn}/attendance", status_code=204, response_model=None)
 def clear_device_attendance(
     sn: str,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    """Wipe attendance logs from device memory. Does not touch our DB."""
+    """Wipe attendance logs from device memory. Does not touch our DB.
+
+    * `att` — SDK, synchronous, unchanged. Still 204.
+    * `acc` — `DATA DELETE transaction *` on the outbox (§12.1.2.5, "Delete
+      all the access control records", `*` meaning clear the table). **202
+      with a body**, not 204, because there is something to say: which command
+      is queued and that nothing has been deleted yet.
+
+    Note what this is not. E12 refused to invent a `DATA QUERY
+    tablename=transaction` and that refusal stands — no server-issued *query*
+    of the transaction table has ever been seen answered, and these terminals
+    push their punches up unasked, so nothing needs to ask. This is the
+    documented *delete*, printed in the specification with a worked example.
+    Reading E12's refusal as "the transaction table is off limits" would be
+    over-reading it, and the AST test that enforces E12's rule is deliberately
+    scoped to the query form for exactly this reason.
+    """
     device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        row = commands.queue(db, sn, devicecontrol.CLEAR_RECORDS)
+        audit.record(db, admin.username, "clear_attendance_queued", target=sn,
+                     ip=client_ip(request), detail=f"command_id={row.id}")
+        return _queued_control_response(
+            sn, row, response,
+            "clear the access-control records held on the terminal",
+            extra=" Nothing has been deleted yet, and nothing already synced "
+                  "to this database is affected either way.",
+        )
+
     try:
         with device_connection(device) as conn:
             conn.clear_attendance()

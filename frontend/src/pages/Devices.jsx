@@ -205,10 +205,18 @@ export default function Devices() {
     setPwConfirm({ title, description, onConfirm: action })
   }
 
+  // The three device-control actions share one rule, the same one the sync
+  // actions follow: on an access-control terminal the server has QUEUED
+  // something, not done it, and it says so in `message`. Where a message comes
+  // back it is shown verbatim rather than being replaced with a cheerful past
+  // tense that would be false.
   async function handleClearAttendance(device) {
     try {
-      await api.devices.clearAttendance(device.serial_number)
-      showToast(`Attendance cleared on ${device.name || device.serial_number}`)
+      const result = await api.devices.clearAttendance(device.serial_number)
+      showToast(
+        result?.message ||
+          `Attendance cleared on ${device.name || device.serial_number}`
+      )
     } catch (err) {
       showToast(err.message, 'error')
     }
@@ -216,8 +224,11 @@ export default function Devices() {
 
   async function handleRestart(device) {
     try {
-      await api.devices.restart(device.serial_number)
-      showToast(`${device.name || device.serial_number} is restarting`)
+      const result = await api.devices.restart(device.serial_number)
+      showToast(
+        result?.message ||
+          `${device.name || device.serial_number} is restarting`
+      )
     } catch (err) {
       showToast(err.message, 'error')
     }
@@ -225,8 +236,14 @@ export default function Devices() {
 
   async function handleUnlock(device) {
     try {
-      await api.devices.unlock(device.serial_number)
-      showToast(`Door unlocked on ${device.name || device.serial_number}`)
+      const result = await api.devices.unlock(device.serial_number)
+      // "Door unlocked" is only true on the SDK transport, where the call
+      // returned because the door opened. On a queued unlock the honest
+      // report is the server's, which says queued and states the delay.
+      showToast(
+        result?.message ||
+          `Door unlocked on ${device.name || device.serial_number}`
+      )
     } catch (err) {
       showToast(err.message, 'error')
     }
@@ -256,8 +273,25 @@ export default function Devices() {
       { label: 'Manage Users', onClick: () => setDrawer({ type: 'users', device }) },
       { label: 'Device Info', onClick: () => setDrawer({ type: 'info', device }) },
       { label: 'Set Clock', onClick: () => setDrawer({ type: 'clock', device }) },
-      { label: 'Write LCD', onClick: () => setDrawer({ type: 'lcd', device }) },
-      { label: 'Unlock Door', onClick: () => handleUnlock(device) },
+      // No command in the access-control protocol addresses the screen, so
+      // this is shown unavailable with the reason rather than left clickable
+      // (it would open a drawer whose only possible outcome is a 501).
+      isAcc
+        ? {
+            label: 'Write LCD',
+            disabled: true,
+            hint: 'Not available — the access-control protocol has no command for writing to the screen.',
+          }
+        : { label: 'Write LCD', onClick: () => setDrawer({ type: 'lcd', device }) },
+      // The door DOES work here, but it is not the same action it is on an
+      // SDK device and the menu says so before it is clicked. See handleUnlock.
+      isAcc
+        ? {
+            label: 'Unlock Door',
+            onClick: () => handleUnlock(device),
+            hint: 'Queued — the door opens when the terminal next polls, usually within ~10s, not instantly.',
+          }
+        : { label: 'Unlock Door', onClick: () => handleUnlock(device) },
       { label: 'Commands', onClick: () => setDrawer({ type: 'commands', device }) },
       'divider',
       {
@@ -265,7 +299,9 @@ export default function Devices() {
         danger: true,
         onClick: () => confirmAction(
           'Clear Attendance',
-          `This will permanently wipe attendance logs from the device memory. Records already synced to the database are kept.`,
+          isAcc
+            ? `This will permanently wipe the access-control records held on the terminal. Records already synced to the database are kept. The command is queued and runs when the terminal next polls — nothing is deleted at the moment you confirm.`
+            : `This will permanently wipe attendance logs from the device memory. Records already synced to the database are kept.`,
           () => { setPwConfirm(null); handleClearAttendance(device) }
         ),
       },
@@ -274,7 +310,9 @@ export default function Devices() {
         danger: true,
         onClick: () => confirmAction(
           'Restart Device',
-          `The device will reboot. It will go offline briefly and reconnect automatically.`,
+          isAcc
+            ? `The terminal will reboot. The command is queued and runs when it next polls, so it will not restart at the moment you confirm. It goes offline briefly and reconnects automatically.`
+            : `The device will reboot. It will go offline briefly and reconnect automatically.`,
           () => { setPwConfirm(null); handleRestart(device) }
         ),
       },
@@ -545,7 +583,11 @@ export default function Devices() {
         />
       )}
       {drawer?.type === 'info' && (
-        <DeviceInfoDrawer device={drawer.device} onClose={() => setDrawer(null)} />
+        <DeviceInfoDrawer
+          device={drawer.device}
+          onClose={() => setDrawer(null)}
+          showToast={showToast}
+        />
       )}
       {drawer?.type === 'clock' && (
         <SetClockDrawer

@@ -3191,7 +3191,13 @@ class OfflineIsNotFailureTests(CommandDeliveryTestCase):
         finally:
             db.close()
 
-        self.assertEqual(result, {"exhausted": 0, "expired": 0, "pruned": 0})
+        self.assertEqual(
+            result,
+            # door_expired is E15's short deadline for door commands. An
+            # ordinary command has expires_at=NULL and is untouched by it,
+            # which is what the zero here is asserting.
+            {"exhausted": 0, "door_expired": 0, "expired": 0, "pruned": 0},
+        )
         self.assertEqual(len(self.outbox()), 1)
 
     def test_the_absolute_expiry_is_a_separate_much_longer_clock(self):
@@ -3757,6 +3763,10 @@ class CommandSchemaTests(unittest.TestCase):
         self.assertEqual(columns["device_command_outbox"], {
             "id", "device_sn", "command", "status", "attempts",
             "next_attempt_at", "created_at", "sent_at",
+            # E15: a hard deadline past which a command must never be
+            # delivered. NULL for everything except door control, and NULL
+            # means the queue's original patience.
+            "expires_at",
         })
         self.assertEqual(columns["device_command_log"], {
             "id", "device_sn", "command", "outcome", "attempts", "return_code",
@@ -8056,3 +8066,762 @@ class AttendancePullRefusalTests(PullRoutingTestCase):
 
         self.assertIn("Attendance is not included", body["message"])
         self.assertIn("rtlog", body["attendance"])
+
+
+# ---------------------------------------------------------------------------
+# 28. E15 — device control on an access-control terminal
+# ---------------------------------------------------------------------------
+#
+# Nine endpoints used to open an SDK connection unconditionally, so on an `acc`
+# terminal behind NAT every one of them was a 503. Five of them now have a
+# documented `acc` command and four of them do not exist in the protocol at
+# all.
+#
+# What makes this section different from E12's is where the commands come
+# from. E12 could assert bytes the operator's own hardware had already
+# answered. These come from ZKTeco's *Security PUSH Communication Protocol*
+# 3.1.2 — the complete document, whose command chapters (pp.100-150) were
+# missing from every truncated copy available when push-protocol.md §3.8 was
+# written. They have NOT been run against the operator's terminal.
+#
+# So the literals below are copied from the specification's own printed
+# examples rather than imported from app/, because a test that imports the
+# constant it is checking asserts nothing. If a refactor changes a byte of a
+# door command, this fails.
+
+# §12.4 example (1), verbatim: "The server delivers the command of opening
+# Door 1 for 5s: C:221:CONTROL DEVICE 01010105"
+SPEC_UNLOCK_DOOR1_5S = "CONTROL DEVICE 01010105"
+# §12.4 example (3), verbatim: "the command of restarting the current device"
+SPEC_RESTART = "CONTROL DEVICE 03000000"
+# §12.5.1, verbatim: "Synchronize the time to the client:
+# C:401:SET OPTIONS DateTime=583080894"
+SPEC_SET_TIME = "SET OPTIONS DateTime=583080894"
+SPEC_SET_TIME_INSTANT = datetime(2018, 2, 22, 14, 54, 54)
+# §12.1.2.5, verbatim: "Delete all the access control records:
+# C:123:DATA DELETE transaction *"
+SPEC_CLEAR_RECORDS = "DATA DELETE transaction *"
+
+
+class DeviceControlShapeTests(unittest.TestCase):
+    """The literal bytes, against the vendor's own worked examples."""
+
+    def setUp(self):
+        from app.services import devicecontrol
+        self.dc = devicecontrol
+
+    def test_the_unlock_command_reproduces_the_specs_own_example(self):
+        self.assertEqual(
+            self.dc.unlock_command(door=1, seconds=5), SPEC_UNLOCK_DOOR1_5S)
+
+    def test_the_restart_command_reproduces_the_specs_own_example(self):
+        self.assertEqual(self.dc.restart_command(), SPEC_RESTART)
+
+    def test_the_set_time_command_reproduces_the_specs_own_example(self):
+        self.assertEqual(
+            self.dc.set_time_command(SPEC_SET_TIME_INSTANT), SPEC_SET_TIME)
+
+    def test_the_time_encoding_matches_the_value_printed_in_the_spec(self):
+        """Appendix 5's algorithm, checked against Appendix/§12.5.1's own
+        number rather than against a reimplementation of the same formula."""
+        self.assertEqual(self.dc.encode_time(SPEC_SET_TIME_INSTANT), 583080894)
+
+    def test_the_time_encoding_is_not_a_unix_timestamp(self):
+        """It looks like one and is not: every month is 31 days long in this
+        encoding. A maintainer reaching for `int(dt.timestamp())` breaks the
+        clock on every access-control terminal, silently."""
+        self.assertNotEqual(
+            self.dc.encode_time(SPEC_SET_TIME_INSTANT),
+            int(SPEC_SET_TIME_INSTANT.replace(tzinfo=timezone.utc).timestamp()),
+        )
+
+    def test_control_device_parameters_are_concatenated_hex_with_no_separators(self):
+        """§12.4: "AA, BB, CC, and DD are four groups of two-byte strings.
+        Each group ... after %02X conversion."
+
+        Two open-source ADMS servers send a space-separated decimal form
+        (`CONTROL DEVICE 1 1 1 15`). It appears nowhere in the 178-page
+        specification. This is the assertion that keeps it out."""
+        for command in (self.dc.unlock_command(door=1, seconds=5),
+                        self.dc.restart_command()):
+            with self.subTest(command=command):
+                verb, _, params = command.rpartition(" ")
+                self.assertEqual(verb, "CONTROL DEVICE")
+                self.assertEqual(len(params), 8, "four %02X groups, no more")
+                int(params, 16)  # raises if it is not pure hex
+
+    def test_the_duration_byte_is_the_seconds_asked_for(self):
+        for seconds in (1, 3, 5, 30, 254):
+            with self.subTest(seconds=seconds):
+                command = self.dc.unlock_command(door=1, seconds=seconds)
+                self.assertEqual(command[-2:], f"{seconds:02X}")
+
+    def test_the_door_byte_is_the_door_asked_for(self):
+        for door in (1, 2, 10):
+            with self.subTest(door=door):
+                command = self.dc.unlock_command(door=door, seconds=3)
+                self.assertEqual(command.split()[-1][2:4], f"{door:02X}")
+
+    def test_the_clear_records_command_is_the_documented_shape(self):
+        self.assertEqual(self.dc.CLEAR_RECORDS, SPEC_CLEAR_RECORDS)
+
+    def test_get_options_is_comma_separated_with_no_trailing_comma(self):
+        """§12.5.2: "Multiple parameters are separated by commas, but the last
+        parameter is not followed by a comma." Note SET/GET OPTIONS use commas
+        while DATA commands use tabs — the two are not interchangeable."""
+        command = self.dc.QUERY_OPTIONS
+        self.assertTrue(command.startswith("GET OPTIONS "))
+        params = command[len("GET OPTIONS "):]
+        self.assertNotIn("\t", params)
+        self.assertFalse(params.endswith(","))
+        self.assertIn("~SerialNumber", params)
+        self.assertIn("LockCount", params)
+
+    def test_the_communication_password_is_never_requested(self):
+        """ComPwd is in the spec's own GET OPTIONS example. It is a shared
+        secret and `capabilities` is rendered in the UI, so it is left out."""
+        self.assertNotIn("ComPwd", self.dc.QUERY_OPTIONS)
+
+
+class DoorCommandSafetyTests(unittest.TestCase):
+    """The values that must never reach a door, and why each one is refused."""
+
+    def setUp(self):
+        from app.services import devicecontrol
+        self.dc = devicecontrol
+
+    def test_255_seconds_is_refused_because_it_means_latch_the_door_open(self):
+        """§12.4: "00: Off. FF: Normal open. 01-FF: The opening duration."
+
+        0xFF is not a 255-second unlock. It latches the door normally-open.
+        Refused rather than clamped: silently turning a request for 255
+        seconds into 254 would be a different bug, and turning it into a
+        permanently open door is the worst one available here."""
+        with self.assertRaises(self.dc.UnsafeDoorCommand) as caught:
+            self.dc.unlock_command(door=1, seconds=255)
+        self.assertIn("latch", str(caught.exception).lower())
+
+    def test_no_reachable_duration_ever_encodes_to_FF(self):
+        """The property the test above is protecting, stated directly."""
+        for seconds in range(1, 255):
+            command = self.dc.unlock_command(door=1, seconds=seconds)
+            self.assertNotEqual(command[-2:].upper(), "FF")
+
+    def test_zero_seconds_is_refused_because_it_is_the_close_command(self):
+        with self.assertRaises(self.dc.UnsafeDoorCommand):
+            self.dc.unlock_command(door=1, seconds=0)
+
+    def test_door_zero_is_refused_because_it_means_every_door(self):
+        """§12.4: "00: Open all the doors." A single-door face terminal would
+        not notice; a multi-door controller would open the building."""
+        with self.assertRaises(self.dc.UnsafeDoorCommand) as caught:
+            self.dc.unlock_command(door=0, seconds=3)
+        self.assertIn("EVERY door", str(caught.exception))
+
+    def test_out_of_range_values_are_refused(self):
+        for door, seconds in ((11, 3), (-1, 3), (1, 300), (1, -5)):
+            with self.subTest(door=door, seconds=seconds):
+                with self.assertRaises(self.dc.UnsafeDoorCommand):
+                    self.dc.unlock_command(door=door, seconds=seconds)
+
+    def test_booleans_are_not_accepted_as_numbers(self):
+        """`True` is an int in Python and would encode as door 1 / 1 second."""
+        with self.assertRaises(self.dc.UnsafeDoorCommand):
+            self.dc.unlock_command(door=True, seconds=3)
+        with self.assertRaises(self.dc.UnsafeDoorCommand):
+            self.dc.unlock_command(door=1, seconds=True)
+
+
+class DeviceControlRoutingTestCase(ProvisioningTestCase):
+    """One acc terminal, one att, one unclassified — nine actions across them."""
+
+    def info(self, sn):
+        return self.client.get(f"/devices/{sn}/info")
+
+    def refresh_info(self, sn):
+        return self.client.post(f"/devices/{sn}/info/refresh")
+
+    def get_time(self, sn):
+        return self.client.get(f"/devices/{sn}/time")
+
+    def set_time(self, sn, **payload):
+        return self.client.post(f"/devices/{sn}/time",
+                                json=payload or {"sync": True})
+
+    def unlock(self, sn, **payload):
+        return self.client.post(f"/devices/{sn}/unlock", json=payload)
+
+    def lock_state(self, sn):
+        return self.client.get(f"/devices/{sn}/lock")
+
+    def restart(self, sn):
+        return self.client.post(f"/devices/{sn}/restart")
+
+    def write_lcd(self, sn):
+        return self.client.post(f"/devices/{sn}/lcd",
+                                json={"line": 1, "text": "hello"})
+
+    def clear_lcd(self, sn):
+        return self.client.delete(f"/devices/{sn}/lcd")
+
+    def clear_attendance(self, sn):
+        return self.client.delete(f"/devices/{sn}/attendance")
+
+    def no_sdk(self):
+        """`device_connection` as a tripwire — an acc device must never dial."""
+        from unittest import mock
+
+        calls = []
+
+        def _record(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("device_connection was called on an acc device")
+
+        return [mock.patch("app.routers.devices.device_connection", _record)], calls
+
+
+class ControlCommandsQueuedOnAccTests(DeviceControlRoutingTestCase):
+    """Each implemented action queues its exact command and dials nothing."""
+
+    def queued_by(self, action, *args, **kwargs):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        try:
+            response = action(*args, **kwargs)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(calls, [])
+        return response
+
+    def test_unlock_queues_the_documented_door_command(self):
+        response = self.queued_by(self.unlock, self.SN, seconds=5, door=1)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_UNLOCK_DOOR1_5S])
+        body = response.json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertFalse(body["synchronous"])
+        # Never claims the door opened.
+        self.assertIsNone(body["unlocked_for_seconds"])
+
+    def test_unlock_defaults_to_door_one_and_three_seconds(self):
+        self.queued_by(self.unlock, self.SN)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         ["CONTROL DEVICE 01010103"])
+
+    def test_restart_queues_the_documented_control_command(self):
+        response = self.queued_by(self.restart, self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_RESTART])
+        self.assertEqual(response.json()["status"], "queued")
+
+    def test_set_clock_queues_the_documented_option_command(self):
+        response = self.queued_by(
+            self.set_time, self.SN, sync=False, dt="2018-02-22T14:54:54")
+
+        self.assertEqual(response.status_code, 202, response.text)
+        # A naive datetime is taken as already device-local and sent as typed,
+        # so this is the spec's own worked value.
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_SET_TIME])
+
+    def test_clear_attendance_queues_the_documented_delete(self):
+        response = self.queued_by(self.clear_attendance, self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_CLEAR_RECORDS])
+        self.assertIn("Nothing has been deleted yet",
+                      response.json()["message"])
+
+    def test_refresh_info_queues_the_documented_get_options(self):
+        from app.services import devicecontrol
+
+        response = self.queued_by(self.refresh_info, self.SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        queued = [r.command for r in self.outbox(self.SN)]
+        self.assertEqual(len(queued), 1)
+        self.assertTrue(queued[0].startswith("GET OPTIONS "))
+        self.assertEqual(queued[0], devicecontrol.QUERY_OPTIONS)
+
+    def test_every_queued_control_answer_says_queued_not_done(self):
+        """The E12 rule, applied to device control: an operator must never be
+        told a thing happened when it has only been enqueued."""
+        for action in (self.unlock, self.restart, self.clear_attendance,
+                       self.refresh_info):
+            with self.subTest(action=action.__name__):
+                for row in self.outbox(self.SN):
+                    pass
+                response = self.queued_by(action, self.SN)
+                body = response.json()
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(body["status"], "queued")
+                self.assertIn("Queued", body["message"])
+                self.assertIn("polls", body["message"])
+
+    def test_a_second_refresh_reuses_the_outstanding_one(self):
+        """A query carries no state, so asking twice asks the same question
+        and only delays the answer. Same reuse rule as E12's Sync."""
+        self.queued_by(self.refresh_info, self.SN)
+        self.queued_by(self.refresh_info, self.SN)
+        self.assertEqual(len(self.outbox(self.SN)), 1)
+
+
+class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
+    """The `att` branch is untouched: SDK, synchronous, empty outbox."""
+
+    def sdk(self, **methods):
+        conn = FakeConnection()
+        conn.log = []
+        for name, result in methods.items():
+            def _make(n, r):
+                def _fn(*args, **kwargs):
+                    conn.log.append((n, args, kwargs))
+                    return r
+                return _fn
+            setattr(conn, name, _make(name, result))
+        return conn
+
+    def test_unlock_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
+        from unittest import mock
+
+        conn = self.sdk(unlock=None)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.unlock(self.ATT_SN, seconds=7)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["unlocked_for_seconds"], 7)
+        self.assertTrue(body["synchronous"])
+        self.assertEqual([c[0] for c in conn.log], ["unlock"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_restart_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
+        from unittest import mock
+
+        conn = self.sdk(restart=None)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.restart(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([c[0] for c in conn.log], ["restart"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_set_clock_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
+        from unittest import mock
+
+        conn = self.sdk(set_time=None)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.set_time(self.ATT_SN, sync=True)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([c[0] for c in conn.log], ["set_time"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_clear_attendance_on_an_att_device_still_answers_204(self):
+        from unittest import mock
+
+        conn = self.sdk(clear_attendance=None)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.clear_attendance(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 204, response.text)
+        self.assertEqual([c[0] for c in conn.log], ["clear_attendance"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_the_lcd_actions_still_work_over_the_sdk(self):
+        from unittest import mock
+
+        conn = self.sdk(write_lcd=None, clear_lcd=None)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            self.assertEqual(self.write_lcd(self.ATT_SN).status_code, 200)
+            self.assertEqual(self.clear_lcd(self.ATT_SN).status_code, 204)
+
+        self.assertEqual([c[0] for c in conn.log], ["write_lcd", "clear_lcd"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_an_unclassified_device_takes_the_sdk_path_for_control_too(self):
+        """Anything that is not explicitly `acc` dials. Failure should be
+        visible, not a queue that looks healthy."""
+        from unittest import mock
+
+        conn = self.sdk(unlock=None, restart=None)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            self.assertEqual(self.unlock(self.DEFAULT_SN).status_code, 200)
+            self.assertEqual(self.restart(self.DEFAULT_SN).status_code, 200)
+
+        self.assertEqual(sorted(c[0] for c in conn.log), ["restart", "unlock"])
+        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+
+
+class ControlActionsWithNoAccCommandTests(DeviceControlRoutingTestCase):
+    """Four actions the protocol does not define. 501, a reason, and no queue."""
+
+    def refused(self, action, *args, **kwargs):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        try:
+            response = action(*args, **kwargs)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(response.status_code, 501, response.text)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.outbox(self.SN), [])
+        return response.json()["detail"]
+
+    def test_reading_the_clock_is_refused_and_says_the_traffic_runs_the_other_way(self):
+        detail = self.refused(self.get_time, self.SN)
+        self.assertIn(self.SN, detail)
+        self.assertIn("Nothing was queued", detail)
+        self.assertIn("rtdata", detail)
+        # And tells the operator what DOES work, rather than only saying no.
+        self.assertIn("Set Clock", detail)
+
+    def test_reading_the_lock_state_is_refused_and_says_why_twice_over(self):
+        detail = self.refused(self.lock_state, self.SN)
+        self.assertIn("rtstate", detail)
+        self.assertIn("Nothing was queued", detail)
+        # Both independent reasons are given: no command exists, AND the
+        # pushed record could not be decoded honestly anyway.
+        self.assertIn("never defines", detail)
+
+    def test_writing_the_lcd_is_refused_and_names_the_whole_command_set(self):
+        detail = self.refused(self.write_lcd, self.SN)
+        self.assertIn("eight server-to-device commands", detail)
+        self.assertIn("Nothing was queued", detail)
+
+    def test_clearing_the_lcd_is_refused_the_same_way(self):
+        detail = self.refused(self.clear_lcd, self.SN)
+        self.assertIn("Nothing was queued", detail)
+
+    def test_refresh_info_is_refused_on_an_att_device(self):
+        """The mirror image: `att` reads live every time, so there is nothing
+        to refresh, and saying so beats a button that queues a command an
+        attendance terminal has no table for."""
+        response = self.refresh_info(self.ATT_SN)
+        self.assertEqual(response.status_code, 501, response.text)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_a_refused_action_never_leaves_anything_on_the_queue(self):
+        """Stated once as a property over all four, because 'nothing was
+        queued' is the claim the 501 text makes to the operator."""
+        for action in (self.get_time, self.lock_state,
+                       self.write_lcd, self.clear_lcd):
+            with self.subTest(action=action.__name__):
+                self.refused(action, self.SN)
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class DoorCommandIsOneShotTests(DeviceControlRoutingTestCase):
+    """A door command must not be delivered late, and must not be retried."""
+
+    def test_an_unlock_is_queued_with_a_short_deadline(self):
+        from app import config
+
+        self.unlock(self.SN)
+        row = self.outbox(self.SN)[0]
+
+        self.assertIsNotNone(row.expires_at)
+        window = (row.expires_at - row.created_at).total_seconds()
+        self.assertAlmostEqual(window, config.DOOR_COMMAND_TTL_SECONDS, delta=2)
+
+    def test_other_commands_keep_the_queues_patience(self):
+        """Only door control gets a deadline. A provisioning command collected
+        an hour late is still correct, and that patience recovered a weekend
+        of missed punches once."""
+        self.restart(self.SN)
+        self.clear_attendance(self.SN)
+        for row in self.outbox(self.SN):
+            with self.subTest(command=row.command):
+                self.assertIsNone(row.expires_at)
+
+    def test_an_expired_unlock_is_never_handed_to_the_device(self):
+        """The failure being prevented: a door that opens minutes later, at
+        somebody who has gone."""
+        from app.models import DeviceCommandOutbox
+
+        self.unlock(self.SN)
+        db = self.Session()
+        try:
+            row = db.query(DeviceCommandOutbox).one()
+            row.expires_at = datetime.utcnow() - timedelta(seconds=1)
+            db.commit()
+        finally:
+            db.close()
+
+        self.assertEqual(self.poll(sn=self.SN).strip(), "OK")
+
+    def test_an_unexpired_unlock_is_handed_over_normally(self):
+        """The other half — the deadline must not break the ordinary case."""
+        self.unlock(self.SN)
+        row = self.outbox(self.SN)[0]
+        self.assertIn(f"C:{row.id}:{SPEC_UNLOCK_DOOR1_5S[:14]}",
+                      self.poll(sn=self.SN))
+
+    def test_the_sweep_concludes_an_expired_unlock_as_a_door_that_did_not_open(self):
+        from app.models import DeviceCommandOutbox
+        from app.services import commands as command_service
+
+        self.unlock(self.SN)
+        db = self.Session()
+        try:
+            db.query(DeviceCommandOutbox).one().expires_at = (
+                datetime.utcnow() - timedelta(seconds=1))
+            db.commit()
+            result = command_service.sweep(db)
+        finally:
+            db.close()
+
+        self.assertEqual(result["door_expired"], 1)
+        self.assertEqual(self.outbox(self.SN), [])
+        concluded = self.history(self.SN)[0]
+        self.assertEqual(concluded.outcome, "failed")
+        self.assertIn("door was not opened", concluded.last_error)
+
+    def test_the_deadline_is_no_longer_than_the_first_retry_backoff(self):
+        """This is what makes a door command one-shot rather than merely
+        short-lived. If the TTL ever exceeded the first backoff, an
+        unacknowledged unlock could be re-delivered — a door re-opening on its
+        own an hour later, which is the failure mode that must not exist."""
+        from app import config
+
+        self.assertLessEqual(config.DOOR_COMMAND_TTL_SECONDS,
+                             config.COMMAND_BACKOFF_SECONDS[0])
+
+    def test_a_delivered_unlock_is_not_offered_a_second_time(self):
+        """The property above, exercised rather than asserted about config."""
+        self.unlock(self.SN)
+        first = self.poll(sn=self.SN)
+        self.assertIn("CONTROL DEVICE", first)
+
+        # Straight after delivery it is inside its backoff, so it is not
+        # re-offered; once the backoff elapses the deadline has passed too.
+        self.assertEqual(self.poll(sn=self.SN).strip(), "OK")
+
+    def test_an_unsafe_duration_is_rejected_before_anything_is_queued(self):
+        response = self.unlock(self.SN, seconds=255)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("latch", response.json()["detail"].lower())
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_door_zero_cannot_be_requested_through_the_api(self):
+        """Refused by the schema before it reaches the builder, so there are
+        two independent guards and neither is load-bearing alone."""
+        response = self.unlock(self.SN, door=0)
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class DeviceInfoOnAccTests(DeviceControlRoutingTestCase):
+    """Last-known, labelled as such — never a live reading, never invented."""
+
+    CAPABILITY_LINE = (
+        "DeviceType=acc,~DeviceName=BioFace A1,FirmVer=Ver 8.0.1.3-20151229,"
+        "MachineType=101,LockCount=1,ReaderCount=2,AuxOutCount=0,"
+        "IPAddress=192.168.213.221,NetMask=255.255.255.0,"
+        "GATEIPAddress=192.168.213.1,~MaxUserCount=50,~ZKFPVersion=10"
+    )
+
+    def store_capabilities(self, line=None):
+        db = self.Session()
+        try:
+            device = db.query(Device).filter_by(serial_number=self.SN).one()
+            device.capabilities = line if line is not None else self.CAPABILITY_LINE
+            device.capabilities_at = datetime(2026, 8, 21, 10, 0, 0)
+            db.commit()
+        finally:
+            db.close()
+
+    def test_info_reports_last_known_values_without_dialling_or_queueing(self):
+        self.store_capabilities()
+
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        try:
+            response = self.info(self.SN)
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(calls, [])
+        # A GET must not have side effects: reading Device Info does not put
+        # anything on the queue.
+        self.assertEqual(self.outbox(self.SN), [])
+
+        body = response.json()
+        self.assertEqual(body["source"], "last_known")
+        self.assertEqual(body["device_name"], "BioFace A1")
+        self.assertEqual(body["firmware_version"], "Ver 8.0.1.3-20151229")
+        self.assertEqual(body["network"]["ip"], "192.168.213.221")
+        self.assertEqual(body["doors"], "1")
+
+    def test_the_as_of_timestamp_is_serialised_unambiguously(self):
+        """The drawer renders this with `new Date(...)`, so the string has to
+        say what zone it is in. A bare naive stamp and an offset-bearing one
+        need opposite handling in the browser, and getting it wrong renders
+        "Invalid Date" — which is what happened the first time. This pins
+        whichever shape the API actually emits so the frontend rule stays
+        matched to it."""
+        self.store_capabilities()
+        as_of = self.info(self.SN).json()["as_of"]
+
+        import re as _re
+        self.assertTrue(
+            _re.search(r"(Z|[+-]\d\d:?\d\d)$", as_of),
+            f"as_of={as_of!r} carries no timezone, so the browser would "
+            "guess local time and display the wrong moment",
+        )
+
+    def test_info_never_presents_last_known_values_as_live(self):
+        """The one dishonesty available on this path."""
+        self.store_capabilities()
+        body = self.info(self.SN).json()
+
+        self.assertEqual(body["transport"], "adms_last_known")
+        self.assertIn("not a live reading", body["message"])
+        self.assertIsNotNone(body["as_of"])
+
+    def test_info_with_nothing_recorded_says_so_rather_than_inventing(self):
+        response = self.info(self.SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["parameter_count"], 0)
+        self.assertIn("has not sent its parameters yet", body["message"])
+        # The serial is the one thing known for certain either way.
+        self.assertEqual(body["serial_number"], self.SN)
+
+    def test_a_get_options_answer_is_stored_as_the_new_last_known(self):
+        """§12.5.2: the device answers a GET OPTIONS on /iclock/querydata with
+        tablename=options. Without this the command would be queued, answered,
+        acknowledged — and the answer dropped on the floor."""
+        self.refresh_info(self.SN)
+        command_id = self.outbox(self.SN)[0].id
+        self.poll(sn=self.SN)
+
+        self.client.post(
+            f"/iclock/querydata?SN={self.SN}&type=options&cmdid={command_id}"
+            f"&tablename=options&count=1&packcnt=1&packidx=1",
+            content=self.CAPABILITY_LINE,
+        )
+
+        body = self.info(self.SN).json()
+        self.assertEqual(body["device_name"], "BioFace A1")
+        self.assertEqual(body["doors"], "1")
+        self.assertIsNotNone(body["as_of"])
+
+    def test_the_options_parser_keeps_values_it_does_not_understand(self):
+        from app.services import devicecontrol
+
+        parsed = devicecontrol.parse_options(
+            "A=1,B=,~C=hello world,Malformed,D=x=y")
+        self.assertEqual(parsed["A"], "1")
+        self.assertEqual(parsed["B"], "")
+        self.assertEqual(parsed["~C"], "hello world")
+        self.assertNotIn("Malformed", parsed)
+        # A value containing '=' survives intact rather than being truncated.
+        self.assertEqual(parsed["D"], "x=y")
+
+    def test_the_options_parser_never_raises_on_rubbish(self):
+        from app.services import devicecontrol
+
+        for text in ("", None, ",,,", "=", "no-equals-at-all"):
+            with self.subTest(text=text):
+                self.assertEqual(devicecontrol.parse_options(text), {})
+
+
+class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
+    """The E12 AST guard, extended to device control.
+
+    E12 built this pattern to keep a fabricated `DATA QUERY
+    tablename=transaction` out of the codebase. The same risk applies to every
+    action E15 did NOT implement, and to two shapes that are real but belong
+    to a different protocol — the exact mistakes a later maintainer working
+    from memory, from a forum post, or from the most popular open-source ADMS
+    server would make.
+
+    Comments and docstrings are excluded on purpose: this file and
+    devicecontrol.py both *discuss* these strings at length, deliberately.
+    What must not exist is a string the program could put on a wire.
+    """
+
+    # Each entry is (marker, why it must never be sent to an `acc` terminal).
+    FORBIDDEN = [
+        ("AC_UNLOCK",
+         "the Attendance-protocol door command. Real, vendor-documented, and "
+         "absent from all 178 pages of the Security PUSH specification."),
+        ("AC_UNALARM",
+         "same family, same reason."),
+        ("CLEAR LOG",
+         "Attendance-protocol verb. An acc terminal has no ATTLOG; its stored "
+         "events are the `transaction` table."),
+        ("CLEAR DATA",
+         "Attendance-protocol verb, and a destructive one."),
+        ("CONTROL DEVICE 1 ",
+         "the space-separated decimal form used by two open-source ADMS "
+         "servers. The spec's parameters are concatenated hex."),
+        ("OPEN DOOR",
+         "not a verb in either protocol."),
+        ("SET OPTION ",
+         "the singular is the Attendance protocol's. acc uses SET OPTIONS."),
+        ("ENROLL_FP",
+         "Attendance-protocol remote enrolment."),
+    ]
+
+    def string_literals(self, tree):
+        """Every str constant in the module except its docstrings."""
+        import ast
+
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                body = getattr(node, "body", None)
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    docstrings.add(id(body[0].value))
+        return [n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and id(n) not in docstrings]
+
+    def test_no_unverified_control_command_appears_anywhere_in_the_app(self):
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "app"
+        offenders = []
+        for path in sorted(root.rglob("*.py")):
+            for literal in self.string_literals(ast.parse(path.read_text())):
+                for marker, why in self.FORBIDDEN:
+                    if marker in literal:
+                        offenders.append(f"{path.name}: {marker!r} — {why}")
+        self.assertEqual(offenders, [])
+
+    def test_the_guard_would_actually_catch_one(self):
+        """A guard nobody has seen fail is a guard nobody knows works."""
+        import ast
+
+        module = ast.parse('x = "C:1:AC_UNLOCK"\n')
+        found = [m for m, _ in self.FORBIDDEN
+                 for lit in self.string_literals(module) if m in lit]
+        self.assertEqual(found, ["AC_UNLOCK"])
+
+    def test_the_door_command_the_app_does_send_is_the_specs_own_bytes(self):
+        """The positive half. The guard above forbids the wrong shapes; this
+        pins the right one to the vendor's printed example."""
+        from app.services import devicecontrol
+
+        self.assertEqual(devicecontrol.unlock_command(door=1, seconds=5),
+                         SPEC_UNLOCK_DOOR1_5S)
