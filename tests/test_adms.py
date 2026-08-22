@@ -4331,9 +4331,12 @@ class AccProvisioningTests(ProvisioningTestCase):
         self.assertEqual(response.status_code, 202, response.text)
         body = response.json()
         self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
         self.assertEqual(body["pushed"], ["9001", "9002"])
         self.assertEqual(len(body["errors"]), 1)
         self.assertEqual(len(self.outbox(self.SN)), 4)
+        self.assertEqual(len(body["command_ids"]), 4)
+        self.assertEqual(set(body["command_ids"]), {r.id for r in self.outbox(self.SN)})
         self.assertIn("40 seconds", body["message"])
         self.assertEqual(config.COMMAND_BATCH_SIZE, 1)
 
@@ -4378,6 +4381,31 @@ class TransportRoutingTests(ProvisioningTestCase):
         self.assertEqual(conn.written, [])
         self.assertEqual(len(self.outbox(self.SN)), 2)
         self.assertEqual(self.links(self.SN), [])
+
+    def test_a_bulk_push_over_the_sdk_keeps_its_original_shape(self):
+        """E16 changed the drawer's wording, not the wire. The SDK branch of
+        push_users_bulk must still return only device_sn/pushed/errors — no
+        `transport`/`status`/`command_ids`/`message` invented for a transport
+        where 'pushed' was already true. The frontend fix leans on this: the
+        absence of `transport: "adms_queue"` is exactly how it tells the two
+        branches apart."""
+        self.create_employee("9002", name="Bilal Khan")
+        from unittest import mock
+        conn = FakeConnection(next_uid=5)
+        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
+            response = self.client.post(
+                f"/devices/{self.ATT_SN}/users/push_bulk",
+                json={"user_ids": ["9001", "9002", "nobody"]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(set(body.keys()), {"device_sn", "pushed", "errors"})
+        self.assertEqual(body["pushed"], ["9001", "9002"])
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertIn("nobody", body["errors"][0])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(len(conn.written), 2)
 
     def test_a_device_with_no_protocol_set_takes_the_sdk_path(self):
         """Predictable, and deliberately the loud direction: an SDK push to a

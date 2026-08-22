@@ -2,13 +2,23 @@ import { useState, useEffect } from 'react'
 import { api } from '../api'
 import Drawer from './Drawer'
 
+// The bulk endpoint names a deliberate skip in `errors` alongside real
+// failures ("employee not found in DB") because it has no separate channel
+// for "correctly did nothing to this person." E3's only skip reason is an
+// outstanding, unconfirmed revocation on this device, and its message always
+// contains the word "revocation" — see push_users_bulk. That is the one
+// signal this drawer has to keep a deliberate skip from reading like a bug.
+const isSkipReason = (line) => /revocation/i.test(line)
+
 export default function DeviceUsersDrawer({ device, onClose, showToast }) {
   const [allEmployees, setAllEmployees] = useState([])
   const [enrolledIds, setEnrolledIds] = useState(new Set())
   const [selected, setSelected] = useState(new Set())
   const [loading, setLoading] = useState(true)
   const [pushing, setPushing] = useState(false)
-  const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
+  const [pushErrors, setPushErrors] = useState([])
+  const [skipped, setSkipped] = useState([])
 
   useEffect(() => {
     Promise.all([
@@ -21,7 +31,7 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
         setEnrolledIds(ids)
         setSelected(new Set(ids))
       })
-      .catch((e) => setError(e.message))
+      .catch((e) => setLoadError(e.message))
       .finally(() => setLoading(false))
   }, [device.serial_number])
 
@@ -44,17 +54,34 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
   async function handlePush() {
     if (selected.size === 0) return
     setPushing(true)
-    setError('')
+    setPushErrors([])
+    setSkipped([])
     try {
       const result = await api.devices.pushBulk(device.serial_number, [...selected])
-      if (result.errors?.length) {
-        setError(result.errors.join('\n'))
-      } else {
-        showToast(`${result.pushed.length} user(s) pushed to ${device.name || device.serial_number}`)
+      const errors = result.errors || []
+      const skips = errors.filter(isSkipReason)
+      const realErrors = errors.filter((e) => !isSkipReason(e))
+      setSkipped(skips)
+      setPushErrors(realErrors)
+
+      // `transport` only appears on the adms_queue branch (see
+      // push_users_bulk) — its absence is how the SDK branch, where
+      // "pushed" is already true, is told apart from it. Use the server's
+      // own wording rather than re-deriving "queued" vs "pushed" here: it
+      // already carries the honest command count and drain estimate.
+      if (result.pushed.length > 0) {
+        if (result.transport === 'adms_queue') {
+          showToast(`${result.message} Track real delivery in the Commands drawer.`)
+        } else {
+          showToast(`${result.pushed.length} user(s) pushed to ${device.name || device.serial_number}`)
+        }
+      }
+
+      if (skips.length === 0 && realErrors.length === 0) {
         onClose()
       }
     } catch (e) {
-      setError(e.message)
+      setPushErrors([e.message])
     } finally {
       setPushing(false)
     }
@@ -67,19 +94,32 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
     <Drawer title="Device Users" onClose={onClose}>
       {loading && <p className="text-sm text-gray-400 text-center py-8">Loading…</p>}
 
-      {!loading && error && (
+      {!loading && loadError && (
         <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-4 whitespace-pre-wrap">
-          {error}
+          {loadError}
         </p>
       )}
 
-      {!loading && !error && (
+      {!loading && !loadError && (
         <>
           <p className="text-xs text-gray-500 mb-3">
             Select employees to push to{' '}
             <span className="font-medium">{device.name || device.serial_number}</span>.
             Pre-checked employees are already enrolled.
           </p>
+
+          {skipped.length > 0 && (
+            <div className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+              <p className="font-medium mb-1">Skipped on purpose — not pushed</p>
+              <p className="whitespace-pre-wrap">{skipped.join('\n')}</p>
+            </div>
+          )}
+
+          {pushErrors.length > 0 && (
+            <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-4 whitespace-pre-wrap">
+              {pushErrors.join('\n')}
+            </p>
+          )}
 
           <div className="flex items-center gap-2 mb-2 px-2">
             <input
