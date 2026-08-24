@@ -735,6 +735,156 @@ class RtlogTests(AdmsTestCase):
         self.assertEqual(response.text, "OK")
         self.assertEqual(self.attendance_rows(), [])
 
+    # -- E18: store only genuine access as attendance ---------------------
+    #
+    # Band-EXCLUSION (Appendix 2) layered on the existing pin check: store
+    # IFF _is_person(pin) AND event in a normal band (0-19 or 200-253). A
+    # person-pin record in 20-99 (denied) or 100-199 (alarm) is logged and
+    # counted but NOT stored. Shapes below are the real observed ones from
+    # field_evidence_rtlog_events (event=3/verifytype=15 punches, event=206
+    # pin=0 device events).
+
+    def test_a_real_face_punch_event_3_is_stored(self):
+        """The normal punch path still works: event=3 (0-19 NORMAL band),
+        a real alphanumeric StringPin, verifytype=15 (face) -> stored."""
+        body = (
+            "time=2026-08-22 09:15:32\tpin=ABC030\tcardno=0\teventaddr=1\t"
+            "event=3\tinoutstatus=0\tverifytype=15\tindex=101\n"
+        )
+        self.post_rtlog(body)
+        rows = self.attendance_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].user_id, "ABC030")
+        self.assertEqual(rows[0].event_code, "3")
+        self.assertEqual(rows[0].verify_type, "15")
+
+    def test_event_206_with_pin_zero_is_a_device_event(self):
+        """event=206 sits in the 200-253 NORMAL band, but pin=0 makes it a
+        device event, not a punch. The pin check still guards the normal band,
+        so a band-only filter (which would wrongly store this) is not what we
+        shipped."""
+        body = (
+            "time=2026-08-22 08:00:00\tpin=0\tevent=206\tinoutstatus=2\t"
+            "verifytype=200\tindex=201\n"
+        )
+        response = self.post_rtlog(body)
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(self.attendance_rows(), [])
+
+    def test_a_denied_event_with_a_real_pin_is_not_stored(self):
+        """The reason the unit exists: event=68 (high body temperature -
+        Access Denied) is in the 20-99 ERROR band and carries a REGISTERED
+        user's pin. Under the old pin != 0 rule this was recorded as a punch
+        and pushed to payroll. It must now be held out of attendance, logged
+        distinctly and counted as denied."""
+        body = (
+            "time=2026-08-22 09:20:00\tpin=DAW004\tevent=68\tinoutstatus=0\t"
+            "verifytype=15\tindex=301\n"
+        )
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            response = self.post_rtlog(body)
+        self.assertEqual(response.text, "OK")
+        self.assertEqual(self.attendance_rows(), [])
+        log = "\n".join(captured.output)
+        # Distinct wording from the pin=0 "device event" line: a denied person.
+        self.assertIn("denied/failed access", log)
+        self.assertIn("pin='DAW004'", log)
+        # Counted in the summary so the operator sees it happened.
+        self.assertIn("1 denied", log)
+
+    def test_a_denied_event_is_logged_differently_from_a_pin_zero_device_event(self):
+        """A denied person and a pin=0 system event are both withheld, but they
+        are not the same thing and must not read the same in the log."""
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_rtlog(
+                "time=2026-08-22 09:20:00\tpin=1001\tevent=29\tinoutstatus=0\t"
+                "index=302\n"
+            )
+        log = "\n".join(captured.output)
+        self.assertIn("not stored as attendance", log)
+        self.assertNotIn("device event (pin=", log)
+
+    def test_an_alarm_event_with_a_real_pin_is_not_stored(self):
+        """A 100-199 ALARM carrying a person's pin is not attendance."""
+        body = (
+            "time=2026-08-22 09:25:00\tpin=1001\tevent=150\tinoutstatus=0\t"
+            "index=401\n"
+        )
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_rtlog(body)
+        self.assertEqual(self.attendance_rows(), [])
+        log = "\n".join(captured.output)
+        self.assertIn("alarm", log)
+        self.assertIn("1 alarm", log)
+
+    def test_a_normal_band_event_in_200_253_with_a_real_pin_is_stored(self):
+        """The upper NORMAL band is still attendance when a real person is
+        involved: event=250, real pin -> stored."""
+        body = (
+            "time=2026-08-22 09:30:00\tpin=1001\tevent=250\tinoutstatus=0\t"
+            "verifytype=1\tindex=501\n"
+        )
+        self.post_rtlog(body)
+        rows = self.attendance_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].event_code, "250")
+
+    def test_a_missing_or_garbage_event_with_a_real_pin_is_held_not_stored(self):
+        """Safe default: an event we cannot classify must not be fabricated
+        into attendance. A missing event and a non-integer event are both held
+        out of the stored set and counted as unclassifiable."""
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_rtlog(
+                # no event= field at all
+                "time=2026-08-22 09:35:00\tpin=1001\tinoutstatus=0\tindex=601\n"
+                # a non-integer event value
+                "time=2026-08-22 09:36:00\tpin=1002\tevent=NORMAL\t"
+                "inoutstatus=0\tindex=602\n"
+            )
+        self.assertEqual(self.attendance_rows(), [])
+        log = "\n".join(captured.output)
+        self.assertIn("unclassifiable event, held", log)
+        self.assertIn("2 unclassifiable", log)
+
+    def test_denied_events_do_not_suppress_a_real_punch_in_the_same_push(self):
+        """A mixed push: a pin=0 device event, a denied person, an alarm, and
+        one genuine punch. Only the punch is stored; the summary counts each
+        category distinctly."""
+        body = (
+            "time=2026-08-22 08:00:00\tpin=0\tevent=206\tinoutstatus=2\tindex=1\n"
+            "time=2026-08-22 09:00:00\tpin=1001\tevent=23\tinoutstatus=0\tindex=2\n"
+            "time=2026-08-22 09:15:32\tpin=ABC030\tevent=3\tinoutstatus=0\t"
+            "verifytype=15\tindex=3\n"
+            "time=2026-08-22 09:20:00\tpin=1002\tevent=102\tinoutstatus=0\tindex=4\n"
+        )
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.post_rtlog(body)
+        rows = self.attendance_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].user_id, "ABC030")
+        log = "\n".join(captured.output)
+        self.assertIn(
+            "1 punch(es) stored, 1 device event(s) ignored, "
+            "2 denied/alarm not stored (1 denied, 1 alarm, 0 unclassifiable)",
+            log,
+        )
+
+    def test_dedup_and_timezone_still_hold_for_a_stored_normal_record(self):
+        """The band exclusion must not disturb the invariants that guard stored
+        records: dedup on (device_sn, index) across pushes (E9) and the device
+        timezone stamp (D10)."""
+        body = (
+            "time=2026-08-22 09:15:32\tpin=ABC030\tevent=3\tinoutstatus=0\t"
+            "verifytype=15\tindex=701\n"
+        )
+        self.post_rtlog(body)
+        self.post_rtlog(body)
+        self.post_rtlog(body)
+        rows = self.attendance_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].record_index, "701")
+        self.assertIsNotNone(rows[0].timezone)
+
 
 # ---------------------------------------------------------------------------
 # 4. The unknown-table trap

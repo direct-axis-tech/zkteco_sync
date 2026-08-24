@@ -752,6 +752,48 @@ def _is_person(pin: str) -> bool:
         return True       # a non-numeric PIN is still a person
 
 
+# Real-time ``event`` bands, from push.txt Appendix 2 "Description of Real-time
+# Events" (spec pp.156-162), confirmed against this operator's hardware
+# (event=3 face punches in NORMAL, event=102 in ALARM, event=206 in NORMAL).
+# The rule lives here, in one named place, so a reader sees Appendix 2 at a
+# glance rather than magic numbers scattered through the parse loop:
+#
+#   0-19  and 200-253 -> NORMAL  (genuine access; every observed punch is 3)
+#   20-99             -> ERROR   (denied/failed; can carry a REGISTERED user's pin)
+#   100-199           -> ALARM
+_RTLOG_NORMAL_BANDS = ((0, 19), (200, 253))
+_RTLOG_ERROR_BAND = (20, 99)
+_RTLOG_ALARM_BAND = (100, 199)
+
+
+def _event_band(event: str) -> str:
+    """Classify an rtlog ``event`` code per Appendix 2.
+
+    Returns ``"normal"`` (genuine access — attendance), ``"denied"`` (a failed
+    or refused verification), ``"alarm"``, or ``"unknown"`` when ``event`` is
+    missing, non-integer, or outside every documented band.
+
+    ``event`` is a string wire field; a missing or garbage value must not crash
+    the loop and — crucially — must not be treated as a punch. Anything that is
+    not provably in a normal band returns something other than ``"normal"``, so
+    the caller holds it rather than fabricating attendance from an event it
+    cannot vouch for. This can never drop a real punch: granted access is always
+    0-19 (observed: event=3), never in the excluded/unknown range.
+    """
+    try:
+        code = int(event)
+    except (TypeError, ValueError):
+        return "unknown"
+    for lo, hi in _RTLOG_NORMAL_BANDS:
+        if lo <= code <= hi:
+            return "normal"
+    if _RTLOG_ERROR_BAND[0] <= code <= _RTLOG_ERROR_BAND[1]:
+        return "denied"
+    if _RTLOG_ALARM_BAND[0] <= code <= _RTLOG_ALARM_BAND[1]:
+        return "alarm"
+    return "unknown"
+
+
 def _store_rtlog(db: Session, sn: str, body: str, ip: str, tz: str) -> None:
     """Security PUSH access events: keyed TSV, deduped on ``(device_sn, index)``."""
     # Logged verbatim, at INFO, one line per push. This log is the evidence
@@ -762,6 +804,9 @@ def _store_rtlog(db: Session, sn: str, body: str, ip: str, tz: str) -> None:
 
     stored = 0
     ignored = 0
+    denied = 0
+    alarm = 0
+    held = 0
     seen_index = set()
     seen_punch = set()
 
@@ -786,6 +831,37 @@ def _store_rtlog(db: Session, sn: str, body: str, ip: str, tz: str) -> None:
                 sn, pin, fields.get("event"), record_index,
             )
             ignored += 1
+            continue
+
+        # This IS a person's pin, but only genuine access is attendance. Layer
+        # Appendix 2 band-EXCLUSION on top of the pin check: a denied/failed
+        # verification (20-99), an alarm (100-199), or an event we cannot
+        # classify is logged and counted but NOT stored. This can only ever
+        # remove refused/alarm records from the stored set — it cannot drop a
+        # real punch, because granted access is always 0-19 (observed: event=3)
+        # or the 200-253 normal band, never in the excluded range.
+        band = _event_band(fields.get("event", ""))
+        if band != "normal":
+            # A person who was DENIED (or an alarm, or an unclassifiable event)
+            # is operationally meaningful but is not a punch. Logged distinctly
+            # from the pin=0 "device event" line above — this is a real person,
+            # not a system event — and counted separately so an operator can see
+            # it happened rather than it being silently dropped.
+            reason = {
+                "denied": "denied/failed access",
+                "alarm": "alarm",
+            }.get(band, "unclassifiable event, held")
+            log.info(
+                "ADMS rtlog from %s: %s, not stored as attendance "
+                "(pin=%r event=%r index=%r)",
+                sn, reason, pin, fields.get("event"), record_index,
+            )
+            if band == "denied":
+                denied += 1
+            elif band == "alarm":
+                alarm += 1
+            else:
+                held += 1
             continue
 
         raw_time = fields.get("time", "")
@@ -852,8 +928,9 @@ def _store_rtlog(db: Session, sn: str, body: str, ip: str, tz: str) -> None:
 
     db.commit()
     log.info(
-        "ADMS rtlog from %s: %d punch(es) stored, %d device event(s) ignored",
-        sn, stored, ignored,
+        "ADMS rtlog from %s: %d punch(es) stored, %d device event(s) ignored, "
+        "%d denied/alarm not stored (%d denied, %d alarm, %d unclassifiable)",
+        sn, stored, ignored, denied + alarm + held, denied, alarm, held,
     )
 
 
