@@ -1765,8 +1765,11 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
 
     Nothing that fails here fails silently:
 
-    * templates captured on *this* device are never sent back to it, and the
-      response names them,
+    * templates captured on *this* device are not sent back while it still
+      holds the person, and the response names them; once it does not — a
+      wiped terminal, or a revoked person being re-added — they are sendable,
+      because then the server holds the only surviving copy
+      (see provisioning.templates_for_device),
     * a template that cannot be expressed on the wire is refused rather than
       trimmed to fit, and the response names it,
     * a person with nothing captured is an error, not an empty success.
@@ -1799,8 +1802,13 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
             status_code=409,
             detail=(
                 f"All {len(from_this_device)} stored template(s) for this person "
-                f"were captured on {sn} itself. A template is never pushed back "
-                "to its own device — nothing was queued."
+                f"were captured on {sn} itself, and {sn} still holds them — it "
+                "has the originals. Sending this server's copy back would "
+                "overwrite a live enrolment for no gain, so nothing was queued. "
+                "(If the terminal has actually lost them — a wipe, or a "
+                "revocation — revoke the person from this door first; once the "
+                "device no longer holds them, the same templates become "
+                "sendable and a push restores them.)"
             ),
         )
 

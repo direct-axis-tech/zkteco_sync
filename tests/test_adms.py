@@ -4940,11 +4940,15 @@ class TemplateNeverGoesHomeTests(TemplatePushTestCase):
 
     def test_pushing_only_its_own_templates_back_is_refused_and_queues_nothing(self):
         self.add_template(type=9, no=0, source=self.SN)
-        self.link(self.SN)
+        self.link(self.SN)          # the terminal still holds this person
 
         response = self.push_templates(self.SN)
         self.assertEqual(response.status_code, 409)
-        self.assertIn("never pushed back", response.json()["detail"])
+        # The refusal names the reason it is refusing — that the device still
+        # holds the originals — because that is the condition an operator can
+        # act on. See TemplateGoesHomeWhenTheDeviceLostItTests for the case
+        # where it no longer holds them and the same push is allowed.
+        self.assertIn("still holds them", response.json()["detail"])
         self.assertEqual(self.outbox(self.SN), [])
 
     def test_the_same_template_still_goes_to_every_other_device(self):
@@ -4956,6 +4960,102 @@ class TemplateNeverGoesHomeTests(TemplatePushTestCase):
         response = self.push_templates(self.OTHER_SN)
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(len(self.commands_on(self.OTHER_SN)), 1)
+        self.assertEqual(self.outbox(self.SN), [])
+
+
+class TemplateGoesHomeWhenTheDeviceLostItTests(TemplatePushTestCase):
+    """The exception to "never goes home": the device no longer holds it.
+
+    The guard exists to stop this server overwriting a terminal's own live
+    enrolment with a copy of it. That reasoning depends entirely on the
+    terminal still HAVING the enrolment. When it does not — its database was
+    wiped, or the person was revoked from that door — the server is holding
+    the only surviving copy of a template the device itself captured, and
+    refusing to give it back makes the data unrecoverable by the one route
+    that exists.
+
+    Occasioned by a real incident: converting a BioFace A1 between A&C and T&A
+    mode wipes its enrolment database, and the restore was blocked for exactly
+    the people whose templates had come from that terminal.
+    """
+
+    def test_its_own_template_goes_back_when_the_device_no_longer_holds_it(self):
+        self.add_template(type=9, no=0, source=self.SN)
+        # deliberately NOT linked: device_employees is empty, so the terminal
+        # has not confirmed it holds this person
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        queued = self.commands_on(self.SN)
+        self.assertIn(f"Tmp={CAPTURED_FACE_TMP}", queued[-1])
+        self.assertIn("\tType=9\t", queued[-1])
+
+    def test_it_is_not_reported_as_skipped(self):
+        """A template that was sent must not also be named as withheld."""
+        self.add_template(type=9, no=0, source=self.SN)
+
+        body = self.push_templates(self.SN).json()
+        self.assertEqual(body["skipped_from_this_device"], [])
+        self.assertEqual(body["templates_queued"], 1)
+
+    def test_the_409_does_not_fire_for_a_device_that_lost_the_person(self):
+        """Before this fix, a wiped terminal answered 409 and queued nothing —
+        the restore was refused by a guard whose premise had stopped being
+        true."""
+        self.add_template(type=9, no=0, source=self.SN)
+        self.add_template(type=1, no=5, source=self.SN)
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(len(self.outbox(self.SN)), 4)   # user + authorize + 2
+
+    def test_the_person_is_queued_ahead_of_their_returning_templates(self):
+        """A wiped terminal has forgotten the person as well as the face, so
+        the user record has to lead — same ordering rule as any other push."""
+        self.add_template(type=9, no=0, source=self.SN)
+
+        self.push_templates(self.SN)
+        queued = self.commands_on(self.SN)
+        self.assertTrue(queued[0].startswith("DATA UPDATE user "))
+        self.assertTrue(queued[1].startswith("DATA UPDATE userauthorize "))
+        self.assertTrue(queued[2].startswith("DATA UPDATE BIODATA "))
+
+    def test_the_guard_still_holds_while_the_device_does_hold_the_person(self):
+        """The narrowing must not become a removal: a live enrolment is still
+        protected, which is the case the rule was written for."""
+        self.add_template(type=9, no=0, source=self.SN)
+        self.link(self.SN)
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("still holds them", response.json()["detail"])
+        self.assertEqual(self.outbox(self.SN), [])
+
+    def test_revoking_then_re_adding_restores_the_face(self):
+        """The operator-visible sequence this fixes, end to end: the person is
+        on the door, is revoked, and is put back. Their face must come back
+        with them."""
+        self.add_template(type=9, no=0, source=self.SN)
+        self.link(self.SN)
+        self.assertEqual(self.push_templates(self.SN).status_code, 409)
+
+        db = self.Session()
+        try:
+            employee_sync.unlink_device_employee(db, self.SN, "9001")
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertTrue(any("DATA UPDATE BIODATA" in c for c in self.commands_on(self.SN)))
+
+    def test_a_person_with_no_templates_at_all_is_still_a_404(self):
+        """Lifting the guard must not turn "nothing captured" into an empty
+        success — that distinction is what tells an operator to go and enrol."""
+        response = self.push_templates(self.SN)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("must enrol", response.json()["detail"])
         self.assertEqual(self.outbox(self.SN), [])
 
 

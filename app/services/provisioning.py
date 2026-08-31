@@ -317,12 +317,31 @@ def templates_for_device(db: Session, device_sn: str, user_id: str):
 
     Returns ``(sendable, from_this_device)``.
 
-    **A template is never pushed back to the device it came from.** That is
-    what ``BiometricTemplate.source_device_sn`` is for. At best it is wasted
-    work on a queue that moves one command per ten seconds; at worst it
-    overwrites a device's own live enrolment record with this server's copy of
-    it, which is a corruption path with no upside — the device already has the
-    original.
+    **A template is not pushed back to the device it came from — while that
+    device still holds the person.** That is what
+    ``BiometricTemplate.source_device_sn`` is for. Sending one back is wasted
+    work at best, and at worst it overwrites a device's own live enrolment
+    record with this server's copy of it: a corruption path with no upside,
+    because the device already has the original.
+
+    **"The device already has the original" is a claim, so it is now checked.**
+    It was previously assumed, and it is false in exactly the case that needs
+    this most: a terminal whose enrolment database was wiped, and a person
+    revoked from a door who is being re-added. In both, the server holds the
+    only surviving copy of a template the device itself captured, and the old
+    rule refused to give it back — the restore was blocked by a guard whose
+    premise no longer held.
+
+    ``is_on_device`` answers it from ``device_employees``, which earns its row
+    only when the terminal acknowledges the user record. So the guard now
+    applies when it is true that the device has the person, and lifts when it
+    is not. A live enrolment is protected exactly as before; a wiped or
+    revoked one is restorable.
+
+    (The old docstring also called this "wasted work on a queue that moves one
+    command per ten seconds". Measured on real hardware 2026-08-31, a terminal
+    with a full outbox collects about 2.2 commands per second — ``RequestDelay``
+    governs an idle queue, not a busy one.)
 
     Ordered by (type, no) so a given push is reproducible rather than
     depending on insertion order.
@@ -333,6 +352,10 @@ def templates_for_device(db: Session, device_sn: str, user_id: str):
         .order_by(BiometricTemplate.type, BiometricTemplate.no, BiometricTemplate.id)
         .all()
     )
+    # One query, not one per row: the answer is the same for every template
+    # this person has, because it is a fact about the person and the device.
+    if not is_on_device(db, device_sn, user_id):
+        return rows, []
     sendable = [r for r in rows if r.source_device_sn != device_sn]
     own = [r for r in rows if r.source_device_sn == device_sn]
     return sendable, own
