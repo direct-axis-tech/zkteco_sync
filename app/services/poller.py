@@ -118,8 +118,24 @@ def pull_attendance(serial_number: str) -> dict:
 
             # Load the keys already stored for this device in one query, rather
             # than a SELECT per record (20k+ round-trips otherwise).
+            #
+            # `.replace(tzinfo=None)` is load-bearing, not tidying. Every
+            # DateTime column in app/models.py is `UTCDateTime` (models.py:6
+            # imports it *as* DateTime), and its process_result_value stamps
+            # tzinfo=UTC onto every value read back. pyzk hands back the
+            # device's naive wall-clock. An aware datetime never compares equal
+            # to a naive one, so without this the set below matches nothing:
+            # every record looks new on every pull, and the insert trips
+            # uq_attendance on the first punch already stored. The first pull
+            # into an empty table succeeds and every pull after it fails —
+            # which is exactly how this was found, on PSS7235100187.
+            #
+            # Naive is the right side to normalise to: a punch IS a naive
+            # device wall-clock (D10), labelled by the `timezone` column and
+            # never converted. UTCDateTime's label is wrong for this column;
+            # correcting that is a wider change than this dedup needs.
             existing = {
-                (uid, ts)
+                (uid, ts.replace(tzinfo=None) if ts is not None and ts.tzinfo else ts)
                 for uid, ts in db.query(
                     AttendanceLog.user_id, AttendanceLog.timestamp
                 ).filter_by(device_sn=serial_number)

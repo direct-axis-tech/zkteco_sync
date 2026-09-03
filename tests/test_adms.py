@@ -4963,6 +4963,132 @@ class TemplateNeverGoesHomeTests(TemplatePushTestCase):
         self.assertEqual(self.outbox(self.SN), [])
 
 
+class SdkAttendancePullDedupTests(AdmsTestCase):
+    """`pull_attendance` must be re-runnable. It was not.
+
+    Every DateTime column in app/models.py is `UTCDateTime` (models.py:6 imports
+    it *as* DateTime), and its process_result_value stamps tzinfo=UTC onto every
+    value read back. pyzk hands back the device's naive wall-clock. An aware
+    datetime never compares equal to a naive one, so the "already stored" set
+    the poller builds matched nothing, every record looked new on every pull,
+    and the insert tripped uq_attendance on the first punch already stored.
+
+    The shape of the bug is what made it survive: the FIRST pull into an empty
+    table succeeds (nothing to match against), and every pull after it fails.
+    Found in the field on PSS7235100187, on a device with a year of backlog:
+
+        psycopg2.errors.UniqueViolation: duplicate key value violates unique
+        constraint "uq_attendance"
+        DETAIL: Key (device_sn, user_id, "timestamp")=
+                (PSS7235100187, 25001, 2025-06-02 13:19:25) already exists.
+
+    So the test that matters is not "does a pull work" — it is "does the second
+    pull of the same records do nothing, quietly".
+    """
+
+    SN = "PSS7235100187"
+
+    class _FakeAttendance:
+        def __init__(self, user_id, timestamp, status=15, punch=0):
+            self.user_id, self.timestamp = user_id, timestamp
+            self.status, self.punch = status, punch
+
+    class _FakeConn:
+        """Stands in for a pyzk connection. Returns naive wall-clocks, as the
+        real one does — that naivety is the whole point of the test."""
+        def __init__(self, records):
+            self._records = records
+        def disable_device(self): pass
+        def enable_device(self): pass
+        def disconnect(self): pass
+        def get_attendance(self): return list(self._records)
+
+    def setUp(self):
+        super().setUp()
+        from app.services import poller
+        self.poller = poller
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=self.SN, ip_address="192.0.2.50", port=4370,
+                          name="T&A terminal", status="approved", protocol="att"))
+            db.commit()
+        finally:
+            db.close()
+
+        self.records = [
+            self._FakeAttendance("25001", datetime(2025, 6, 2, 13, 19, 25)),
+            self._FakeAttendance("25001", datetime(2025, 6, 2, 13, 25, 55)),
+            self._FakeAttendance("24007", datetime(2025, 6, 2, 11, 9, 26), status=1),
+        ]
+
+        self._orig_session = poller.SessionLocal
+        self._orig_connect = poller._connect
+        poller.SessionLocal = self.Session
+        poller._connect = lambda device: self._FakeConn(self.records)
+
+    def tearDown(self):
+        self.poller.SessionLocal = self._orig_session
+        self.poller._connect = self._orig_connect
+        super().tearDown()
+
+    def rows(self):
+        db = self.Session()
+        try:
+            return db.query(AttendanceLog).filter_by(device_sn=self.SN).count()
+        finally:
+            db.close()
+
+    def test_the_first_pull_stores_every_record(self):
+        result = self.poller.pull_attendance(self.SN)
+        self.assertEqual(result["attendance_synced"], 3)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(self.rows(), 3)
+
+    def test_the_second_pull_of_the_same_records_inserts_nothing(self):
+        """The regression. Before the fix this raised IntegrityError on
+        uq_attendance and rolled the whole pull back."""
+        self.poller.pull_attendance(self.SN)
+        result = self.poller.pull_attendance(self.SN)
+        self.assertEqual(result["attendance_synced"], 0)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(self.rows(), 3)
+
+    def test_a_later_punch_still_lands_on_a_repeat_pull(self):
+        """Skipping what is stored must not become skipping everything: a pull
+        that carries both old and new records stores exactly the new ones."""
+        self.poller.pull_attendance(self.SN)
+        self.records.append(
+            self._FakeAttendance("25020", datetime(2025, 6, 3, 8, 1, 2))
+        )
+        result = self.poller.pull_attendance(self.SN)
+        self.assertEqual(result["attendance_synced"], 1)
+        self.assertEqual(self.rows(), 4)
+
+    def test_the_stored_timestamp_is_the_device_wall_clock_unconverted(self):
+        """D10: a punch is stored as the device's own naive wall-clock and
+        labelled by the timezone column, never shifted."""
+        self.poller.pull_attendance(self.SN)
+        db = self.Session()
+        try:
+            row = db.query(AttendanceLog).filter_by(user_id="24007").one()
+            self.assertEqual(
+                row.timestamp.replace(tzinfo=None), datetime(2025, 6, 2, 11, 9, 26)
+            )
+        finally:
+            db.close()
+
+    def test_a_duplicate_inside_one_pull_is_still_collapsed(self):
+        """The in-batch guard is independent of the fix and must keep working —
+        devices do report the same punch twice in a single response."""
+        self.records.append(
+            self._FakeAttendance("25001", datetime(2025, 6, 2, 13, 19, 25))
+        )
+        result = self.poller.pull_attendance(self.SN)
+        self.assertEqual(result["attendance_synced"], 3)
+        self.assertEqual(self.rows(), 3)
+
+
 class TemplateGoesHomeWhenTheDeviceLostItTests(TemplatePushTestCase):
     """The exception to "never goes home": the device no longer holds it.
 
