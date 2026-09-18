@@ -48,6 +48,56 @@ async function request(method, path, body) {
   return data
 }
 
+// A file download rather than a JSON call: same cookie, same SPA-vs-API flag
+// and the same 401 bounce as request(), but the body is a blob and the name to
+// save it under comes from the server's Content-Disposition. An error body is
+// still JSON, so a refusal (an export too large to build, say) reaches the
+// operator as its own message instead of "Download failed".
+async function download(path) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'GET',
+    credentials: 'include',
+    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+  })
+
+  if (res.status === 401) {
+    csrfToken = null
+    window.location.href = '/'
+    throw new Error('Unauthorized')
+  }
+
+  if (!res.ok) {
+    let detail = 'Download failed'
+    try {
+      const data = await res.json()
+      detail = data.detail || detail
+    } catch {
+      // Not a JSON body — keep the generic message.
+    }
+    throw new Error(detail)
+  }
+
+  const disposition = res.headers.get('Content-Disposition') || ''
+  const match = /filename="?([^";]+)"?/i.exec(disposition)
+
+  return { blob: await res.blob(), filename: match ? match[1] : null }
+}
+
+// Hands the blob to the browser as a save. Revoking the object URL matters:
+// without it the file stays in memory for the life of the tab, and an export
+// is megabytes.
+export function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
 export const api = {
   hrmSync: {
     status: () => request('GET', '/hrm-sync'),
@@ -64,6 +114,21 @@ export const api = {
       if (params.limit != null) q.set('limit', params.limit)
       if (params.offset != null) q.set('offset', params.offset)
       return request('GET', `/attendance?${q}`)
+    },
+    // Everything matching the filter, as one .xlsx — deliberately not the
+    // page on screen. No limit/offset is sent for that reason; the server
+    // refuses an export that is too large rather than silently truncating it.
+    //
+    // mode 'daily' is the timesheet (one row per person per day, first punch
+    // in and last punch out); 'raw' is every punch.
+    exportXlsx: (params = {}) => {
+      const q = new URLSearchParams()
+      q.set('mode', params.mode || 'daily')
+      if (params.device_sn) q.set('device_sn', params.device_sn)
+      if (params.user_id) q.set('user_id', params.user_id)
+      if (params.from_date) q.set('from_date', params.from_date)
+      if (params.to_date) q.set('to_date', params.to_date)
+      return download(`/attendance/export.xlsx?${q}`)
     },
   },
   employees: {

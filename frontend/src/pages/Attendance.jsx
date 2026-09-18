@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api } from '../api'
+import { api, saveBlob } from '../api'
 
 const PAGE_SIZE = 50
 
@@ -34,6 +34,13 @@ export default function Attendance() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  // 'daily' is the timesheet HR reads; 'raw' is every punch, for the day
+  // somebody disputes what the summary says.
+  const [exportMode, setExportMode] = useState('daily')
+  // Kept apart from `error`, which the table area renders in place of the
+  // rows: a failed export must not blank out the records that are on screen.
+  const [exportError, setExportError] = useState('')
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -69,6 +76,28 @@ export default function Attendance() {
     load(filters, page)
   }, [load, filters, page])
 
+  // Exports what the filter selects, not what the table is showing: the
+  // server builds the workbook from the same query, so a month picked above
+  // comes out whole even though only 50 rows are on screen.
+  async function exportExcel() {
+    setExporting(true)
+    setExportError('')
+    try {
+      const { blob, filename } = await api.attendance.exportXlsx({
+        mode: exportMode,
+        ...(filters.device_sn ? { device_sn: filters.device_sn } : {}),
+        ...(filters.user_id ? { user_id: filters.user_id } : {}),
+        ...(filters.from_date ? { from_date: filters.from_date + ':00' } : {}),
+        ...(filters.to_date ? { to_date: filters.to_date + ':00' } : {}),
+      })
+      saveBlob(blob, filename || 'attendance.xlsx')
+    } catch (err) {
+      setExportError(err.message)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   function setFilter(key, value) {
     setFilters((f) => ({ ...f, [key]: value }))
     setPage(0)
@@ -94,8 +123,39 @@ export default function Attendance() {
     <>
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-semibold text-gray-900">Attendance</h1>
-        <span className="text-sm text-gray-400">{total.toLocaleString()} records</span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-400">{total.toLocaleString()} records</span>
+          <select
+            value={exportMode}
+            onChange={(e) => setExportMode(e.target.value)}
+            aria-label="What the export contains"
+            className="input text-sm py-1.5"
+          >
+            <option value="daily">Daily summary</option>
+            <option value="raw">All punches</option>
+          </select>
+          <button
+            onClick={exportExcel}
+            disabled={exporting || loading || total === 0}
+            title={
+              total === 0
+                ? 'Nothing matches the current filter'
+                : exportMode === 'daily'
+                  ? 'One row per person per day: first punch in, last punch out'
+                  : 'Every punch matching the filter, one per row'
+            }
+            className="px-3 py-1.5 rounded-lg border border-gray-200 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40 transition-colors"
+          >
+            {exporting ? 'Exporting…' : 'Export Excel'}
+          </button>
+        </div>
       </div>
+
+      {exportError && (
+        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {exportError}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="bg-white rounded-xl border border-gray-200 p-4 mb-4 grid grid-cols-2 md:grid-cols-4 gap-3">

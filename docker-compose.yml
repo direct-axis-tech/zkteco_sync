@@ -1,0 +1,84 @@
+# ZKTeco Sync — the app plus a MariaDB next to it.
+#
+#   cp .env.example .env      # then edit: SECRET_KEY, ALLOWED_HOSTS, DB_HOST=db,
+#                             # DB_USER (not root), DB_PASSWORD, API_USERNAME/API_PASSWORD
+#   docker compose up -d --build
+#
+# One .env drives both containers: DB_NAME/DB_USER/DB_PASSWORD create the
+# database and the account inside MariaDB, and the whole file is handed to
+# the app. Set DB_HOST=db and DB_PORT=3306 to use that bundled database.
+#
+# Already have a database? Point DB_HOST/DB_PORT at it in .env (from inside
+# the container, this machine is `host.docker.internal`) and start only the
+# app:  docker compose up -d --build --no-deps app
+#
+# Full walkthrough, including TRUSTED_PROXIES under Docker: DEPLOY.md.
+name: zkteco-sync
+
+services:
+  app:
+    build:
+      context: .
+      # runtime (Alpine, default) or runtime-mssql (Debian + Microsoft ODBC
+      # Driver 18, for DB_ENGINE=mssql) — see the Dockerfile header.
+      target: ${ZK_TARGET:-runtime}
+    image: zkteco-sync:${ZK_IMAGE_TAG:-local}
+    restart: unless-stopped
+    env_file: ${ZK_ENV_FILE:-.env}
+    environment:
+      # The one value .env must not decide: inside the container the socket
+      # has to be reachable from outside the network namespace. What the
+      # *host* exposes is narrowed by the ports: mapping below.
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+    ports:
+      # Published on loopback only by default, mirroring the native install:
+      # Apache on the host terminates TLS and proxies to 127.0.0.1:8000. For a
+      # plain LAN deployment with no proxy, set APP_BIND=0.0.0.0 in .env.
+      #
+      # Note for TRUSTED_PROXIES: a connection from the host arrives in the
+      # container from the bridge gateway, NOT from 127.0.0.1. With the fixed
+      # subnet below that address is always 172.30.0.1 — put that in
+      # TRUSTED_PROXIES (see DEPLOY.md).
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - zk
+
+  db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+      MARIADB_DATABASE: ${DB_NAME:-zkteco_sync}
+      # The mariadb image refuses to create a regular user named root, so
+      # DB_USER must be something else (the default .env.example says root
+      # for a native install — change it).
+      MARIADB_USER: ${DB_USER:?set DB_USER in .env (not root)}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - zk
+
+networks:
+  zk:
+    ipam:
+      config:
+        # Fixed so the gateway (x.x.x.1) — the address Apache-on-host appears
+        # as to the app — is predictable for TRUSTED_PROXIES. Change it only
+        # if it collides with a network you already route to.
+        - subnet: ${ZK_SUBNET:-172.30.0.0/24}
+
+volumes:
+  dbdata:

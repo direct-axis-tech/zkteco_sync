@@ -70,6 +70,16 @@ ENABLE_DOCS = _get_bool("ENABLE_DOCS", False)
 MAX_REQUEST_BYTES = _get_int("MAX_REQUEST_BYTES", 2 * 1024 * 1024)
 ADMS_PAIRING_MINUTES = _get_int("ADMS_PAIRING_MINUTES", 15)
 
+# Ceiling on one Attendance Excel export. The export is deliberately the whole
+# result of the filter, not the page on screen — a month of punches is the
+# point of it — but "the whole result" with no filter at all is every punch the
+# system has ever recorded, built into one workbook in memory. Past this many
+# matching rows the request is refused with a message naming the count, so the
+# operator narrows the range instead of the server running out of memory
+# silently. 200k rows is roughly a year of a few hundred people punching four
+# times a day, and produces a file of a few megabytes.
+ATTENDANCE_EXPORT_MAX_ROWS = max(1, _get_int("ATTENDANCE_EXPORT_MAX_ROWS", 200_000))
+
 
 # ---------------------------------------------------------------------------
 # Device command delivery (E7)
