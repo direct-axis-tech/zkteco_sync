@@ -8,6 +8,7 @@ half-way through a request. Later hardening units add keys to this module.
 import logging
 import os
 import zoneinfo
+from datetime import time as dt_time
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -48,6 +49,19 @@ def _get_list(name: str, default: str = "") -> list:
     return [item.strip() for item in _get(name, default).split(",") if item.strip()]
 
 
+def _get_int_list(name: str, default: str = "") -> list:
+    """Comma-separated env value → list of ints. A non-numeric entry is
+    dropped with a warning rather than taking the whole setting down with
+    it — the caller decides what an empty list means."""
+    values = []
+    for item in _get_list(name, default):
+        try:
+            values.append(int(item))
+        except ValueError:
+            log.warning("%s: ignoring non-numeric entry '%s'", name, item)
+    return values
+
+
 APP_ENV = _get("APP_ENV", "production").lower()
 IS_PRODUCTION = APP_ENV == "production"
 
@@ -69,6 +83,16 @@ LOGIN_LOCKOUT_MINUTES = _get_int("LOGIN_LOCKOUT_MINUTES", 15)
 ENABLE_DOCS = _get_bool("ENABLE_DOCS", False)
 MAX_REQUEST_BYTES = _get_int("MAX_REQUEST_BYTES", 2 * 1024 * 1024)
 ADMS_PAIRING_MINUTES = _get_int("ADMS_PAIRING_MINUTES", 15)
+
+# Ceiling on one Attendance Excel export. The export is deliberately the whole
+# result of the filter, not the page on screen — a month of punches is the
+# point of it — but "the whole result" with no filter at all is every punch the
+# system has ever recorded, built into one workbook in memory. Past this many
+# matching rows the request is refused with a message naming the count, so the
+# operator narrows the range instead of the server running out of memory
+# silently. 200k rows is roughly a year of a few hundred people punching four
+# times a day, and produces a file of a few megabytes.
+ATTENDANCE_EXPORT_MAX_ROWS = max(1, _get_int("ATTENDANCE_EXPORT_MAX_ROWS", 200_000))
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +320,71 @@ if not valid_timezone(DEFAULT_DEVICE_TIMEZONE):
         "    python -c \"import zoneinfo; print('\\n'.join(sorted(zoneinfo.available_timezones())))\"\n"
         "If that list comes back empty, this machine has no tz database — "
         "install the 'tzdata' package."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The shift the timesheet is scored against
+# ---------------------------------------------------------------------------
+# The monthly Excel report (GET /attendance/export.xlsx?mode=daily) reproduces
+# the sheet ZKTime.Net produced, which does not just list punches: it says how
+# long each person worked, how late they arrived, how early they left and
+# which days they were absent. Every one of those numbers is a punch measured
+# against a shift, so the shift has to live somewhere — here, rather than
+# hard-coded in the exporter, because it is a payroll policy and a site that
+# starts at 08:00 must be able to say so without editing Python.
+#
+# The defaults are the shift the operator's own ZKTime.Net export was scored
+# against (08:30–17:30 with 12:00–13:00 unpaid, Monday to Friday), verified
+# against that file row by row.
+#
+# "Require Work" is not configured: it is derived as the paid length of the
+# shift (end - start - break), so the two can never disagree.
+
+def _get_clock(name: str, default: str) -> dt_time:
+    """HH:MM from the environment → a time. A typo here would silently
+    mis-score every row of a payroll sheet, so it refuses to boot instead."""
+    raw = _get(name, default)
+    try:
+        hour, _, minute = raw.partition(":")
+        return dt_time(int(hour), int(minute))
+    except ValueError:
+        raise RuntimeError(
+            f"{name}='{raw}' is not a 24-hour clock time.\n"
+            f"Use HH:MM, e.g.\n    {name}={default}"
+        ) from None
+
+
+WORK_SHIFT_START = _get_clock("WORK_SHIFT_START", "08:30")
+WORK_SHIFT_END = _get_clock("WORK_SHIFT_END", "17:30")
+WORK_BREAK_START = _get_clock("WORK_BREAK_START", "12:00")
+WORK_BREAK_END = _get_clock("WORK_BREAK_END", "13:00")
+
+# The name that goes in the report's "Bảng thời gian" (timetable) column on a
+# working day, and the column is blank on a rest day. ZKTime.Net wrote the
+# name of the timetable assigned to the person; this install has one shift, so
+# it writes one name.
+WORK_TIMETABLE_NAME = _get("WORK_TIMETABLE_NAME", "Default")
+
+# Which weekdays carry the shift, as ISO numbers (Monday=1 … Sunday=7).
+# A day outside this set is a rest day: no timetable, nothing required, and
+# nothing counted as absent.
+WORK_DAYS = frozenset(
+    day for day in (_get_int_list("WORK_DAYS", "1,2,3,4,5")) if 1 <= day <= 7
+) or frozenset({1, 2, 3, 4, 5})
+
+if not WORK_SHIFT_START < WORK_SHIFT_END:
+    raise RuntimeError(
+        f"WORK_SHIFT_START={WORK_SHIFT_START:%H:%M} is not before "
+        f"WORK_SHIFT_END={WORK_SHIFT_END:%H:%M}. An overnight shift is not "
+        "supported by the timesheet export — it scores each calendar day on "
+        "its own."
+    )
+
+if not WORK_BREAK_START <= WORK_BREAK_END:
+    raise RuntimeError(
+        f"WORK_BREAK_START={WORK_BREAK_START:%H:%M} is after "
+        f"WORK_BREAK_END={WORK_BREAK_END:%H:%M}."
     )
 
 

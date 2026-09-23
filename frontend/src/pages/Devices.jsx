@@ -56,9 +56,11 @@ function TrustBadge({ status, ipLocked }) {
 
 function Toast({ message, type, onDismiss }) {
   useEffect(() => {
-    const t = setTimeout(onDismiss, 3500)
+    // An error is something to read, not glimpse — "timed out" at 3.5s reads
+    // as a flicker. It also stays until dismissed by the next toast.
+    const t = setTimeout(onDismiss, type === 'error' ? 10_000 : 3500)
     return () => clearTimeout(t)
-  }, [onDismiss])
+  }, [onDismiss, type])
 
   return (
     <div
@@ -69,6 +71,71 @@ function Toast({ message, type, onDismiss }) {
       {message}
     </div>
   )
+}
+
+const PULL_KINDS = { employees: 'Employees', attendance: 'Attendance', templates: 'Templates' }
+
+function formatRelative(iso) {
+  const seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000)
+  if (seconds < 60) return 'just now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)} h ago`
+  return new Date(iso).toLocaleDateString()
+}
+
+// What the last SDK pull of each kind did (DeviceOut.pull_outcomes). The pull
+// runs in the background after the server has already said "started", so
+// this column is the ONLY place a failure — a timed-out connect, a refused
+// comm key — is visible without reading the server log. Shown per kind and
+// never collapsed to the latest one: Sync All runs three pulls, and a
+// successful template read must not hide the attendance read that failed.
+function LastSyncCell({ outcomes }) {
+  const kinds = Object.keys(PULL_KINDS).filter((k) => outcomes?.[k])
+  if (kinds.length === 0) return <span className="text-gray-400">—</span>
+  return (
+    <ul className="space-y-0.5">
+      {kinds.map((kind) => {
+        const o = outcomes[kind]
+        return (
+          <li
+            key={kind}
+            title={`${PULL_KINDS[kind]} · ${new Date(o.at).toLocaleString()}${o.seconds != null ? ` · took ${o.seconds}s` : ''}\n${o.detail}`}
+            className={`text-xs ${o.ok ? 'text-gray-600' : 'text-red-700 font-medium'}`}
+          >
+            <span className={o.ok ? 'text-green-600' : 'text-red-600'}>{o.ok ? '✓' : '✗'}</span>{' '}
+            {PULL_KINDS[kind]} · {formatRelative(o.at)}
+            {o.seconds != null && <span className="text-gray-400"> · {Math.round(o.seconds)}s</span>}
+            {!o.ok && <span className="block font-normal text-red-600 truncate max-w-[16rem]">{o.detail}</span>}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Wait for the background pull(s) started by a Sync click to finish, by
+// watching the device row for a NEWER outcome of each kind than the one it
+// had before the click. Resolves to the fresh outcomes, or null when nothing
+// arrived within the budget (an SDK connect times out after 30s; Sync All is
+// three of those in a row, and a device with a year of backlog reads slowly).
+async function waitForPullOutcomes(sn, kinds, before, budgetMs = 180_000) {
+  const started = Date.now()
+  while (Date.now() - started < budgetMs) {
+    await sleep(2000)
+    let device
+    try {
+      device = await api.devices.get(sn)
+    } catch {
+      continue
+    }
+    const outcomes = device.pull_outcomes || {}
+    if (kinds.every((k) => outcomes[k] && outcomes[k].at !== before?.[k]?.at)) {
+      return outcomes
+    }
+  }
+  return null
 }
 
 export default function Devices() {
@@ -186,18 +253,53 @@ export default function Devices() {
       attendance: () => api.devices.pullAttendance(device.serial_number),
       templates: () => api.devices.pullTemplates(device.serial_number),
     }
+    // Which background pulls this click starts on an `att` device. The
+    // manual template pull is synchronous and reports in its own response.
+    const pullKinds = {
+      all: ['employees', 'attendance', 'templates'],
+      employees: ['employees'],
+      attendance: ['attendance'],
+      templates: [],
+    }[type]
+    const name = device.name || device.serial_number
+    let result
     try {
-      const result = await calls[type]()
-      // An `acc` terminal is never dialled: the server queues a DATA QUERY and
-      // the device answers on its next poll, so the response says what really
-      // happened and that is what gets shown. Reporting "started" for work
-      // that has only been enqueued is the thing this avoids.
-      showToast(
-        result?.message ||
-          `${labels[type]} started for ${device.name || device.serial_number}`
-      )
+      result = await calls[type]()
     } catch (err) {
       showToast(err.message, 'error')
+      return
+    }
+    // An `acc` terminal is never dialled: the server queues a DATA QUERY and
+    // the device answers on its next poll, so the response says what really
+    // happened and that is what gets shown. Reporting "started" for work
+    // that has only been enqueued is the thing this avoids.
+    if (result?.status === 'queued' || pullKinds.length === 0) {
+      showToast(result?.message || `${labels[type]} done for ${name}`)
+      return
+    }
+    // "started" is all the server can honestly say at this point — the pull
+    // is a background task. So say it, then watch the device row for what
+    // the pull actually did and report THAT, in red if it failed. Before
+    // this, a timed-out connect was visible only in the server log.
+    showToast(`${labels[type]} started for ${name}…`)
+    const outcomes = await waitForPullOutcomes(device.serial_number, pullKinds, device.pull_outcomes)
+    loadDevices()
+    if (!outcomes) {
+      showToast(`${labels[type]} on ${name}: no result after 3 minutes — check the server log`, 'error')
+      return
+    }
+    const failed = pullKinds.filter((k) => !outcomes[k].ok)
+    if (failed.length > 0) {
+      showToast(
+        `${labels[type]} failed on ${name} — ` +
+          failed.map((k) => `${PULL_KINDS[k]}: ${outcomes[k].detail}`).join('; '),
+        'error'
+      )
+    } else {
+      showToast(
+        `${labels[type]} done on ${name} — ` +
+          pullKinds.map((k) => outcomes[k].detail).join('; ')
+      )
     }
   }
 
@@ -460,6 +562,7 @@ export default function Devices() {
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Timezone</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Protocol</th>
                 <th className="text-left px-4 py-3 font-medium text-gray-500">Last Seen</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500">Last Sync</th>
                 <th className="px-4 py-3" />
               </tr>
             </thead>
@@ -540,6 +643,7 @@ export default function Devices() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-gray-400 text-xs">{formatDate(device.last_seen)}</td>
+                  <td className="px-4 py-3"><LastSyncCell outcomes={device.pull_outcomes} /></td>
                   <td className="px-4 py-3 text-right">
                     <KebabMenu items={menuItems(device)} />
                   </td>

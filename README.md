@@ -18,6 +18,7 @@ This app runs both listeners. Devices push attendance events the moment they hap
 - **Real-time attendance** via ADMS push from devices
 - **On-demand sync** — pull employees, attendance, and fingerprint templates from any device
 - **Employee management** — view all employees, push to specific devices, remove from devices
+- **Excel export** — the monthly timesheet, as a formatted `.xlsx`, reproducing the report ZKTime.Net produced column for column: a row for every person on every day of the range, with hours worked, hours owed, overtime, lateness, early departures and absences scored against the shift set in `.env` (`WORK_SHIFT_START` and friends). One button, one kind of file. It covers the whole filter (device, employee, date range), not the page on screen, and days are paired by clock rather than by the device's status field — terminals where nobody presses the mode key stamp every punch identically.
 - **Fingerprint templates** — pull from one device, push to others (one master copy per finger)
 - **Live enrollment** — trigger fingerprint enrollment on a device from the UI
 - **Device control** — unlock door, set clock, write LCD message, restart, queue raw commands
@@ -27,6 +28,8 @@ This app runs both listeners. Devices push attendance events the moment they hap
 - **Device approval queue** — an unknown device serial is refused, not auto-registered; approve it from a pending queue, or open a time-boxed pairing window while onboarding new hardware. Optional per-device source-IP allowlist.
 
 ## Requirements
+
+Either **Docker** (Engine 24+ with Compose v2.24+ — see [Docker](#docker)), or:
 
 - Python 3.11+
 - One of: MariaDB/MySQL, PostgreSQL, or MSSQL
@@ -41,7 +44,13 @@ This app runs both listeners. Devices push attendance events the moment they hap
 - One of: MariaDB/MySQL, PostgreSQL, or MSSQL
 - Node 18+ with npm (development only)
 
-### Guided installer (recommended)
+### Docker
+
+See [DEPLOY.md](DEPLOY.md) — one image for backend + UI, one compose file
+with a bundled MariaDB (or point it at a database you already have), and the
+one setting (`TRUSTED_PROXIES`) that differs from a native install.
+
+### Guided installer (recommended for a bare-metal install)
 
 The installer handles everything interactively — configuration, dependencies, frontend build, and optional service registration.
 
@@ -172,7 +181,7 @@ automatically on first run.
 
 On each ZKTeco device, set the ADMS / Cloud Server address to wherever the
 app is actually reachable — `http://<server-ip>:8000` on a LAN deployment
-with `APP_HOST=0.0.0.0`, or your public hostname over HTTPS
+with `APP_HOST=0.0.0.0` (`APP_BIND=0.0.0.0` under Docker), or your public hostname over HTTPS
 (`https://zk.example.com`) behind Apache.
 
 By default an unrecognized device serial is **refused, not auto-registered**
@@ -325,7 +334,7 @@ app/
     users.py        # Admin-only operator account management
     devices.py      # Device CRUD, approval queue, pairing, SDK actions
     employees.py    # Employee read, device/template queries
-    attendance.py   # Attendance list with filters
+    attendance.py   # Attendance list with filters, Excel export
     adms.py         # ADMS push endpoints (device-initiated, unauthenticated)
     hrm_sync.py     # HRM config, status, manual trigger
     audit.py        # Admin-only audit trail read
@@ -341,4 +350,9 @@ frontend/
 deploy/
   apache/
     zkteco-sync.conf.example   # Reference reverse-proxy vhost
+Dockerfile                     # Multi-stage build; Alpine runtime by default (see DEPLOY.md)
+docker-compose.yml             # App + bundled MariaDB (or your own DB via .env)
+docker/
+  healthcheck.py               # Container liveness probe (GET /healthz with a valid Host)
+DEPLOY.md                      # Running it in Docker
 ```

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api } from '../api'
+import { api, saveBlob } from '../api'
 
 const PAGE_SIZE = 50
 
@@ -34,6 +34,10 @@ export default function Attendance() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  // Kept apart from `error`, which the table area renders in place of the
+  // rows: a failed export must not blank out the records that are on screen.
+  const [exportError, setExportError] = useState('')
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -69,6 +73,27 @@ export default function Attendance() {
     load(filters, page)
   }, [load, filters, page])
 
+  // Exports what the filter selects, not what the table is showing: the
+  // server builds the workbook from the same query, so a month picked above
+  // comes out whole even though only 50 rows are on screen.
+  async function exportExcel() {
+    setExporting(true)
+    setExportError('')
+    try {
+      const { blob, filename } = await api.attendance.exportXlsx({
+        ...(filters.device_sn ? { device_sn: filters.device_sn } : {}),
+        ...(filters.user_id ? { user_id: filters.user_id } : {}),
+        ...(filters.from_date ? { from_date: filters.from_date + ':00' } : {}),
+        ...(filters.to_date ? { to_date: filters.to_date + ':00' } : {}),
+      })
+      saveBlob(blob, filename || 'attendance.xlsx')
+    } catch (err) {
+      setExportError(err.message)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   function setFilter(key, value) {
     setFilters((f) => ({ ...f, [key]: value }))
     setPage(0)
@@ -94,8 +119,48 @@ export default function Attendance() {
     <>
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-semibold text-gray-900">Attendance</h1>
-        <span className="text-sm text-gray-400">{total.toLocaleString()} records</span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-400">{total.toLocaleString()} records</span>
+          <button
+            onClick={exportExcel}
+            disabled={exporting || loading || total === 0}
+            title={
+              total === 0
+                ? 'Nothing matches the current filter'
+                : 'The monthly timesheet: a row per person per day, scored against the shift — hours, lateness, absences'
+            }
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-200 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40 transition-colors"
+          >
+            {/* A sheet with a download arrow — what the button does, at a
+                glance. aria-hidden because the label beside it already says
+                it, and a screen reader should not hear it twice. */}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+              className={exporting ? 'animate-pulse' : undefined}
+            >
+              <path d="M9 1.75H4a1.25 1.25 0 0 0-1.25 1.25v10A1.25 1.25 0 0 0 4 14.25h8a1.25 1.25 0 0 0 1.25-1.25V6z" />
+              <path d="M9 1.75V6h4.25" />
+              <path d="M8 8.5v3.75" />
+              <path d="M6.25 10.5 8 12.25l1.75-1.75" />
+            </svg>
+            {exporting ? 'Exporting…' : 'Export timesheet'}
+          </button>
+        </div>
       </div>
+
+      {exportError && (
+        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {exportError}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="bg-white rounded-xl border border-gray-200 p-4 mb-4 grid grid-cols-2 md:grid-cols-4 gap-3">

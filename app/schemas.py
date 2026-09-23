@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field, computed_field, field_serializer
+import json
+
+from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 from datetime import datetime
 from typing import Literal, Optional, List
 
@@ -60,6 +62,26 @@ class DeviceOut(BaseModel):
     # scanning the device list for "is anything wrong" should not have to open
     # each employee in turn to find an outstanding revocation.
     pending_revocations: int = 0
+    # Outcome of the last SDK pull of each kind, keyed "employees" /
+    # "attendance" / "templates": {"at": <UTC ISO>, "ok": bool, "detail": str}.
+    # A pull is a background task whose result would otherwise reach nobody;
+    # this is how the Devices page learns that "Sync Attendance" timed out.
+    # Empty for a device never pulled over the SDK, including every `acc`
+    # terminal, which is read over the command queue instead.
+    pull_outcomes: dict = {}
+
+    @field_validator("pull_outcomes", mode="before")
+    @classmethod
+    def _parse_pull_outcomes(cls, value):
+        # The ORM column is JSON text; a row that predates the column is NULL.
+        if value is None or value == "":
+            return {}
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return {}
+        return value if isinstance(value, dict) else {}
 
     class Config:
         from_attributes = True

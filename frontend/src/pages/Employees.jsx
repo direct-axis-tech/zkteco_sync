@@ -3,6 +3,8 @@ import { api } from '../api'
 import { useAuth } from '../auth'
 import RevocationCard from '../components/RevocationCard'
 import DeleteEmployeeModal from '../components/DeleteEmployeeModal'
+import HandsDiagram from '../components/HandsDiagram'
+import { FINGER_NAMES } from '../fingers'
 
 const PRIVILEGE_LABELS = { 0: 'User', 2: 'Enroller', 14: 'Admin' }
 
@@ -35,11 +37,6 @@ const isRevocationCommand = (command) =>
 // string rather than inventing a plausible-looking name, so the PIN is what
 // there is to show. Attendance.jsx already falls back the same way.
 const displayName = (e) => (e && e.name) || e?.user_id || ''
-
-const FINGER_NAMES = [
-  'Left Little', 'Left Ring', 'Left Middle', 'Left Index', 'Left Thumb',
-  'Right Thumb', 'Right Index', 'Right Middle', 'Right Ring', 'Right Little',
-]
 
 // The face photo a terminal uploaded, if any — a real <img>, not a data:
 // URI (CSP's default-src 'self' covers a same-origin request; a data: URI
@@ -279,7 +276,8 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
 
   // Enroll
   const [enrollDeviceSn, setEnrollDeviceSn] = useState('')
-  const [enrollFingerId, setEnrollFingerId] = useState(0)
+  // The finger picked on the hands diagram — what Delete and Enroll act on.
+  const [selectedFinger, setSelectedFinger] = useState(null)
   const [enrolling, setEnrolling] = useState(false)
 
   // Per-row busy states
@@ -346,6 +344,11 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
   useEffect(() => {
     reload()
   }, [reload])
+
+  // A finger picked for one person means nothing for the next.
+  useEffect(() => {
+    setSelectedFinger(null)
+  }, [employee?.user_id])
 
   if (!employee) {
     return (
@@ -498,11 +501,11 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
 
   async function handleEnroll(e) {
     e.preventDefault()
-    if (!enrollDeviceSn) return
+    if (!enrollDeviceSn || selectedFinger === null) return
     setEnrolling(true)
     try {
-      await api.devices.enrollUser(enrollDeviceSn, employee.user_id, enrollFingerId)
-      showToast(`Enrollment started — ask the person to scan their finger on the device`)
+      await api.devices.enrollUser(enrollDeviceSn, employee.user_id, selectedFinger)
+      showToast(`Enrollment started — ask the person to scan their ${FINGER_NAMES[selectedFinger].toLowerCase()} on the device`)
     } catch (err) {
       showToast(err.message, 'error')
     } finally {
@@ -545,7 +548,7 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
     setBusyTemplate((b) => ({ ...b, [fingerId]: true }))
     try {
       await api.devices.deleteTemplate(sn, employee.user_id, fingerId)
-      showToast(`Finger ${fingerId} template deleted`)
+      showToast(`${FINGER_NAMES[fingerId]} template deleted`)
       reload()
     } catch (err) {
       showToast(err.message, 'error')
@@ -1006,82 +1009,114 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
         )}
       </Section>
 
-      {/* Fingerprint Templates */}
-      <Section title="Fingerprint Templates">
+      {/* Fingerprint Templates — drawn on two hands rather than listed, so
+          which fingers are on file is visible at a glance. The diagram is
+          the picker: click a finger and the card underneath says what is
+          stored for it and offers the one action that makes sense — Delete
+          for a stored finger, Enroll for an empty one. */}
+      <Section
+        title="Fingerprint Templates"
+        action={
+          templates && (
+            <span className="text-xs text-gray-400">
+              {templates.length} of 10 fingers
+            </span>
+          )
+        }
+      >
         {templates === null ? (
           <p className="text-sm text-gray-400">Loading…</p>
         ) : (
           <>
-            {templates.length === 0 ? (
-              <p className="text-sm text-gray-400 mb-3">No templates stored.</p>
-            ) : (
-              <div className="space-y-2 mb-3">
-                {templates.map((t) => (
-                  <div
-                    key={t.finger_id}
-                    className="bg-gray-50 rounded-lg px-3 py-2.5 flex items-center gap-2 text-sm"
-                  >
-                    <div className="flex-1">
-                      <p className="text-gray-800 font-medium">
-                        {FINGER_NAMES[t.finger_id] || `Finger ${t.finger_id}`}
-                      </p>
-                      <p className="text-xs text-gray-400">from {t.source_device_sn}</p>
-                    </div>
-                    <span
-                      className={`text-xs px-1.5 py-0.5 rounded-full ${
-                        t.valid ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400'
-                      }`}
-                    >
-                      {t.valid ? 'Valid' : 'Invalid'}
-                    </span>
-                    <button
-                      onClick={() => handleDeleteTemplate(t.finger_id)}
-                      disabled={busyTemplate[t.finger_id]}
-                      className="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-40 transition-colors"
-                    >
-                      {busyTemplate[t.finger_id] ? '…' : 'Delete'}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
+            <HandsDiagram
+              templates={templates}
+              selected={selectedFinger}
+              onSelect={(fid) => setSelectedFinger(fid === selectedFinger ? null : fid)}
+            />
+            <div className="flex items-center justify-center gap-4 text-xs text-gray-400 mt-1 mb-3">
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block" /> Enrolled
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-300 inline-block" /> Invalid
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-gray-100 border border-gray-300 inline-block" /> Not enrolled
+              </span>
+            </div>
 
-            {/* Live enroll */}
-            {enrolledDevices && enrolledDevices.length > 0 && (
-              <form onSubmit={handleEnroll} className="flex gap-2">
-                <select
-                  value={enrollDeviceSn}
-                  onChange={(e) => setEnrollDeviceSn(e.target.value)}
-                  className="input flex-1 min-w-0 text-sm"
-                >
-                  <option value="">Select device…</option>
-                  {enrolledDevices.map((d) => {
-                    const name = allDevices.find((x) => x.serial_number === d.device_sn)?.name
-                    return (
-                      <option key={d.device_sn} value={d.device_sn}>
-                        {name || d.device_sn}
-                      </option>
-                    )
-                  })}
-                </select>
-                <select
-                  value={enrollFingerId}
-                  onChange={(e) => setEnrollFingerId(Number(e.target.value))}
-                  className="input w-32 text-sm"
-                >
-                  {FINGER_NAMES.map((name, i) => (
-                    <option key={i} value={i}>{name}</option>
-                  ))}
-                </select>
-                <button
-                  type="submit"
-                  disabled={!enrollDeviceSn || enrolling}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
-                >
-                  {enrolling ? 'Starting…' : 'Enroll'}
-                </button>
-              </form>
-            )}
+            {selectedFinger === null ? (
+              <p className="text-xs text-gray-400 text-center">
+                Click a finger to see its template, delete it, or enrol it.
+              </p>
+            ) : (() => {
+              const stored = templates.find((t) => t.finger_id === selectedFinger)
+              const sourceName = stored && (
+                allDevices.find((x) => x.serial_number === stored.source_device_sn)?.name ||
+                stored.source_device_sn
+              )
+              return (
+                <div className="bg-gray-50 rounded-lg px-3 py-2.5 text-sm">
+                  {stored ? (
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-gray-800 font-medium">{FINGER_NAMES[selectedFinger]}</p>
+                        <p className="text-xs text-gray-400 truncate">from {sourceName}</p>
+                      </div>
+                      <span
+                        className={`text-xs px-1.5 py-0.5 rounded-full ${
+                          stored.valid ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400'
+                        }`}
+                      >
+                        {stored.valid ? 'Valid' : 'Invalid'}
+                      </span>
+                      <button
+                        onClick={() => handleDeleteTemplate(selectedFinger)}
+                        disabled={busyTemplate[selectedFinger]}
+                        className="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-40 transition-colors"
+                      >
+                        {busyTemplate[selectedFinger] ? '…' : 'Delete'}
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-gray-800 font-medium">{FINGER_NAMES[selectedFinger]}</p>
+                      <p className="text-xs text-gray-400 mb-2">Not enrolled.</p>
+                      {enrolledDevices && enrolledDevices.length > 0 ? (
+                        <form onSubmit={handleEnroll} className="flex gap-2">
+                          <select
+                            value={enrollDeviceSn}
+                            onChange={(e) => setEnrollDeviceSn(e.target.value)}
+                            className="input flex-1 min-w-0 text-sm"
+                          >
+                            <option value="">Enrol on device…</option>
+                            {enrolledDevices.map((d) => {
+                              const name = allDevices.find((x) => x.serial_number === d.device_sn)?.name
+                              return (
+                                <option key={d.device_sn} value={d.device_sn}>
+                                  {name || d.device_sn}
+                                </option>
+                              )
+                            })}
+                          </select>
+                          <button
+                            type="submit"
+                            disabled={!enrollDeviceSn || enrolling}
+                            className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
+                          >
+                            {enrolling ? 'Starting…' : 'Enroll'}
+                          </button>
+                        </form>
+                      ) : (
+                        <p className="text-xs text-gray-400">
+                          Push this person to a device first, then enrol the finger there.
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )
+            })()}
           </>
         )}
       </Section>

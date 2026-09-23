@@ -1,0 +1,25 @@
+# Never bake secrets or a host-specific config into the image. Compose hands
+# .env to the container at run time via env_file instead.
+.env
+.env.*
+!.env.example
+
+# Host build products. The image builds its own frontend/dist and venv.
+.venv/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Not part of the running application.
+.git/
+.github/
+.vscode/
+.idea/
+*.md
+LICENSE
+install.py
+scripts/
+deploy/
+docker-compose*.yml

@@ -172,6 +172,19 @@ app.add_middleware(
     allowed_hosts=config.ALLOWED_HOSTS or ["localhost", "127.0.0.1", "::1"],
 )
 
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    """Liveness probe for container orchestration (docker/healthcheck.py).
+
+    Deliberately says nothing beyond "the process is up and routing": no
+    version, no database state, nothing an unauthenticated caller on the
+    public internet could use. Readiness is the database container's own
+    healthcheck, which compose waits on before starting this one.
+    """
+    return {"status": "ok"}
+
+
 app.include_router(auth.router)
 app.include_router(adms.router)
 app.include_router(devices.router)
