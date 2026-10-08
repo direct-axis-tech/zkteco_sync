@@ -218,6 +218,17 @@ that file:
    the example vhost, and [SECURITY.md](SECURITY.md), for the full
    explanation.
 
+On a Bitnami server, [`deploy/bitnami/provision.sh`](deploy/bitnami/provision.sh)
+turns the checkout it sits in into an instance in one go, with its own
+database, port, systemd service and vhost, so several clients can share one
+server - one checkout each. The one prerequisite is a certificate from
+`bncert-tool` that covers the hostname (see `--help`). Then:
+
+```bash
+git clone <repo-url> /opt/zkteco-sync-acme && cd /opt/zkteco-sync-acme
+sudo ./deploy/bitnami/provision.sh acme zk-acme.example.com
+```
+
 `install.py` prompts for both `ALLOWED_HOSTS` (the hostname Apache serves)
 and `TRUSTED_PROXIES` during a production install, and registers a systemd
 service with sandboxing directives (`ProtectSystem=strict`, `ProtectHome`,
@@ -341,4 +352,7 @@ frontend/
 deploy/
   apache/
     zkteco-sync.conf.example   # Reference reverse-proxy vhost
+  bitnami/
+    provision.sh               # Makes this checkout an instance on a Bitnami server
+    zkteco-sync-vhost.conf.template  # Vhost provision.sh renders per instance
 ```

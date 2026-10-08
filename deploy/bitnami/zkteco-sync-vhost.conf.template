@@ -1,0 +1,35 @@
+# ZKTeco Sync '@INSTANCE@' — reverse proxy vhost (Bitnami, HTTPS only)
+# Rendered by deploy/bitnami/provision.sh.
+# App binds 127.0.0.1:@APP_PORT@.
+# .env must set:
+#   ALLOWED_HOSTS=@HOSTNAME@
+#   TRUSTED_PROXIES=127.0.0.1
+
+<VirtualHost *:443>
+    ServerName @HOSTNAME@
+
+    SSLEngine on
+    SSLCertificateFile    "@CERT_FILE@"
+    SSLCertificateKeyFile "@KEY_FILE@"
+
+    SSLProtocol         all -SSLv3 -TLSv1 -TLSv1.1
+    SSLHonorCipherOrder off
+    SSLSessionTickets   off
+
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # The app's COOKIE_SECURE and its own HSTS header depend on knowing the
+    # original request arrived over TLS.
+    RequestHeader set X-Forwarded-Proto "https"
+
+    # Do NOT add a RequestHeader for X-Forwarded-For — mod_proxy_http appends
+    # the real client to the chain automatically, and a hand-set header would
+    # replace that chain, breaking per-device IP allowlisting.
+    ProxyPreserveHost On
+    ProxyPass        / http://127.0.0.1:@APP_PORT@/
+    ProxyPassReverse / http://127.0.0.1:@APP_PORT@/
+    ProxyTimeout     120
+
+    ErrorLog  /opt/bitnami/apache/logs/zkteco-sync-@INSTANCE@-error.log
+    CustomLog /opt/bitnami/apache/logs/zkteco-sync-@INSTANCE@-access.log combined
+</VirtualHost>
