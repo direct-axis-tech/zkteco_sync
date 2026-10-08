@@ -84,7 +84,9 @@ env_get() {
 # $2 characters (64 for a database, 32 for a user).
 sql_name() { local name="${1//[^A-Za-z0-9_]/_}"; printf '%s' "${name:0:$2}"; }
 
-sql() { mysql --defaults-extra-file="$MYCNF" -N -B -e "$1"; }
+# Statements go in on stdin: CREATE USER carries a password, and argv is
+# visible to every user in ps.
+sql() { mysql --defaults-extra-file="$MYCNF" -N -B <<< "$1"; }
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 
@@ -184,6 +186,7 @@ open_database() {
 # Whichever user the app logs in as can reach every database that user can.
 # Asked on a first run only; a re-run keeps what .env already says.
 choose_db_user() {
+    DB_USER_IS_NEW=0
     DB_USER="$(env_get DB_USER)"
     DB_PASSWORD="$(env_get DB_PASSWORD)"
     [ -n "$DB_USER" ] && return
@@ -202,6 +205,7 @@ choose_db_user() {
         can_log_in "$DB_USER" "$DB_PASSWORD" || die "cannot log in as $DB_USER with that password"
     else
         DB_PASSWORD="$(openssl rand -hex 24)"
+        DB_USER_IS_NEW=1
     fi
 }
 
@@ -301,28 +305,50 @@ create_database() {
     ok "$DB_USER granted $DB_NAME"
 }
 
-# install.py asks its own questions; tell the operator the answers that
-# differ per instance, then check they were typed in.
+# Everything this script already knows goes in as answers, so install.py
+# asks only for the admin login. The database password travels in the
+# environment, not argv, where ps would show it. Keeping an existing .env
+# skips all of it, hence the checks after.
 run_installer() {
-    local password_hint="$DB_PASSWORD"
-    [ "$DB_USER" = root ] && password_hint="contents of $ROOT_PASSWORD_FILE"
+    local password_source
+    if   [ -f "$ENV_FILE" ];        then password_source="as in $ENV_FILE"
+    elif [ "$DB_USER" = root ];     then password_source="from $ROOT_PASSWORD_FILE"
+    elif [ "$DB_USER_IS_NEW" = 1 ]; then password_source="generated, saved to .env"
+    else                                 password_source="as typed above"
+    fi
     cat <<EOF
 
-    Answer install.py with the defaults, except:
+    install.py is given:
 
       Service name ...... $SERVICE
+      Bind address ...... 127.0.0.1
       Port .............. $APP_PORT
       Public hostname ... $HOST
+      Trusted proxies ... 127.0.0.1
       Engine ............ $DB_ENGINE
+      DB host / port .... 127.0.0.1 / 3306
       Database .......... $DB_NAME
       Username .......... $DB_USER
-      Password .......... $password_hint
+      Password .......... ($password_source)
+
+    It asks only for the admin login.
 
 EOF
-    (cd "$INSTALL_DIR" && as_user uv run --python 3.11 python install.py)
+    (cd "$INSTALL_DIR" && ZKTECO_DB_PASSWORD="$DB_PASSWORD" as_user \
+        uv run --python 3.11 python install.py \
+            --service-name    "$SERVICE" \
+            --bind            127.0.0.1 \
+            --port            "$APP_PORT" \
+            --hostname        "$HOST" \
+            --trusted-proxies 127.0.0.1 \
+            --db-engine       "$DB_ENGINE" \
+            --db-host         127.0.0.1 \
+            --db-port         3306 \
+            --db-name         "$DB_NAME" \
+            --db-user         "$DB_USER")
 
     [ -f "$ENV_FILE" ]                          || die "install.py wrote no $ENV_FILE"
-    [ "$(env_get SERVICE_NAME)" = "$SERVICE" ]  || die "SERVICE_NAME in $ENV_FILE is not $SERVICE - re-run and reconfigure"
+    [ "$(env_get SERVICE_NAME)" = "$SERVICE" ]  || die "SERVICE_NAME in $ENV_FILE is not $SERVICE - fix it and re-run"
     [ "$(env_get DB_NAME)" = "$DB_NAME" ]       || die "DB_NAME in $ENV_FILE is not $DB_NAME - fix it and re-run"
     [ "$(env_get DB_USER)" = "$DB_USER" ]       || die "DB_USER in $ENV_FILE is not $DB_USER - fix it and re-run"
     [ "$(env_get APP_PORT)" = "$APP_PORT" ]     || die "APP_PORT in $ENV_FILE is not $APP_PORT - fix it and re-run"

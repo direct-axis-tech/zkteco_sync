@@ -10,6 +10,9 @@ Modes:
                         dependencies, refreshes the frontend, restarts the
                         registered service. Never touches .env. Dev boxes are
                         detected from .env so the same command works everywhere.
+
+Any install question can be answered up front with an option (see --help);
+only the ones left unanswered are asked.
 """
 
 import argparse
@@ -34,6 +37,11 @@ ROOT     = Path(__file__).parent.resolve()
 # that predate the key have none and keep this name.
 DEFAULT_SVC_NAME = "zkteco-sync"
 
+DB_DEFAULT_PORTS = {
+    "mariadb": "3306", "mysql": "3306",
+    "postgresql": "5432", "mssql": "1433",
+}
+
 RED    = "\033[0;31m"
 GREEN  = "\033[0;32m"
 YELLOW = "\033[1;33m"
@@ -56,6 +64,14 @@ def ask(prompt, default=""):
     suffix = f" [{default}]" if default else ""
     val = input(f"   {prompt}{suffix}: ").strip()
     return val if val else default
+
+def given_or_ask(given, prompt, default=""):
+    """The answer passed on the command line, or the operator's if none was.
+    A given answer is still printed, so the transcript shows every value."""
+    if given is None:
+        return ask(prompt, default)
+    print(f"   {prompt}: {given}")
+    return given
 
 def ask_secret(prompt):
     return getpass.getpass(f"   {prompt}: ")
@@ -145,7 +161,37 @@ def parse_args():
                         help="non-interactive upgrade: pull, re-sync, restart")
     parser.add_argument("--skip-pull", action="store_true",
                         help="with --upgrade: don't git pull first")
-    return parser.parse_args()
+
+    answers = parser.add_argument_group(
+        "answers",
+        "Answer an install question up front; anything not given is asked. "
+        "The database password is read from ZKTECO_DB_PASSWORD when set, "
+        "never from the command line, where any user could see it in ps.",
+    )
+    answers.add_argument("--service-name")
+    answers.add_argument("--bind", metavar="ADDRESS")
+    answers.add_argument("--port", type=int)
+    answers.add_argument("--hostname", help="public hostname, for ALLOWED_HOSTS")
+    answers.add_argument("--trusted-proxies", metavar="ADDRESSES")
+    answers.add_argument("--db-engine", choices=DB_DEFAULT_PORTS)
+    answers.add_argument("--db-host")
+    answers.add_argument("--db-port", type=int)
+    answers.add_argument("--db-name")
+    answers.add_argument("--db-user")
+    answers.add_argument("--db-odbc-driver", metavar="DRIVER")
+    answers.add_argument("--admin-username")
+
+    args = parser.parse_args()
+    given = [a.dest for a in answers._group_actions if getattr(args, a.dest) is not None]
+    args.answers_given = bool(given)
+    if given and args.upgrade:
+        parser.error("--upgrade never touches .env; drop "
+                     + ", ".join("--" + d.replace("_", "-") for d in given))
+    for dest in ("port", "db_port"):
+        if getattr(args, dest) is not None:
+            setattr(args, dest, str(getattr(args, dest)))
+    args.db_password = os.environ.get("ZKTECO_DB_PASSWORD")
+    return args
 
 # ── Phases ────────────────────────────────────────────────────────────────────
 def print_banner(upgrade, dev_mode):
@@ -204,20 +250,16 @@ def check_prerequisites(dev_mode):
         check_tool("node", "Node.js")
         check_tool("npm",  "npm")
 
-def prompt_database():
+def prompt_database(args):
     """Interactive database prompts. Returns a dict of DB_* values."""
     header("Database")
     print()
     info("Supported engines:  mariadb   mysql   postgresql   mssql")
     print()
 
-    default_ports = {
-        "mariadb": "3306", "mysql": "3306",
-        "postgresql": "5432", "mssql": "1433",
-    }
     while True:
-        engine = ask("Engine", "mariadb")
-        if engine in default_ports:
+        engine = given_or_ask(args.db_engine, "Engine", "mariadb")
+        if engine in DB_DEFAULT_PORTS:
             break
         warn(f"Invalid engine '{engine}'. Choose: mariadb, mysql, postgresql, mssql")
 
@@ -228,25 +270,32 @@ def prompt_database():
         info("Port will then be discovered automatically via SQL Browser.")
         print()
 
-    host = ask("Host", "127.0.0.1")
+    host = given_or_ask(args.db_host, "Host", "127.0.0.1")
     if engine == "mssql" and "\\" in host:
         port = ""
         info("Named instance detected — skipping port (SQL Browser will resolve it).")
     else:
-        port = ask("Port", default_ports[engine])
-    name = ask("Database", "zkteco_sync")
+        port = given_or_ask(args.db_port, "Port", DB_DEFAULT_PORTS[engine])
+    name = given_or_ask(args.db_name, "Database", "zkteco_sync")
+
+    if args.db_password is not None:
+        def password_prompt(prompt):
+            print(f"   {prompt}: (from ZKTECO_DB_PASSWORD)")
+            return args.db_password
+    else:
+        password_prompt = ask_secret
 
     if engine == "mssql":
         print()
         info("Leave username and password empty to use Windows Authentication.")
         print()
-        user     = ask("Username (empty = Windows Auth)", "")
-        password = ask_secret("Password (empty = Windows Auth)")
+        user     = given_or_ask(args.db_user, "Username (empty = Windows Auth)", "")
+        password = password_prompt("Password (empty = Windows Auth)")
         print()
-        odbc = ask("ODBC Driver", "ODBC Driver 17 for SQL Server")
+        odbc = given_or_ask(args.db_odbc_driver, "ODBC Driver", "ODBC Driver 17 for SQL Server")
     else:
-        user     = ask("Username", "root")
-        password = ask_secret("Password")
+        user     = given_or_ask(args.db_user, "Username", "root")
+        password = password_prompt("Password")
         odbc     = "ODBC Driver 17 for SQL Server"
 
     return {
@@ -255,19 +304,19 @@ def prompt_database():
         "DB_ODBC_DRIVER": odbc,
     }
 
-def prompt_network(dev_mode):
+def prompt_network(args, dev_mode):
     """Interactive prompts for the settings app/config.py needs to boot under
     APP_ENV=production without hand-editing .env afterward. Returns a dict of
     the new config keys."""
     header("Network")
 
-    app_host = ask("Bind address", "127.0.0.1")
+    app_host = given_or_ask(args.bind, "Bind address", "127.0.0.1")
     if app_host == "0.0.0.0":
         warn("Binding to 0.0.0.0 gives this process its own public socket.")
         info("Apache should be the only thing the internet can reach — this app is")
         info("meant to stay on loopback and be reverse-proxied. Only override this")
         info("if you know Apache is NOT fronting this box (not the supported setup).")
-    app_port = ask("Port", "8000")
+    app_port = given_or_ask(args.port, "Port", "8000")
 
     if dev_mode:
         info("Development mode — ALLOWED_HOSTS left unset; app/config.py falls back")
@@ -280,7 +329,7 @@ def prompt_network(dev_mode):
         info("ALLOWED_HOSTS: the public hostname(s) this server answers on. The app")
         info("refuses to boot under APP_ENV=production without this set — it rejects")
         info("any request whose Host header isn't in this list.")
-        hostname = ask("Public hostname (e.g. zk.example.com)")
+        hostname = given_or_ask(args.hostname, "Public hostname (e.g. zk.example.com)")
         while not hostname:
             warn("A hostname is required for a production install.")
             hostname = ask("Public hostname (e.g. zk.example.com)")
@@ -291,7 +340,7 @@ def prompt_network(dev_mode):
         info("X-Forwarded-For. This must be the address Apache's proxy connections")
         info("actually originate from — almost always 127.0.0.1, the default. Get")
         info("this wrong and per-device IP allowlisting silently fails open or closed.")
-        trusted_proxies = ask("Trusted proxy addresses", "127.0.0.1")
+        trusted_proxies = given_or_ask(args.trusted_proxies, "Trusted proxy addresses", "127.0.0.1")
 
     return {
         "app_host": app_host,
@@ -300,7 +349,7 @@ def prompt_network(dev_mode):
         "trusted_proxies": trusted_proxies,
     }
 
-def prompt_service_name(dev_mode):
+def prompt_service_name(args, dev_mode):
     """The name this instance's background service is registered and
     restarted under. Dev boxes register no service."""
     if dev_mode:
@@ -310,8 +359,10 @@ def prompt_service_name(dev_mode):
     info("Each instance on the same server needs its own service name, or")
     info("installing one replaces the other's service and upgrading one")
     info("restarts the other.")
+    given = args.service_name
     while True:
-        name = ask("Service name", DEFAULT_SVC_NAME)
+        name = given_or_ask(given, "Service name", DEFAULT_SVC_NAME)
+        given = None  # a rejected --service-name falls back to asking
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
             warn("Use only letters, digits, '-', '_' and '.'.")
             continue
@@ -333,29 +384,32 @@ def service_directory(name):
         return None
     return out if ok and out else None
 
-def configure(env, dev_mode):
+def configure(env, args):
     """Interactive configuration → fresh .env. Returns False if the user kept
     an existing .env instead."""
+    dev_mode = args.dev
     if env.exists():
         header("Existing configuration found")
         warn(".env already exists.")
         if not ask_yn("Reconfigure?", default="n"):
             success("Keeping existing .env")
+            if args.answers_given:
+                warn("Answers given on the command line were not applied.")
             secure_env_file(env)
             return False
 
-    service_name = prompt_service_name(dev_mode)
+    service_name = prompt_service_name(args, dev_mode)
 
-    net = prompt_network(dev_mode)
+    net = prompt_network(args, dev_mode)
 
-    db = prompt_database()
+    db = prompt_database(args)
 
     header("Admin bootstrap credentials")
     info("These credentials seed exactly ONE administrator account the first time")
     info("the app boots against an empty database. After that first login, the UI")
     info("forces a password change and API_USERNAME/API_PASSWORD are never read")
     info("again — safe (and recommended) to delete them from .env afterward.")
-    api_username = ask("Username", "admin")
+    api_username = given_or_ask(args.admin_username, "Username", "admin")
     while True:
         api_password = ask_secret("Password")
         if not api_password:
@@ -727,7 +781,7 @@ def main():
     check_prerequisites(args.dev)
 
     if not args.upgrade:
-        if not configure(env, args.dev):
+        if not configure(env, args):
             enforce_app_env(env, args.dev)
     svc = env.get("SERVICE_NAME") or DEFAULT_SVC_NAME
 
