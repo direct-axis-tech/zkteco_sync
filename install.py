@@ -16,6 +16,7 @@ import argparse
 import getpass
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -28,7 +29,10 @@ IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
 
 ROOT     = Path(__file__).parent.resolve()
-SVC_NAME = "zkteco-sync"
+# Each install's service is named by SERVICE_NAME in its .env, so several
+# instances can share one server and --upgrade restarts only its own. Installs
+# that predate the key have none and keep this name.
+DEFAULT_SVC_NAME = "zkteco-sync"
 
 RED    = "\033[0;31m"
 GREEN  = "\033[0;32m"
@@ -296,6 +300,39 @@ def prompt_network(dev_mode):
         "trusted_proxies": trusted_proxies,
     }
 
+def prompt_service_name(dev_mode):
+    """The name this instance's background service is registered and
+    restarted under. Dev boxes register no service."""
+    if dev_mode:
+        return DEFAULT_SVC_NAME
+
+    header("Service")
+    info("Each instance on the same server needs its own service name, or")
+    info("installing one replaces the other's service and upgrading one")
+    info("restarts the other.")
+    while True:
+        name = ask("Service name", DEFAULT_SVC_NAME)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            warn("Use only letters, digits, '-', '_' and '.'.")
+            continue
+        owner = service_directory(name)
+        if owner and Path(owner).resolve() != ROOT:
+            warn(f"'{name}' is already the service of the instance in {owner}.")
+            continue
+        return name
+
+def service_directory(name):
+    """Directory an already-registered service runs from, or None."""
+    if IS_WINDOWS and shutil.which("nssm"):
+        out, _, ok = run_capture(["nssm", "get", name, "AppDirectory"])
+    elif IS_LINUX and shutil.which("systemctl"):
+        out, _, ok = run_capture(
+            ["systemctl", "show", "-p", "WorkingDirectory", "--value", name]
+        )
+    else:
+        return None
+    return out if ok and out else None
+
 def configure(env, dev_mode):
     """Interactive configuration → fresh .env. Returns False if the user kept
     an existing .env instead."""
@@ -306,6 +343,8 @@ def configure(env, dev_mode):
             success("Keeping existing .env")
             secure_env_file(env)
             return False
+
+    service_name = prompt_service_name(dev_mode)
 
     net = prompt_network(dev_mode)
 
@@ -331,6 +370,8 @@ def configure(env, dev_mode):
         f"APP_HOST={net['app_host']}\n"
         f"APP_PORT={net['app_port']}\n"
         f"APP_ENV={'development' if dev_mode else 'production'}\n"
+        f"# Background service name - install.py --upgrade restarts only this one.\n"
+        f"SERVICE_NAME={service_name}\n"
         f"\n"
         f"# First-boot bootstrap only — seeds one admin, then ignored forever.\n"
         f"# Safe to delete once you've logged in and changed the password.\n"
@@ -482,21 +523,21 @@ def install_frontend(dev_mode, upgrade):
             "onto this machine and re-run."
         )
 
-def restart_service():
+def restart_service(svc):
     """Upgrade path: never (re-)register — nssm install dies on an existing
     service. Just restart whatever is already registered."""
     if IS_WINDOWS and shutil.which("nssm"):
-        _, _, registered = run_capture(["nssm", "status", SVC_NAME])
+        _, _, registered = run_capture(["nssm", "status", svc])
         if registered:
-            run(["nssm", "restart", SVC_NAME])
-            success(f"Service '{SVC_NAME}' restarted")
+            run(["nssm", "restart", svc])
+            success(f"Service '{svc}' restarted")
         else:
             info("No Windows service registered — restart the app manually.")
     elif IS_LINUX and shutil.which("systemctl"):
-        _, _, registered = run_capture(["systemctl", "cat", SVC_NAME])
+        _, _, registered = run_capture(["systemctl", "cat", svc])
         if registered:
-            run(["sudo", "systemctl", "restart", SVC_NAME])
-            success(f"Service '{SVC_NAME}' restarted")
+            run(["sudo", "systemctl", "restart", svc])
+            success(f"Service '{svc}' restarted")
         else:
             info("No systemd service registered — restart the app manually.")
     else:
@@ -509,7 +550,7 @@ def is_windows_admin():
     except Exception:
         return False
 
-def install_windows_service():
+def install_windows_service(svc):
     nssm = shutil.which("nssm")
     if not nssm:
         warn("NSSM not found in PATH.")
@@ -526,7 +567,6 @@ def install_windows_service():
     uv_path = shutil.which("uv")
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
-    svc = SVC_NAME
 
     # Run as LocalSystem (NSSM default). DB access uses SQL Auth from .env,
     # so the service identity doesn't need any DB grants.
@@ -550,7 +590,7 @@ def install_windows_service():
     info(f"nssm restart {svc}")
     info(f"nssm status  {svc}")
 
-def install_linux_service():
+def install_linux_service(svc):
     if not ask_yn("Install as a systemd service (runs on boot, restarts on crash)?", "y"):
         return
 
@@ -575,7 +615,7 @@ def install_linux_service():
         ExecStart={venv_python} {ROOT / 'run.py'}
         Restart=always
         RestartSec=5
-        SyslogIdentifier={SVC_NAME}
+        SyslogIdentifier={svc}
 
         # --- Sandboxing (defense in depth) --------------------------------
         # This app is now reachable indirectly from the public internet
@@ -600,36 +640,36 @@ def install_linux_service():
         # against this project's actual Python 3.11 runtime and native
         # dependencies on a real Linux box. Enable it deliberately — add
         # `MemoryDenyWriteExecute=true` below and watch
-        # `journalctl -u {SVC_NAME}` on restart — rather than shipping it
+        # `journalctl -u {svc}` on restart — rather than shipping it
         # unverified.
 
         [Install]
         WantedBy=multi-user.target
         """)
     subprocess.run(
-        ["sudo", "tee", f"/etc/systemd/system/{SVC_NAME}.service"],
+        ["sudo", "tee", f"/etc/systemd/system/{svc}.service"],
         input=svc_body, text=True, check=True, capture_output=True,
     )
     run(["sudo", "systemctl", "daemon-reload"])
-    run(["sudo", "systemctl", "enable",  SVC_NAME])
-    run(["sudo", "systemctl", "restart", SVC_NAME])
+    run(["sudo", "systemctl", "enable",  svc])
+    run(["sudo", "systemctl", "restart", svc])
 
-    success(f"Service '{SVC_NAME}' installed and started")
-    info(f"sudo systemctl status  {SVC_NAME}")
-    info(f"sudo systemctl stop    {SVC_NAME}")
-    info(f"sudo systemctl restart {SVC_NAME}")
-    info(f"journalctl -u {SVC_NAME} -f   (live logs)")
+    success(f"Service '{svc}' installed and started")
+    info(f"sudo systemctl status  {svc}")
+    info(f"sudo systemctl stop    {svc}")
+    info(f"sudo systemctl restart {svc}")
+    info(f"journalctl -u {svc} -f   (live logs)")
 
-def setup_service(dev_mode, upgrade):
+def setup_service(svc, dev_mode, upgrade):
     header("Background service")
     if upgrade:
-        restart_service()
+        restart_service(svc)
     elif dev_mode:
         info("Dev mode — skipping service registration.")
     elif IS_WINDOWS:
-        install_windows_service()
+        install_windows_service(svc)
     elif IS_LINUX and shutil.which("systemctl"):
-        install_linux_service()
+        install_linux_service(svc)
     else:
         info("Automatic service setup not supported on this platform.")
         info("Start manually with:  python run.py")
@@ -689,6 +729,7 @@ def main():
     if not args.upgrade:
         if not configure(env, args.dev):
             enforce_app_env(env, args.dev)
+    svc = env.get("SERVICE_NAME") or DEFAULT_SVC_NAME
 
     sync_python_deps()
     test_database(env, args.upgrade)
@@ -697,7 +738,7 @@ def main():
         bootstrap_mssql_login(env)
 
     install_frontend(args.dev, args.upgrade)
-    setup_service(args.dev, args.upgrade)
+    setup_service(svc, args.dev, args.upgrade)
     print_summary(env, args.dev, args.upgrade)
 
 
