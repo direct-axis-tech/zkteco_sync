@@ -103,6 +103,17 @@ class Device(Base):
     # upgraded install get a value from the database itself.
     timezone = Column(String(64), nullable=False, default=config.DEFAULT_DEVICE_TIMEZONE)
 
+    # What the last SDK pull of each kind did, as JSON keyed by kind
+    # ("employees", "attendance", "templates"), each holding
+    # {"at": <UTC ISO>, "ok": bool, "detail": str}. A pull runs as a
+    # background task after the HTTP response has already said "started", so
+    # its return value goes nowhere — this column is the only place its
+    # outcome survives, and the only way the UI can say "that sync failed:
+    # timed out" instead of nothing. JSON text rather than nine columns
+    # because every dialect this app supports can hold it and nothing
+    # queries inside it.
+    pull_outcomes = Column(Text, nullable=True)
+
     @property
     def comm_key_set(self) -> bool:
         """The only externally-visible fact about the comm key: whether one

@@ -29,7 +29,9 @@ from app.schemas import (
 from app.services import (
     commands, devicecontrol, employee_sync, pairing, provisioning,
 )
-from app.services.poller import pull_attendance, pull_device, pull_employees
+from app.services import poller
+from app.services.poller import (pull_attendance, pull_device, pull_employees,
+                                 record_pull_outcome, store_templates)
 from app.services.sdk import device_connection, enroll_user_task
 
 router = APIRouter(prefix="/devices", tags=["devices"], dependencies=[Depends(require_auth)])
@@ -471,6 +473,18 @@ def _queued_query_response(sn: str, rows, created: int, response: Response,
     }
 
 
+def _refuse_if_pulling(sn: str) -> None:
+    """409 while a background pull holds this device's SDK session.
+
+    A terminal serves one SDK session; a second CONNECT during a long read
+    times out and has been seen to wedge the terminal for minutes afterwards.
+    Refusing here is the difference between a toast that says "wait" and a
+    background task that dials anyway and fails eight minutes later.
+    """
+    if poller.is_pulling(sn):
+        raise HTTPException(status_code=409, detail=poller.BUSY_DETAIL)
+
+
 @router.post("/{sn}/pull", dependencies=[Depends(require_admin)])
 def trigger_pull(sn: str, background_tasks: BackgroundTasks, response: Response,
                  db: Session = Depends(get_db)):
@@ -493,6 +507,7 @@ def trigger_pull(sn: str, background_tasks: BackgroundTasks, response: Response,
         # which is what the UI shows in a toast.
         body["attendance"] = provisioning.NO_ATTENDANCE_QUERY
         return body
+    _refuse_if_pulling(sn)
     background_tasks.add_task(pull_device, sn)
     return {"message": "Pull started", "device": sn}
 
@@ -505,6 +520,7 @@ def trigger_pull_employees(sn: str, background_tasks: BackgroundTasks, response:
     if _uses_command_queue(device):
         row, created = provisioning.query_users(db, sn)
         return _queued_query_response(sn, [row], int(created), response, "its user table")
+    _refuse_if_pulling(sn)
     background_tasks.add_task(pull_employees, sn)
     return {"message": "Employee sync started", "device": sn}
 
@@ -539,6 +555,7 @@ def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks,
                 "from this device appear in Attendance without any action here."
             ),
         )
+    _refuse_if_pulling(sn)
     background_tasks.add_task(pull_attendance, sn)
     return {"message": "Attendance sync started", "device": sn}
 
@@ -1711,44 +1728,26 @@ def pull_templates(sn: str, response: Response, db: Session = Depends(get_db)):
         return _queued_query_response(sn, [row], int(created), response,
                                       "its biometric templates")
 
+    _refuse_if_pulling(sn)
     try:
         with device_connection(device) as conn:
-            users = conn.get_users()
-            uid_map = {u.uid: u.user_id for u in users}
-            fingers = conn.get_templates()
-
-            result = []
-            for finger in fingers:
-                user_id = uid_map.get(finger.uid)
-                if not user_id:
-                    continue
-                packed = finger.json_pack()
-                ft = db.query(FingerprintTemplate).filter_by(
-                    user_id=user_id, finger_id=finger.fid
-                ).first()
-                if ft:
-                    ft.valid = finger.valid
-                    ft.template = packed["template"]
-                    ft.source_device_sn = sn
-                else:
-                    ft = FingerprintTemplate(
-                        user_id=user_id,
-                        finger_id=finger.fid,
-                        valid=finger.valid,
-                        template=packed["template"],
-                        source_device_sn=sn,
-                    )
-                    db.add(ft)
-                result.append(ft)
-
+            # Same writer Sync All uses (poller.store_templates), so a manual
+            # pull and the background one cannot disagree about a row.
+            result = store_templates(db, sn, conn)
             db.commit()
             for r in result:
                 db.refresh(r)
+            # Recorded like the background pulls are, so the Devices page's
+            # "last sync" reads the same whichever route read the templates.
+            record_pull_outcome(db, device, "templates", True,
+                                f"{len(result)} templates read from the device")
             # Serialised here rather than by `response_model`, which this
             # endpoint gave up when it grew a second transport that answers
             # with a queue receipt. The `att` body is unchanged.
             return [FingerprintTemplateOut.model_validate(r) for r in result]
-    except (ZKErrorConnection, ZKNetworkError):
+    except (ZKErrorConnection, ZKNetworkError) as exc:
+        record_pull_outcome(db, device, "templates", False,
+                            f"Could not connect to {device.ip_address}:{device.port} — {exc}")
         raise HTTPException(status_code=503, detail="Could not connect to device")
 
 

@@ -115,6 +115,7 @@ export const api = {
   },
   devices: {
     list: (status) => request('GET', status ? `/devices?status=${status}` : '/devices'),
+    get: (sn) => request('GET', `/devices/${sn}`),
     create: (data) => request('POST', '/devices', data),
     approve: (sn) => request('POST', `/devices/${sn}/approve`),
     reject: (sn) => request('POST', `/devices/${sn}/reject`),

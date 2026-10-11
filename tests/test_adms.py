@@ -5088,6 +5088,232 @@ class SdkAttendancePullDedupTests(AdmsTestCase):
         self.assertEqual(result["attendance_synced"], 3)
         self.assertEqual(self.rows(), 3)
 
+    # -- the outcome reaches the device row, so the UI can show it ---------
+    #
+    # The pull is a background task: by the time it runs, the HTTP response
+    # has already said "started" and its return value goes nowhere. Found in
+    # the field on 2145222460344: a wedged terminal timed out every connect
+    # for half an hour and the Devices page showed nothing at all.
+
+    def outcomes(self):
+        import json
+        raw = self.get_device(self.SN).pull_outcomes
+        return json.loads(raw) if raw else {}
+
+    def test_a_successful_pull_records_what_it_stored(self):
+        self.poller.pull_attendance(self.SN)
+        outcome = self.outcomes()["attendance"]
+        self.assertTrue(outcome["ok"])
+        self.assertIn("3 new punches", outcome["detail"])
+        self.assertIn("3 read from the device", outcome["detail"])
+        self.assertTrue(outcome["at"])
+
+    def test_a_timed_out_connect_records_the_failure_and_the_address(self):
+        from zk.exception import ZKNetworkError
+
+        def _timeout(device):
+            raise ZKNetworkError("timed out")
+        self.poller._connect = _timeout
+
+        result = self.poller.pull_attendance(self.SN)
+        self.assertEqual(result["attendance_synced"], 0)
+        outcome = self.outcomes()["attendance"]
+        self.assertFalse(outcome["ok"])
+        # "timed out" on its own tells an operator nothing; say what was dialled.
+        self.assertEqual(outcome["detail"],
+                         "Could not connect to 192.0.2.50:4370 — timed out")
+        self.assertFalse(self.get_device(self.SN).is_online)
+
+    def test_a_failure_does_not_erase_another_kind_s_outcome(self):
+        """Sync All runs three pulls back to back; each keeps its own entry."""
+        from zk.exception import ZKNetworkError
+        self.poller.pull_attendance(self.SN)
+        self.poller._connect = lambda device: (_ for _ in ()).throw(ZKNetworkError("timed out"))
+        self.poller.pull_employees(self.SN)
+        outcomes = self.outcomes()
+        self.assertTrue(outcomes["attendance"]["ok"])
+        self.assertFalse(outcomes["employees"]["ok"])
+
+    def test_a_read_never_disables_the_terminal(self):
+        """A pull only reads. disable_device() locked the keypad for the whole
+        read and its enable_device() sat in a `finally` a killed background
+        task never reaches — a dev-server reload mid-read left 2145222460344
+        locked and its SDK thread wedged for ~8 minutes. Structural, like the
+        one-writer test above: if the call comes back, this fails."""
+        import inspect as _inspect
+        for fn in (self.poller.pull_employees, self.poller.pull_attendance,
+                   self.poller.pull_templates):
+            self.assertNotIn("disable_device", _inspect.getsource(fn), fn.__name__)
+
+    def test_the_outcome_records_how_long_the_device_was_held(self):
+        self.poller.pull_attendance(self.SN)
+        self.assertIsInstance(self.outcomes()["attendance"]["seconds"], float)
+
+    def test_a_second_pull_on_a_busy_device_is_refused_not_dialled(self):
+        """One SDK session per terminal. A second CONNECT during a read does
+        not queue — it times out, and can wedge the terminal."""
+        import threading
+        started, release = threading.Event(), threading.Event()
+        dialled = []
+
+        class _SlowConn(self._FakeConn):
+            def get_attendance(inner):
+                started.set()
+                release.wait(5)
+                return super().get_attendance()
+        self.poller._connect = lambda device: (dialled.append(1), _SlowConn(self.records))[1]
+
+        worker = threading.Thread(target=self.poller.pull_attendance, args=(self.SN,))
+        worker.start()
+        self.assertTrue(started.wait(5))
+        try:
+            self.assertTrue(self.poller.is_pulling(self.SN))
+            second = self.poller.pull_attendance(self.SN)
+            self.assertEqual(second["errors"], [self.poller.BUSY_DETAIL])
+            everything = self.poller.pull_device(self.SN)
+            self.assertEqual(everything["errors"], [self.poller.BUSY_DETAIL])
+            self.assertEqual(len(dialled), 1, "the refused pulls must not touch the device")
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(self.poller.is_pulling(self.SN))
+        # The lock is held, not leaked: the next pull goes through.
+        self.assertEqual(self.poller.pull_attendance(self.SN)["errors"], [])
+
+    def test_device_out_parses_the_json_and_tolerates_a_null_column(self):
+        from app.schemas import DeviceOut
+        self.assertEqual(DeviceOut.model_validate(self.get_device(self.SN)).pull_outcomes, {})
+        self.poller.pull_attendance(self.SN)
+        shape = DeviceOut.model_validate(self.get_device(self.SN))
+        self.assertTrue(shape.pull_outcomes["attendance"]["ok"])
+
+
+class SdkTemplatePullTests(AdmsTestCase):
+    """`poller.pull_templates` and its place in Sync All.
+
+    Fingerprints were only ever read off an `att` terminal by the manual
+    "Sync Templates" action: `pull_device` (Sync All, and the auto-pull on
+    approval) fetched people and punches and stopped there. A site that
+    enrolled every finger on the terminal itself, then synced, ended up with
+    a full employee list and an empty `fingerprint_templates` table, and the
+    employee drawer said "No templates stored" about people who verify by
+    finger every day. Found on 2145222460344: 72 templates on the device, 0
+    in the DB.
+    """
+
+    SN = "2145222460344"
+
+    class _FakeUser:
+        def __init__(self, uid, user_id, name=""):
+            self.uid, self.user_id, self.name = uid, user_id, name
+            self.privilege, self.card, self.password, self.group_id = 0, 0, "", ""
+
+    class _FakeFinger:
+        def __init__(self, uid, fid, valid=1, blob=b"\x01\x02"):
+            self.uid, self.fid, self.valid, self.size = uid, fid, valid, len(blob)
+            self._blob = blob
+        def json_pack(self):
+            return {"uid": self.uid, "fid": self.fid, "valid": self.valid,
+                    "template": self._blob.hex()}
+
+    class _FakeConn:
+        def __init__(self, users, fingers):
+            self._users, self._fingers = users, fingers
+        def disable_device(self): pass
+        def enable_device(self): pass
+        def disconnect(self): pass
+        def get_users(self): return list(self._users)
+        def get_templates(self): return list(self._fingers)
+        def get_attendance(self): return []
+
+    def setUp(self):
+        super().setUp()
+        from app.services import poller
+        self.poller = poller
+
+        db = self.Session()
+        try:
+            db.add(Device(serial_number=self.SN, ip_address="192.0.2.60", port=4370,
+                          name="T&A terminal", status="approved", protocol="att"))
+            db.commit()
+        finally:
+            db.close()
+
+        self.users = [self._FakeUser(1, "3"), self._FakeUser(2, "14")]
+        # The shape seen in the field: right index + right middle for most,
+        # a third finger for some.
+        self.fingers = [
+            self._FakeFinger(1, 6), self._FakeFinger(1, 7), self._FakeFinger(1, 8),
+            self._FakeFinger(2, 6), self._FakeFinger(2, 7),
+        ]
+
+        self._orig_session = self.poller.SessionLocal
+        self._orig_connect = self.poller._connect
+        self.poller.SessionLocal = self.Session
+        self.poller._connect = lambda device: self._FakeConn(self.users, self.fingers)
+
+    def tearDown(self):
+        self.poller.SessionLocal = self._orig_session
+        self.poller._connect = self._orig_connect
+        super().tearDown()
+
+    def rows(self):
+        db = self.Session()
+        try:
+            return db.query(FingerprintTemplate).order_by(
+                FingerprintTemplate.user_id, FingerprintTemplate.finger_id
+            ).all()
+        finally:
+            db.close()
+
+    def test_a_pull_stores_one_row_per_finger_keyed_on_user_id(self):
+        result = self.poller.pull_templates(self.SN)
+        self.assertEqual(result["templates_synced"], 5)
+        self.assertEqual(result["errors"], [])
+        rows = self.rows()
+        self.assertEqual(
+            [(r.user_id, r.finger_id, r.valid, r.source_device_sn) for r in rows],
+            [("14", 6, 1, self.SN), ("14", 7, 1, self.SN),
+             ("3", 6, 1, self.SN), ("3", 7, 1, self.SN), ("3", 8, 1, self.SN)],
+        )
+
+    def test_a_second_pull_updates_in_place_and_never_duplicates(self):
+        self.poller.pull_templates(self.SN)
+        self.fingers[0] = self._FakeFinger(1, 6, blob=b"\xff\xfe\xfd")
+        result = self.poller.pull_templates(self.SN)
+        self.assertEqual(result["templates_synced"], 5)
+        rows = self.rows()
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(
+            next(r for r in rows if r.user_id == "3" and r.finger_id == 6).template,
+            "fffefd",
+        )
+
+    def test_a_finger_whose_uid_is_unknown_is_skipped_not_misfiled(self):
+        self.fingers.append(self._FakeFinger(99, 6))
+        result = self.poller.pull_templates(self.SN)
+        self.assertEqual(result["templates_synced"], 5)
+        self.assertEqual(len(self.rows()), 5)
+
+    def test_sync_all_now_pulls_templates_after_people(self):
+        """The regression: Sync All alone must leave the drawer populated."""
+        result = self.poller.pull_device(self.SN)
+        self.assertEqual(result["users_synced"], 2)
+        self.assertEqual(result["templates_synced"], 5)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(self.rows()), 5)
+
+    def test_a_connection_failure_is_reported_not_raised(self):
+        from zk.exception import ZKNetworkError
+
+        def _refuse(device):
+            raise ZKNetworkError("can't reach device (ping 192.0.2.60)")
+        self.poller._connect = _refuse
+        result = self.poller.pull_templates(self.SN)
+        self.assertEqual(result["templates_synced"], 0)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(self.rows(), [])
+
 
 class TemplateGoesHomeWhenTheDeviceLostItTests(TemplatePushTestCase):
     """The exception to "never goes home": the device no longer holds it.
@@ -8083,6 +8309,28 @@ CONFIRMED_TEMPLATE_QUERY = "DATA QUERY tablename=biodata,fielddesc=*,filter=type
 class PullRoutingTestCase(ProvisioningTestCase):
     """The four Sync actions, over one acc terminal, one att and one unset."""
 
+    def hold_device(self, sn):
+        """Simulate a pull in progress on `sn` from another thread, the way a
+        background task holds it. Returns the release function."""
+        import threading
+        from app.services import poller
+        acquired, release = threading.Event(), threading.Event()
+
+        def _hold():
+            lock = poller._lock_for(sn)
+            lock.acquire()
+            acquired.set()
+            release.wait(10)
+            lock.release()
+        t = threading.Thread(target=_hold, daemon=True)
+        t.start()
+        acquired.wait(5)
+
+        def _release():
+            release.set()
+            t.join(5)
+        return _release
+
     def sync_all(self, sn):
         return self.client.post(f"/devices/{sn}/pull")
 
@@ -8292,6 +8540,36 @@ class PullTransportRoutingTests(PullRoutingTestCase):
 
         self.assertEqual(seen, [("all", self.ATT_SN), ("attendance", self.ATT_SN)])
         self.assertEqual(self.outbox(), [])
+
+    def test_an_att_sync_while_a_pull_is_running_is_409_and_dials_nothing(self):
+        """The terminal serves one SDK session. A second click during a
+        multi-minute read must be told to wait, not started as a background
+        task that times out and wedges the device."""
+        from unittest import mock
+        from app.services import poller
+
+        seen = []
+        release = self.hold_device(self.ATT_SN)
+        self.addCleanup(release)
+        with mock.patch("app.routers.devices.pull_device", lambda sn: seen.append(sn)), \
+             mock.patch("app.routers.devices.pull_employees", lambda sn: seen.append(sn)), \
+             mock.patch("app.routers.devices.pull_attendance", lambda sn: seen.append(sn)), \
+             mock.patch("app.routers.devices.device_connection",
+                        side_effect=AssertionError("must not dial")):
+            for action in (self.sync_all, self.sync_employees,
+                           self.sync_attendance, self.sync_templates):
+                with self.subTest(action=action.__name__):
+                    response = action(self.ATT_SN)
+                    self.assertEqual(response.status_code, 409, response.text)
+                    self.assertEqual(response.json()["detail"], poller.BUSY_DETAIL)
+        self.assertEqual(seen, [])
+        self.assertEqual(self.outbox(), [])
+
+        # Once the running pull lets go, the same click goes through.
+        release()
+        with mock.patch("app.routers.devices.pull_attendance", lambda sn: seen.append(sn)):
+            self.assertEqual(self.sync_attendance(self.ATT_SN).status_code, 200)
+        self.assertEqual(seen, [self.ATT_SN])
 
     def test_an_att_template_pull_still_reads_the_device_over_the_sdk(self):
         from unittest import mock
