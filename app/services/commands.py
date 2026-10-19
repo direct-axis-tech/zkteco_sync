@@ -301,6 +301,14 @@ def verdict_for(return_code, command_name: str = "") -> str:
     negative refused. From the document; not yet observed on hardware. It
     needs nothing of its own here, and a positive code on one stays
     UNREADABLE like any other unexplained one.
+
+    ``AC_UNLOCK``: a status, read by the general rule
+    -------------------------------------------------
+    An attendance terminal's door unlock (Attendance PUSH 2.4.1 §12.7.2)
+    answers ``CMD=AC_UNLOCK`` the same way: ``0`` the unlock signal was
+    output, negative refused. From the document; not yet observed on hardware.
+    Its one-shot deadline is the outbox row's ``expires_at``, not anything
+    read here.
     """
     if return_code is None:
         return UNREADABLE

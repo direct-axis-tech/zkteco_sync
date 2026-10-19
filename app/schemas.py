@@ -335,8 +335,8 @@ class UnlockRequest(BaseModel):
     seconds: int = 3
 
     # Which door on the controller (E15). Only the `acc` transport can address
-    # more than one — the SDK path has always opened the terminal's own lock
-    # and ignores this.
+    # more than one. An `att` terminal's AC_UNLOCK names no door, so the
+    # endpoint refuses anything but door 1 for one rather than ignore it.
     #
     # Defaults to 1, and 0 is NOT accepted even though the protocol defines it,
     # because in this protocol door 0 means EVERY door on the controller. A

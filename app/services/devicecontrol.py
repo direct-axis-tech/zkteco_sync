@@ -46,7 +46,8 @@ TWO SHAPES THAT WOULD HAVE BEEN PLAUSIBLE GUESSES, AND ARE WRONG
 
 * **`AC_UNLOCK`** is real, vendor-documented, and belongs to the *Attendance*
   PUSH protocol. It appears nowhere in the 178 pages of the Security one. On a
-  `DeviceType=acc` device it is not a command.
+  `DeviceType=acc` device it is not a command. (It is what an `att` terminal
+  is sent, as UNLOCK_ATT_DOOR below, and only ever an `att` one.)
 * **`CONTROL DEVICE 1 1 1 15`** — space-separated decimal — is used by at
   least two open-source ADMS servers. The spec's parameters are a single
   concatenated hex string with no separators at all. The space-separated form
@@ -402,6 +403,41 @@ CLEAR_ATT_RECORDS = "CLEAR LOG"
 
 
 # ---------------------------------------------------------------------------
+# AC_UNLOCK — Attendance PUSH 2.4.1 §12.7.2, p.97 (`att` terminals)
+# ---------------------------------------------------------------------------
+#
+# The attendance-mode counterpart of unlock_command above. Verbatim from the
+# Attendance PUSH document: "Outputting the Door Unlocking Signal. The access
+# equipment outputs the door unlocking signal. The command format is:
+# C:${CmdID}:AC_UNLOCK", answered with `ID=${XXX}&Return=${XXX}&CMD=AC_UNLOCK`.
+# From the document; not yet observed on hardware. The BioPro SA20 has a lock
+# relay, door sensor and exit-button interface, so it is the hardware this
+# section describes, but nobody has yet watched its relay fire on this command.
+#
+# IT TAKES NO PARAMETERS — no door, no duration. That is the whole of §12.7.2,
+# and nothing else in the document qualifies it. So the two things an `acc`
+# unlock is built from cannot be expressed here, and are not invented:
+#
+#   * duration — the terminal holds the lock open for its OWN configured lock
+#     time, set on the terminal, whatever the operator asked for. The endpoint
+#     says so in its reply rather than echoing a number it never sent.
+#   * door — an attendance terminal drives one lock and the command names
+#     none. The endpoint refuses a request for any door but the first rather
+#     than open the one door it can while claiming to have opened another.
+#
+# The reply is a plain status, read by commands.verdict_for's general rule:
+# Return=0 the signal was output, negative refused (Appendix 1 has no codes of
+# its own for it). Like the `acc` unlock it is queued with
+# DOOR_COMMAND_TTL_SECONDS, so it is one-shot and never delivered late — see
+# "Why a door command is one-shot" below; the deadline lives on the outbox row,
+# so the sweep and the dispatcher treat it exactly as they treat the `acc` one.
+#
+# §12.7.3 `AC_UNALARM` sits beside it and is a different action (cancel an
+# alarm output). It is not sent from here.
+UNLOCK_ATT_DOOR = "AC_UNLOCK"
+
+
+# ---------------------------------------------------------------------------
 # The gaps — what an `acc` terminal genuinely cannot be asked
 # ---------------------------------------------------------------------------
 #
@@ -470,8 +506,8 @@ NO_LCD_COMMAND = (
 
 DOOR_COMMAND_EXPIRED = (
     "This door command expired before the terminal collected it, so the door "
-    "was NOT opened. An access-control terminal only receives commands when "
-    "it polls, and a door command is deliberately given a short life: opening "
+    "was NOT opened. A terminal on the push queue only receives commands "
+    "when it polls, and a door command is deliberately given a short life: opening "
     "a door minutes after somebody asked — when they have gone — is worse "
     "than not opening it. Check the terminal is online and try again."
 )

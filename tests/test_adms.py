@@ -9959,6 +9959,9 @@ SPEC_CLEAR_RECORDS = "DATA DELETE transaction *"
 # Attendance PUSH 2.4.1 §12.2.1, verbatim: "To clear the client attendance
 # record, the command format is: C:${CmdID}:CLEAR${SP}LOG"
 SPEC_CLEAR_LOG = "CLEAR LOG"
+# Attendance PUSH 2.4.1 §12.7.2, verbatim: "The access equipment outputs the
+# door unlocking signal. The command format is: C: ${CmdID}: AC_UNLOCK"
+SPEC_AC_UNLOCK = "AC_UNLOCK"
 
 
 class DeviceControlShapeTests(unittest.TestCase):
@@ -10027,6 +10030,11 @@ class DeviceControlShapeTests(unittest.TestCase):
         """One space between CLEAR and LOG, nothing after it: §12.2.1 takes
         no parameters."""
         self.assertEqual(self.dc.CLEAR_ATT_RECORDS, SPEC_CLEAR_LOG)
+
+    def test_the_attendance_unlock_command_is_the_documented_shape(self):
+        """The verb alone: §12.7.2 defines no door and no duration, so
+        nothing follows it."""
+        self.assertEqual(self.dc.UNLOCK_ATT_DOOR, SPEC_AC_UNLOCK)
 
     def test_get_options_is_comma_separated_with_no_trailing_comma(self):
         """§12.5.2: "Multiple parameters are separated by commas, but the last
@@ -10252,20 +10260,6 @@ class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
             setattr(conn, name, _make(name, result))
         return conn
 
-    def test_unlock_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
-        from unittest import mock
-
-        conn = self.sdk(unlock=None)
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.unlock(self.ATT_SN, seconds=7)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertEqual(body["unlocked_for_seconds"], 7)
-        self.assertTrue(body["synchronous"])
-        self.assertEqual([c[0] for c in conn.log], ["unlock"])
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-
     def test_restart_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
         from unittest import mock
 
@@ -10304,12 +10298,11 @@ class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
         visible, not a queue that looks healthy."""
         from unittest import mock
 
-        conn = self.sdk(unlock=None, restart=None)
+        conn = self.sdk(restart=None)
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            self.assertEqual(self.unlock(self.DEFAULT_SN).status_code, 200)
             self.assertEqual(self.restart(self.DEFAULT_SN).status_code, 200)
 
-        self.assertEqual(sorted(c[0] for c in conn.log), ["restart", "unlock"])
+        self.assertEqual([c[0] for c in conn.log], ["restart"])
         self.assertEqual(self.outbox(self.DEFAULT_SN), [])
 
 
@@ -10453,6 +10446,203 @@ class AttAttendanceClearTests(DeviceControlRoutingTestCase):
         self.deliver_and_ack(0)
 
         self.assertEqual(self.punches(self.ATT_SN), 1)
+
+
+class AttDoorUnlockTests(DeviceControlRoutingTestCase):
+    """Opening an attendance terminal's door, over the queue.
+
+    Until 2026-10-19 the `att` branch dialled the SDK, TCP 4370, which never
+    reaches a terminal behind NAT. It now queues `AC_UNLOCK` (Attendance PUSH
+    2.4.1 §12.7.2) with the `acc` door command's deadline, and answers the
+    way the `acc` branch always has.
+    """
+
+    def tripwire(self):
+        """`device_connection`, which must not be reached on any branch now."""
+        from unittest import mock
+
+        def _dial(*args, **kwargs):
+            raise AssertionError("unlocking the door dialled the SDK")
+
+        return mock.patch("app.routers.devices.device_connection", _dial)
+
+    def expire(self, sn):
+        from app.models import DeviceCommandOutbox
+        db = self.Session()
+        try:
+            db.query(DeviceCommandOutbox).filter_by(device_sn=sn).one() \
+                .expires_at = datetime.utcnow() - timedelta(seconds=1)
+            db.commit()
+        finally:
+            db.close()
+
+    def deliver_and_ack(self, return_code):
+        command_id = self.outbox(self.ATT_SN)[-1].id
+        self.poll(self.ATT_SN)
+        self.ack(command_id, return_code=return_code, cmd="AC_UNLOCK",
+                 sn=self.ATT_SN)
+
+    def audit_rows(self, action):
+        from app.models import AuditLog
+        db = self.Session()
+        try:
+            return db.query(AuditLog).filter_by(action=action).all()
+        finally:
+            db.close()
+
+    # -- routing -------------------------------------------------------------
+
+    def test_an_att_device_queues_ac_unlock_and_never_opens_a_socket(self):
+        with self.tripwire():
+            response = self.unlock(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_AC_UNLOCK])
+
+    def test_the_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.unlock(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         f"C:{command_id}:AC_UNLOCK".encode())
+
+    def test_an_unclassified_device_is_unlocked_as_an_attendance_terminal(self):
+        with self.tripwire():
+            response = self.unlock(self.DEFAULT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.DEFAULT_SN)],
+                         [SPEC_AC_UNLOCK])
+
+    def test_an_acc_device_still_queues_the_control_device_command(self):
+        """AC_UNLOCK is not a command on an acc terminal, and CONTROL DEVICE
+        is not one on an att terminal."""
+        self.unlock(self.ATT_SN, seconds=5, door=1)
+        self.unlock(self.SN, seconds=5, door=1)
+
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_UNLOCK_DOOR1_5S])
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_AC_UNLOCK])
+
+    def test_the_reply_has_the_queued_shape_the_acc_reply_has(self):
+        """Devices.jsx toasts `message`, falling back to "Door unlocked" only
+        when there is none; everything else matches acc's."""
+        att = self.unlock(self.ATT_SN)
+        acc = self.unlock(self.SN)
+
+        self.assertEqual(att.status_code, acc.status_code)
+        body = att.json()
+        self.assertEqual(sorted(body), sorted(acc.json()))
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["command"], SPEC_AC_UNLOCK)
+        self.assertEqual(body["command_id"], self.outbox(self.ATT_SN)[0].id)
+        self.assertFalse(body["synchronous"])
+        self.assertIsNone(body["unlocked_for_seconds"])
+        self.assertIn("Queued: open the terminal's door", body["message"])
+        self.assertIn("NOT AN IMMEDIATE UNLOCK", body["message"])
+        self.assertIn("will NOT open later", body["message"])
+
+    def test_a_requested_duration_is_never_put_on_the_wire(self):
+        """§12.7.2 carries no duration, so none is invented."""
+        self.unlock(self.ATT_SN, seconds=7)
+
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_AC_UNLOCK])
+
+    def test_the_reply_says_the_terminal_keeps_its_own_lock_time(self):
+        body = self.unlock(self.ATT_SN, seconds=7).json()
+
+        self.assertEqual(body["requested_seconds"], 7)
+        self.assertIn("lock time configured on the terminal", body["message"])
+        self.assertIn("not the 7 seconds asked for", body["message"])
+
+    def test_a_door_other_than_the_first_is_refused_and_nothing_queued(self):
+        """AC_UNLOCK names no door; opening the terminal's one lock and
+        calling it door 2 would be a door opened that nobody asked for."""
+        response = self.unlock(self.ATT_SN, door=2)
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("names no door", response.json()["detail"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(self.audit_rows("door_unlock_queued"), [])
+
+    def test_it_is_audited_as_a_queued_unlock_like_acc(self):
+        self.unlock(self.ATT_SN, seconds=7)
+
+        [entry] = self.audit_rows("door_unlock_queued")
+        self.assertEqual(entry.target, self.ATT_SN)
+        self.assertEqual(
+            entry.detail,
+            "door=1 seconds=terminal-configured requested_seconds=7 "
+            f"command_id={self.outbox(self.ATT_SN)[0].id}")
+
+    # -- the door deadline ---------------------------------------------------
+
+    def test_it_is_queued_with_the_door_commands_short_deadline(self):
+        from app import config
+
+        self.unlock(self.ATT_SN)
+        row = self.outbox(self.ATT_SN)[0]
+
+        self.assertIsNotNone(row.expires_at)
+        window = (row.expires_at - row.created_at).total_seconds()
+        self.assertAlmostEqual(window, config.DOOR_COMMAND_TTL_SECONDS, delta=2)
+
+    def test_an_expired_one_is_never_handed_to_the_terminal(self):
+        """A terminal back online after the deadline must not open the door
+        at somebody who has gone."""
+        self.unlock(self.ATT_SN)
+        self.expire(self.ATT_SN)
+
+        self.assertEqual(self.poll(self.ATT_SN).strip(), "OK")
+
+    def test_the_sweep_concludes_an_expired_one_as_a_door_that_did_not_open(self):
+        from app.services import commands as command_service
+
+        self.unlock(self.ATT_SN)
+        self.expire(self.ATT_SN)
+        db = self.Session()
+        try:
+            result = command_service.sweep(db)
+        finally:
+            db.close()
+
+        self.assertEqual(result["door_expired"], 1)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        [concluded] = self.history(self.ATT_SN)
+        self.assertEqual((concluded.command, concluded.outcome),
+                         (SPEC_AC_UNLOCK, "failed"))
+        self.assertIn("door was not opened", concluded.last_error)
+
+    def test_a_delivered_one_is_not_offered_a_second_time(self):
+        self.unlock(self.ATT_SN)
+        self.assertIn("AC_UNLOCK", self.poll(self.ATT_SN))
+
+        self.assertEqual(self.poll(self.ATT_SN).strip(), "OK")
+
+    # -- acknowledgement -----------------------------------------------------
+
+    def test_return_zero_concludes_it_acknowledged(self):
+        self.unlock(self.ATT_SN)
+        self.deliver_and_ack(0)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual([(r.command, r.outcome, r.return_code)
+                          for r in self.history(self.ATT_SN)],
+                         [(SPEC_AC_UNLOCK, "acknowledged", 0)])
+
+    def test_a_negative_return_concludes_it_refused(self):
+        self.unlock(self.ATT_SN)
+        self.deliver_and_ack(-1002)
+
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual((row.outcome, row.return_code), ("failed", -1002))
+        [listed] = self.client.get(
+            f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual(listed["verdict"], "refused")
 
 
 class ControlActionsWithNoAccCommandTests(DeviceControlRoutingTestCase):
@@ -10788,6 +10978,10 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
         # devicecontrol.CLEAR_ATT_RECORDS (§12.2.1). Its reply is a plain
         # status, so no reader needs the text. Routing: AttAttendanceClearTests.
         "CLEAR LOG": {"devicecontrol.py"},
+        # devicecontrol.UNLOCK_ATT_DOOR (§12.7.2). A plain status reply, and
+        # its deadline is the outbox row's, so no reader needs the text.
+        # Routing: AttDoorUnlockTests.
+        "AC_UNLOCK": {"devicecontrol.py"},
     }
 
     def string_literals(self, tree):

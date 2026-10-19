@@ -1035,26 +1035,37 @@ def unlock_door(
 ):
     """Open the door.
 
-    * `att` — the SDK opens it synchronously. Unchanged: the call returns when
-      the door has opened, and the response says so.
-    * `acc` — `CONTROL DEVICE 01<door>01<secs>` on the outbox (§12.4). **202,
-      and the response says queued, not unlocked**, because on this transport
-      it genuinely is not open yet.
+    Both protocols queue one door command on the ADMS outbox and answer **202,
+    and the response says queued, not unlocked**, because on this transport
+    the door genuinely is not open yet.
 
-    THE TWO TRANSPORTS ARE NOT EQUIVALENT AND THIS ENDPOINT DOES NOT PRETEND
-    THEY ARE. An SDK unlock is a round trip to the door. An ADMS unlock is a
-    row in a queue that the terminal collects when it next polls — normally
-    within about ten seconds, but behind anything else already queued for that
-    device, because delivery is FIFO at one command per poll. Somebody is
-    standing at the door while that happens.
+    * `acc` — `CONTROL DEVICE 01<door>01<secs>` (§12.4): the door and the
+      duration asked for.
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — `AC_UNLOCK`
+      (devicecontrol.UNLOCK_ATT_DOOR, Attendance PUSH 2.4.1 §12.7.2). Until
+      2026-10-19 this dialled the SDK, TCP 4370, which never reaches a
+      terminal behind NAT, and answered 200 "unlocked". The command takes no
+      parameters, so the terminal holds its lock open for its own configured
+      lock time, not `seconds`, and the reply says so; and it names no door,
+      so any door but 1 is refused with 400 rather than quietly opening the
+      terminal's one lock in its place.
 
-    Which is why an `acc` unlock is given a short deadline
+    THIS IS NOT THE SDK'S UNLOCK AND THIS ENDPOINT DOES NOT PRETEND IT IS. An
+    SDK unlock was a round trip to the door. A queued unlock is a row that the
+    terminal collects when it next polls — normally within about ten seconds,
+    but behind anything else already queued for that device, because delivery
+    is FIFO at one command per poll. Somebody is standing at the door while
+    that happens.
+
+    Which is why both are given a short deadline
     (`DOOR_COMMAND_TTL_SECONDS`, 60s) instead of the queue's usual patience.
     Past it the command is never delivered and is concluded as "the door was
     not opened". Two failure modes go away with it: a door that opens minutes
     later at nobody, and — because the deadline is no longer than the shortest
     retry backoff — a lost acknowledgement re-opening the door repeatedly over
     the following hour. A door command from here is one-shot by construction.
+    Both protocols are audited the same way, `door_unlock_queued`.
     """
     device = _get_device_or_404(sn, db)
 
@@ -1066,44 +1077,60 @@ def unlock_door(
             # 400, not 500: the caller asked for something specific and this
             # says exactly which part of it will not be sent to a door.
             raise HTTPException(status_code=400, detail=str(e))
-
-        row = commands.queue(
-            db, sn, command,
-            ttl_seconds=config.DOOR_COMMAND_TTL_SECONDS,
+        what = f"open door {payload.door} for {payload.seconds} seconds"
+        audited_duration = f"seconds={payload.seconds}"
+        duration_note = ""
+    else:
+        # AC_UNLOCK names no door. Door 1 is the terminal's own lock; asked
+        # for any other, opening that one and replying "door 3" would be a
+        # door opened that nobody asked for.
+        if payload.door != devicecontrol.DEFAULT_DOOR:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{sn} is an attendance terminal: its unlock command "
+                    f"({devicecontrol.UNLOCK_ATT_DOOR}) names no door and "
+                    "opens the terminal's one lock. Door "
+                    f"{payload.door} cannot be addressed, so "
+                    "nothing was queued."
+                ),
+            )
+        command = devicecontrol.UNLOCK_ATT_DOOR
+        what = "open the terminal's door"
+        audited_duration = ("seconds=terminal-configured "
+                            f"requested_seconds={payload.seconds}")
+        duration_note = (
+            " The door stays open for the lock time configured on the "
+            f"terminal, not the {payload.seconds} seconds asked for: an "
+            "attendance terminal's unlock command carries no duration."
         )
-        audit.record(db, admin.username, "door_unlock_queued", target=sn,
-                     ip=client_ip(request),
-                     detail=f"door={payload.door} seconds={payload.seconds} "
-                            f"command_id={row.id}")
-        body = _queued_control_response(
-            sn, row, response,
-            f"open door {payload.door} for {payload.seconds} seconds",
-            extra=(
-                f" THIS IS NOT AN IMMEDIATE UNLOCK: the door opens when the "
-                f"terminal next polls, usually within about 10 seconds. If it "
-                f"has not collected the command within "
-                f"{config.DOOR_COMMAND_TTL_SECONDS} seconds the command is "
-                "cancelled and the door will NOT open later."
-            ),
-        )
-        body.update({
-            "door": payload.door,
-            "unlocked_for_seconds": None,
-            "requested_seconds": payload.seconds,
-            "expires_at": row.expires_at,
-            "synchronous": False,
-        })
-        return body
 
-    try:
-        with device_connection(device) as conn:
-            conn.unlock(time=payload.seconds)
-            audit.record(db, admin.username, "door_unlock", target=sn,
-                         ip=client_ip(request), detail=f"seconds={payload.seconds}")
-            return {"device_sn": sn, "unlocked_for_seconds": payload.seconds,
-                    "synchronous": True}
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+    row = commands.queue(
+        db, sn, command,
+        ttl_seconds=config.DOOR_COMMAND_TTL_SECONDS,
+    )
+    audit.record(db, admin.username, "door_unlock_queued", target=sn,
+                 ip=client_ip(request),
+                 detail=(f"door={payload.door} {audited_duration} "
+                         f"command_id={row.id}"))
+    body = _queued_control_response(
+        sn, row, response, what,
+        extra=(
+            f" THIS IS NOT AN IMMEDIATE UNLOCK: the door opens when the "
+            f"terminal next polls, usually within about 10 seconds. If it "
+            f"has not collected the command within "
+            f"{config.DOOR_COMMAND_TTL_SECONDS} seconds the command is "
+            "cancelled and the door will NOT open later." + duration_note
+        ),
+    )
+    body.update({
+        "door": payload.door,
+        "unlocked_for_seconds": None,
+        "requested_seconds": payload.seconds,
+        "expires_at": row.expires_at,
+        "synchronous": False,
+    })
+    return body
 
 
 @router.get("/{sn}/lock")
@@ -1248,10 +1275,11 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 # `ENROLL_FP`, on the same outbox, with the same acknowledgement rules,
 # because an attendance terminal behind NAT can never be dialled (the BioPro
 # SA20 CPV2232560497 is one). Clearing a terminal's attendance
-# (clear_device_attendance) is queued too, as `CLEAR LOG`. Unlock, restart and
-# device info still route `att` to the SDK until they are moved too; clock,
-# lock state and LCD message stay there for good, having no attendance-mode
-# command.
+# (clear_device_attendance) is queued too, as `CLEAR LOG`, and so is opening
+# its door (unlock_door), as `AC_UNLOCK` with the same short deadline as acc's
+# door command. Restart and device info still route `att` to the SDK until
+# they are moved too; clock, lock state and LCD message stay there for good,
+# having no attendance-mode command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
