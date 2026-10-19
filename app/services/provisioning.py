@@ -980,6 +980,18 @@ NO_ATTENDANCE_QUERY = (
 )
 
 
+# The `att` side: one query, people and fingerprints together.
+#
+# Attendance PUSH 2.4.1 §12.1.3 documents only `DATA QUERY USERINFO PIN=<pin>`.
+# Sent with no PIN, it returns every user. Field-confirmed on BioPro SA20
+# CPV2232560497 (pushver 2.4.1), 2026-10-19: Return=0, then 459 `USER` and
+# 479 `FP` lines uploaded on `cdata?table=OPERLOG`, the exact counts the
+# terminal reports in its own `INFO=` line. The fingerprints come with the
+# users unasked, so there is no second query for templates. Attendance is
+# not asked for either: these terminals push every punch as ATTLOG.
+QUERY_ATT_USERS = "DATA QUERY USERINFO"
+
+
 def queue_query(db: Session, device_sn: str, command: str) -> tuple:
     """Queue one ``DATA QUERY``, reusing an identical one already outstanding.
 
@@ -1024,6 +1036,11 @@ def query_photos(db: Session, device_sn: str) -> tuple:
 def query_templates(db: Session, device_sn: str) -> tuple:
     """Ask an `acc` terminal for its biometric templates — one query, all types."""
     return queue_query(db, device_sn, QUERY_TEMPLATES)
+
+
+def query_att_users(db: Session, device_sn: str) -> tuple:
+    """Ask an `att` terminal for its users and fingerprints — one query."""
+    return queue_query(db, device_sn, QUERY_ATT_USERS)
 
 
 def query_everything(db: Session, device_sn: str) -> tuple:

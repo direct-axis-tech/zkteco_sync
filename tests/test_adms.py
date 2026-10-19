@@ -312,6 +312,86 @@ class LegacyHandshakeRegressionTests(AdmsTestCase):
         self.assertIn(f"TMP=<{len(template)} chars>", log)
         self.assertNotIn(template, log)
 
+    def test_operlog_log_hides_passwords_and_card_numbers(self):
+        self.add_device(LEGACY_SN)
+        body = ("USER PIN=1\tName=Admin\tPri=14\tPasswd=1234\tCard=7495825\tGrp=1\t"
+                "TZ=0000000100000000\tVerify=0\tViceCard=\tStartDatetime=0\tEndDatetime=0\n")
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            self.client.post(f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG", content=body)
+        log = "\n".join(captured.output)
+        self.assertIn("Passwd=<set>\tCard=<set>", log)
+        self.assertIn("ViceCard=\t", log)
+        self.assertNotIn("1234", log)
+        self.assertNotIn("7495825", log)
+
+    def test_operlog_users_and_fingerprints_are_stored_with_their_pins_intact(self):
+        """The SA20's answer to DATA QUERY USERINFO, in its own shapes."""
+        from app.models import DeviceEmployee, FingerprintTemplate
+
+        self.add_device(LEGACY_SN)
+        raw_template = bytes(range(256)) * 4
+        tmp = base64.b64encode(raw_template).decode()
+        body = (
+            "USER PIN=036\tName=BASILA SHERIN SHEHIN HA\tPri=0\tPasswd=\tCard=\tGrp=1\t"
+            "TZ=0000000100000000\tVerify=0\tViceCard=\tStartDatetime=0\tEndDatetime=0\n"
+            "USER PIN=0036\tName=BASILA SHERIN SHEHIN HAIDER\tPri=0\tPasswd=\tCard=\tGrp=1\t"
+            "TZ=0000000100000000\tVerify=0\tViceCard=\tStartDatetime=0\tEndDatetime=0\n"
+            "USER PIN=26SGC00322\tName=DR SHAMINAS ACHAN KANDI\tPri=0\tPasswd=\tCard=\tGrp=1\t"
+            "TZ=0000000100000000\tVerify=0\tViceCard=\tStartDatetime=0\tEndDatetime=0\n"
+            "USER PIN=1\tName=Admin\tPri=14\tPasswd=1234\tCard=7495825\tGrp=1\t"
+            "TZ=0000000100000000\tVerify=0\tViceCard=\tStartDatetime=0\tEndDatetime=0\n"
+        )
+        self.client.post(f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG&Stamp=9999", content=body)
+        response = self.client.post(
+            f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG&Stamp=9999",
+            content=f"FP PIN=036\tFID=6\tSize={len(tmp)}\tValid=1\tTMP={tmp}\n",
+        )
+        self.assertEqual(response.text, "OK")
+
+        people = self.employees()
+        self.assertEqual(set(people), {"036", "0036", "26SGC00322", "1"})
+        self.assertEqual(people["036"].name, "BASILA SHERIN SHEHIN HA")
+        self.assertEqual(people["0036"].name, "BASILA SHERIN SHEHIN HAIDER")
+        self.assertEqual(people["1"].privilege, 14)
+        self.assertEqual(people["1"].card, "7495825")
+
+        db = self.Session()
+        try:
+            links = {link.user_id for link in db.query(DeviceEmployee).filter_by(device_sn=LEGACY_SN)}
+            fingers = db.query(FingerprintTemplate).all()
+        finally:
+            db.close()
+        self.assertEqual(links, {"036", "0036", "26SGC00322", "1"})
+        self.assertEqual(len(fingers), 1)
+        self.assertEqual((fingers[0].user_id, fingers[0].finger_id, fingers[0].valid),
+                         ("036", 6, 1))
+        self.assertEqual(bytes.fromhex(fingers[0].template), raw_template)
+        self.assertEqual(fingers[0].source_device_sn, LEGACY_SN)
+
+    def test_operlog_fingerprint_reupload_replaces_and_a_bad_one_spares_the_rest(self):
+        from app.models import FingerprintTemplate
+
+        self.add_device(LEGACY_SN)
+        first = base64.b64encode(b"first template").decode()
+        second = base64.b64encode(b"second template").decode()
+        self.client.post(f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG",
+                         content=f"FP PIN=080\tFID=5\tSize={len(first)}\tValid=1\tTMP={first}\n")
+        response = self.client.post(
+            f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG",
+            content=(f"FP PIN=080\tFID=5\tSize={len(second)}\tValid=1\tTMP={second}\n"
+                     "FP PIN=081\tFID=5\tSize=4\tValid=1\tTMP=not*base64\n"
+                     "OPLOG 4\t0\t2026-10-19 07:27:05\t0\t0\t0\t0\n"),
+        )
+        self.assertEqual(response.text, "OK")
+
+        db = self.Session()
+        try:
+            fingers = db.query(FingerprintTemplate).all()
+        finally:
+            db.close()
+        self.assertEqual(len(fingers), 1)
+        self.assertEqual(bytes.fromhex(fingers[0].template), b"second template")
+
     def test_attlog_push_demotes_a_stale_acc_classification(self):
         """A terminal converted back to T&A mode recovers on its own."""
         self.add_device(LEGACY_SN, protocol="acc")
@@ -8097,6 +8177,8 @@ class AckSemanticsFieldEvidenceTests(QueryDataTestCase):
 CONFIRMED_USER_QUERY = "DATA QUERY tablename=user,fielddesc=*,filter=*"
 CONFIRMED_PHOTO_QUERY = "DATA QUERY tablename=biophoto,fielddesc=*,filter=Type=9"
 CONFIRMED_TEMPLATE_QUERY = "DATA QUERY tablename=biodata,fielddesc=*,filter=type=9"
+# The att query, as BioPro SA20 CPV2232560497 answered it on 2026-10-19.
+CONFIRMED_ATT_USER_QUERY = "DATA QUERY USERINFO"
 
 
 class PullRoutingTestCase(ProvisioningTestCase):
@@ -8128,22 +8210,14 @@ class PullRoutingTestCase(ProvisioningTestCase):
         def _record(name):
             def _fn(*args, **kwargs):
                 calls.append((name, args, kwargs))
-                raise AssertionError(f"{name} was called on an acc device")
+                raise AssertionError(f"{name} was called by a Sync that should queue")
             return _fn
 
         patches = [
             mock.patch(f"app.routers.devices.{name}", _record(name))
-            for name in ("pull_device", "pull_employees", "pull_attendance",
-                         "device_connection")
+            for name in ("pull_attendance", "device_connection")
         ]
         return patches, calls
-
-
-class EmptyTemplateConnection(FakeConnection):
-    """A terminal the SDK can read that simply holds no templates."""
-
-    def get_templates(self):
-        return []
 
 
 class PullCommandShapeTests(PullRoutingTestCase):
@@ -8269,7 +8343,7 @@ class PullHonestyTests(PullRoutingTestCase):
 
 
 class PullTransportRoutingTests(PullRoutingTestCase):
-    """acc goes to the outbox, att goes to the SDK, never both."""
+    """Every Sync but attendance goes to the outbox, on both protocols."""
 
     def test_an_acc_sync_never_opens_a_socket(self):
         patches, calls = self.no_sdk()
@@ -8284,82 +8358,49 @@ class PullTransportRoutingTests(PullRoutingTestCase):
 
         self.assertEqual(calls, [])
 
-    def test_an_att_sync_uses_the_sdk_and_leaves_the_outbox_empty(self):
+    def test_an_att_sync_queues_the_userinfo_query_and_never_opens_a_socket(self):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        for action in (self.sync_employees, self.sync_templates, self.sync_all):
+            with self.subTest(action=action.__name__):
+                response = action(self.ATT_SN)
+                self.assertEqual(response.status_code, 202, response.text)
+                self.assertEqual(response.json()["commands"], [CONFIRMED_ATT_USER_QUERY])
+
+        self.assertEqual(calls, [])
+        # One question, asked once: the second and third clicks reuse it.
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [CONFIRMED_ATT_USER_QUERY])
+
+    def test_att_sync_attendance_still_reaches_the_poller(self):
         from unittest import mock
 
         seen = []
-        with mock.patch("app.routers.devices.pull_employees",
-                        lambda sn: seen.append(("employees", sn))):
-            response = self.sync_employees(self.ATT_SN)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(),
-                         {"message": "Employee sync started", "device": self.ATT_SN})
-        self.assertEqual(seen, [("employees", self.ATT_SN)])
-        self.assertEqual(self.outbox(), [])
-
-    def test_att_sync_all_and_attendance_still_reach_the_poller_unchanged(self):
-        from unittest import mock
-
-        seen = []
-        with mock.patch("app.routers.devices.pull_device",
-                        lambda sn: seen.append(("all", sn))), \
-             mock.patch("app.routers.devices.pull_attendance",
+        with mock.patch("app.routers.devices.pull_attendance",
                         lambda sn: seen.append(("attendance", sn))):
-            self.assertEqual(self.sync_all(self.ATT_SN).status_code, 200)
             self.assertEqual(self.sync_attendance(self.ATT_SN).status_code, 200)
 
-        self.assertEqual(seen, [("all", self.ATT_SN), ("attendance", self.ATT_SN)])
-        self.assertEqual(self.outbox(), [])
+        self.assertEqual(seen, [("attendance", self.ATT_SN)])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
 
-    def test_an_att_template_pull_still_reads_the_device_over_the_sdk(self):
-        from unittest import mock
-
-        class Finger:
-            uid, fid, valid = 5, 1, 1
-
-            def json_pack(self):
-                return {"template": "0a0b0c"}
-
-        class Conn(FakeConnection):
-            def get_templates(self):
-                return [Finger()]
-
-        conn = Conn(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.sync_templates(self.ATT_SN)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertEqual(len(body), 1)
-        # The `att` body shape is unchanged by E12: still FingerprintTemplateOut.
-        self.assertEqual(body[0]["user_id"], "9001")
-        self.assertEqual(body[0]["template"], "0a0b0c")
-        self.assertEqual(body[0]["source_device_sn"], self.ATT_SN)
-        self.assertEqual(self.outbox(), [])
-
-    def test_a_device_with_no_protocol_set_takes_the_sdk_path_for_every_action(self):
-        """Unclassified is not acc. An SDK pull to a device that cannot answer
-        fails loudly; queueing acc-shaped commands to an attendance terminal
-        would sit in the outbox looking healthy."""
+    def test_a_device_with_no_protocol_set_is_synced_as_att(self):
+        """The column defaults to att, so an unclassified device gets the att
+        query — never the acc one, which an attendance terminal refuses
+        with -1004."""
         from unittest import mock
 
         seen = []
-        with mock.patch("app.routers.devices.pull_device",
-                        lambda sn: seen.append("all")), \
-             mock.patch("app.routers.devices.pull_employees",
-                        lambda sn: seen.append("employees")), \
-             mock.patch("app.routers.devices.pull_attendance",
-                        lambda sn: seen.append("attendance")), \
-             mock.patch("app.routers.devices.device_connection",
-                        fake_sdk(EmptyTemplateConnection())):
-            self.assertEqual(self.sync_all(self.DEFAULT_SN).status_code, 200)
-            self.assertEqual(self.sync_employees(self.DEFAULT_SN).status_code, 200)
+        with mock.patch("app.routers.devices.pull_attendance",
+                        lambda sn: seen.append("attendance")):
+            self.assertEqual(self.sync_all(self.DEFAULT_SN).status_code, 202)
             self.assertEqual(self.sync_attendance(self.DEFAULT_SN).status_code, 200)
-            self.sync_templates(self.DEFAULT_SN)
 
-        self.assertEqual(sorted(seen), ["all", "attendance", "employees"])
-        self.assertEqual(self.outbox(), [])
+        self.assertEqual(seen, ["attendance"])
+        self.assertEqual([r.command for r in self.outbox(self.DEFAULT_SN)],
+                         [CONFIRMED_ATT_USER_QUERY])
 
     def test_approving_an_acc_terminal_queues_the_queries_instead_of_dialling(self):
         """The fifth caller of the SDK pull, and it had the same defect."""
@@ -8390,9 +8431,7 @@ class PullTransportRoutingTests(PullRoutingTestCase):
             [CONFIRMED_USER_QUERY, CONFIRMED_PHOTO_QUERY, CONFIRMED_TEMPLATE_QUERY],
         )
 
-    def test_approving_an_att_terminal_still_dials_it_and_queues_nothing(self):
-        from unittest import mock
-
+    def test_approving_an_att_terminal_queues_the_userinfo_query_instead_of_dialling(self):
         db = self.Session()
         try:
             db.add(Device(serial_number="E12NEWATT00001", ip_address="203.0.113.21",
@@ -8402,13 +8441,19 @@ class PullTransportRoutingTests(PullRoutingTestCase):
         finally:
             db.close()
 
-        seen = []
-        with mock.patch("app.routers.devices.pull_device", lambda sn: seen.append(sn)):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        try:
             response = self.client.post("/devices/E12NEWATT00001/approve")
+        finally:
+            for p in patches:
+                p.stop()
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(seen, ["E12NEWATT00001"])
-        self.assertEqual(self.outbox("E12NEWATT00001"), [])
+        self.assertEqual(calls, [])
+        self.assertEqual([r.command for r in self.outbox("E12NEWATT00001")],
+                         [CONFIRMED_ATT_USER_QUERY])
 
 
 class AttendancePullRefusalTests(PullRoutingTestCase):

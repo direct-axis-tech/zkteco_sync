@@ -387,3 +387,31 @@ def record_device_user(
     if emp is None:
         return None, None
     return emp, link_device_employee(db, device_sn, emp.user_id, uid)
+
+
+def record_device_fingerprint(db: Session, device_sn: str, user_id, finger_id,
+                              template_hex: str, *, valid=1):
+    """One fingerprint template, as reported by one device.
+
+    Keyed on ``(user_id, finger_id)`` like the ``fingerprint_templates`` unique
+    constraint, so a re-upload of the same finger replaces the row instead of
+    adding one. ``template_hex`` is the raw template, hex-encoded, the same
+    form pyzk's ``Finger.json_pack()`` stores, so a template read over push
+    can be written back over either transport.
+
+    Returns the row, or ``None`` if the record carried no usable ID or finger.
+    """
+    user_id = str(user_id).strip()[:_USER_ID_LIMIT] if user_id is not None else ""
+    fid = _int_or_none(finger_id)
+    if not user_id or fid is None or not template_hex:
+        return None
+
+    row = db.query(FingerprintTemplate).filter_by(user_id=user_id, finger_id=fid).first()
+    if row is None:
+        row = FingerprintTemplate(user_id=user_id, finger_id=fid)
+        db.add(row)
+    row.valid = _int_or_none(valid) if _int_or_none(valid) is not None else 1
+    row.template = template_hex
+    row.source_device_sn = device_sn
+    db.flush()
+    return row

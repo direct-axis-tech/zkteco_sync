@@ -25,6 +25,8 @@ instead of dropping it, and never filter records on a code we have not
 actually confirmed.
 """
 
+import base64
+import binascii
 import logging
 import re
 import secrets
@@ -474,15 +476,24 @@ async def adms_receive(
         return PlainTextResponse(content="OK")
 
     if name == "OPERLOG":
-        # Operation logs have never been parsed here and still are not; the
-        # reply is the same "OK" the legacy devices have always received.
-        # They are logged, though: an `att` terminal answers
-        # `DATA QUERY USERINFO` / `FINGERTMP` on this table (Attendance PUSH
-        # §11.5, §11.9 — confirmed on BioPro SA20 CPV2232560497, 2026-10-19),
-        # and until a parser exists the log is the only place that user list
-        # can be read.
+        # An `att` terminal answers `DATA QUERY USERINFO` on this table with
+        # `USER` and `FP` lines (Attendance PUSH §11.5, §11.9 — confirmed on
+        # BioPro SA20 CPV2232560497, 2026-10-19), and pushes new enrolments
+        # the same way. Those are stored; `OPLOG` operation records are only
+        # logged. The reply is the same "OK" the legacy devices have always
+        # received, whatever the parse made of the body.
         raw = await request.body()
-        _log_operlog(SN, raw.decode("utf-8", errors="ignore"))
+        body = raw.decode("utf-8", errors="ignore")
+        _log_operlog(SN, body)
+        try:
+            _store_operlog(db, SN, body)
+        except Exception:
+            log.exception(
+                "ADMS OPERLOG from %s could not be stored; acknowledging "
+                "anyway so the device does not retry forever", SN,
+            )
+            db.rollback()
+        _touch(db, device, request)
         return PlainTextResponse(content="OK")
 
     # --- Security PUSH tables (lowercase) ---------------------------------
@@ -600,14 +611,19 @@ def _log_bulk_payload(source: str, sn: str, tablename: str, count: str,
 # the reason one record can be kilobytes, so the log keeps only its length.
 _OPERLOG_BLOB_VALUE = re.compile(r"\b(tmp|content)=([^\t\r\n]*)", re.IGNORECASE)
 
+# Credentials inside a `USER` line: the keypad password and the card numbers
+# that open the door. A journal is readable by more people than the device
+# menu, so a set value is logged only as being set.
+_OPERLOG_SECRET_VALUE = re.compile(r"\b(passwd|card|vicecard)=([^\t\r\n]+)", re.IGNORECASE)
+
 
 def _log_operlog(sn: str, body: str) -> None:
     """Record one OPERLOG upload: a tally by record kind, then the lines.
 
     Each line opens with its kind and a space (`USER PIN=…`, `FP PIN=…`,
     `OPLOG …`). Blob values are shortened to their length, as `tabledata`
-    does for its blob tables, and the rest is kept up to
-    ``_TABLEDATA_LOG_LIMIT``.
+    does for its blob tables, credentials are hidden, and the rest is kept up
+    to ``_TABLEDATA_LOG_LIMIT``.
     """
     lines = [ln for ln in body.splitlines() if ln.strip()]
     kinds = {}
@@ -618,10 +634,92 @@ def _log_operlog(sn: str, body: str) -> None:
     shown = _OPERLOG_BLOB_VALUE.sub(
         lambda m: f"{m.group(1)}=<{len(m.group(2))} chars>", "\n".join(lines)
     )
+    shown = _OPERLOG_SECRET_VALUE.sub(lambda m: f"{m.group(1)}=<set>", shown)
     log.info(
         "ADMS OPERLOG from %s: %d record(s) (%s) body=%s",
         sn, len(lines), tally, _clip(shown, _TABLEDATA_LOG_LIMIT),
     )
+
+
+def _operlog_fields(rest: str) -> dict:
+    """``PIN=1⇥Name=x⇥…`` as a dict with lowercased keys.
+
+    The Attendance PUSH document spells these keys in mixed case (`PIN`,
+    `Name`, `Pri`, `FID`, `TMP`) and is not consistent about it across
+    record kinds, so they are matched case-insensitively. Values are kept
+    verbatim: a PIN's leading zeros are part of it (`036` and `0036` are two
+    people on the SA20).
+    """
+    fields = {}
+    for part in rest.split("\t"):
+        key, sep, value = part.partition("=")
+        if sep:
+            fields[key.strip().lower()] = value
+    return fields
+
+
+def _store_operlog(db: Session, sn: str, body: str) -> None:
+    """Store the people and fingerprints in one OPERLOG upload.
+
+    * ``USER PIN=…⇥Name=…⇥Pri=…⇥Passwd=…⇥Card=…⇥…`` — §11.5. Written through
+      ``employee_sync.record_device_user``, the writer every other transport
+      uses, so its "fill in, never empty out" rule holds here too.
+      ``Passwd``, ``Grp``, ``TZ``, ``Verify``, ``ViceCard`` and the validity
+      dates have nowhere to go in the schema and are dropped.
+    * ``FP PIN=…⇥FID=…⇥Size=…⇥Valid=…⇥TMP=<base64>`` — §11.9. The template is
+      decoded and stored hex-encoded, the form the SDK path stores.
+
+    Anything else — ``OPLOG`` operation records, or a kind not seen yet — is
+    left to the log line. One unreadable record is skipped and logged, never
+    allowed to cost the rest of the batch.
+    """
+    users = fingers = skipped = 0
+
+    for line in body.splitlines():
+        line = line.strip()
+        kind, _, rest = line.partition(" ")
+        if kind not in ("USER", "FP"):
+            continue
+
+        fields = _operlog_fields(rest)
+        pin = fields.get("pin", "").strip()
+        if not _is_person(pin):
+            log.warning("ADMS OPERLOG from %s: skipping %s record with no usable PIN", sn, kind)
+            skipped += 1
+            continue
+
+        if kind == "USER":
+            employee_sync.record_device_user(
+                db, sn, pin,
+                name=fields.get("name"),
+                privilege=fields.get("pri"),
+                card=fields.get("card"),
+            )
+            users += 1
+            continue
+
+        try:
+            template = base64.b64decode(fields.get("tmp", ""), validate=True)
+        except (binascii.Error, ValueError):
+            template = b""
+        stored = template and employee_sync.record_device_fingerprint(
+            db, sn, pin, fields.get("fid"), template.hex(), valid=fields.get("valid"),
+        )
+        if stored:
+            fingers += 1
+        else:
+            log.warning(
+                "ADMS OPERLOG from %s: skipping FP record for PIN %s finger %r — "
+                "no readable template", sn, pin, fields.get("fid"),
+            )
+            skipped += 1
+
+    if users or fingers or skipped:
+        db.commit()
+        log.info(
+            "ADMS OPERLOG from %s: %d user(s), %d fingerprint(s) stored, "
+            "%d record(s) skipped", sn, users, fingers, skipped,
+        )
 
 
 def _store_bulk_table(db: Session, sn: str, tablename: str, body: str,

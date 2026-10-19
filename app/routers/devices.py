@@ -23,13 +23,13 @@ from app.schemas import (
     BulkPushRequest, CommandCreate, CommandLogOut, CommandOut, DeviceCreate,
     DeviceInfoOut, DeviceOut,
     DeviceProtocolUpdate, DeviceTimezoneUpdate, DeviceUpdate, EnrollRequest,
-    FingerprintTemplateOut, LcdRequest, PairingOpenRequest, PairingWindowOut,
+    LcdRequest, PairingOpenRequest, PairingWindowOut,
     RevocationGroupOut, SetTimeRequest, UnlockRequest,
 )
 from app.services import (
     commands, devicecontrol, employee_sync, pairing, provisioning,
 )
-from app.services.poller import pull_attendance, pull_device, pull_employees
+from app.services.poller import pull_attendance
 from app.services.sdk import device_connection, enroll_user_task
 
 router = APIRouter(prefix="/devices", tags=["devices"], dependencies=[Depends(require_auth)])
@@ -374,7 +374,6 @@ def update_device_protocol(
 @router.post("/{sn}/approve", response_model=DeviceOut)
 def approve_device(
     sn: str,
-    background_tasks: BackgroundTasks,
     request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -395,11 +394,12 @@ def approve_device(
         # protocol for the same reason the Sync menu is (E12). This is the
         # fifth caller of the SDK pull and it had the same defect: on an `acc`
         # terminal it dialled TCP 4370 and timed out, silently, in a
-        # background task nobody was watching.
+        # background task nobody was watching. An `att` terminal behind NAT
+        # timed out the same way, so it now gets its own query too.
         if _uses_command_queue(device):
             provisioning.query_everything(db, sn)
         else:
-            background_tasks.add_task(pull_device, sn)
+            provisioning.query_att_users(db, sn)
     return device
 
 
@@ -436,14 +436,20 @@ def delete_device(sn: str, request: Request, db: Session = Depends(get_db), admi
 # app/services/poller.py. On an `acc` terminal behind NAT that is a timeout,
 # which is exactly what the operator saw when they clicked Sync Employees.
 #
-#   att -> the SDK poller, unchanged, in a background task. It really does
-#          read the device, so it reports what it read.
-#   acc -> a `DATA QUERY` on the E7 outbox. **202 and the word "queued"**: the
-#          device collects it on its next poll (~10s) and answers by POSTing
-#          the table to /iclock/querydata, where E9 ingests it. Nothing has
-#          been read at the moment this returns, so nothing here says it has.
+#   acc -> a `DATA QUERY tablename=…` on the E7 outbox. **202 and the word
+#          "queued"**: the device collects it on its next poll (~10s) and
+#          answers by POSTing the table to /iclock/querydata, where E9
+#          ingests it. Nothing has been read at the moment this returns, so
+#          nothing here says it has.
+#   att -> `DATA QUERY USERINFO` on the same outbox, also 202. The device
+#          answers with `USER` and `FP` lines on cdata?table=OPERLOG, which
+#          adms._store_operlog ingests. Until 2026-10-19 this dialled TCP 4370,
+#          which reaches a LAN terminal and never one behind NAT; the push
+#          channel reaches both. Attendance is the exception, below.
 #
 # Attendance has no `acc` branch on purpose — see provisioning.NO_ATTENDANCE_QUERY.
+# On `att` it still reads the device over the SDK: punches arrive as ATTLOG
+# pushes anyway, and the documented `DATA QUERY ATTLOG` has not been tried.
 
 def _queued_query_response(sn: str, rows, created: int, response: Response,
                            what: str, extra: str = "") -> dict:
@@ -472,14 +478,16 @@ def _queued_query_response(sn: str, rows, created: int, response: Response,
 
 
 @router.post("/{sn}/pull", dependencies=[Depends(require_admin)])
-def trigger_pull(sn: str, background_tasks: BackgroundTasks, response: Response,
-                 db: Session = Depends(get_db)):
+def trigger_pull(sn: str, response: Response, db: Session = Depends(get_db)):
     """Sync everything this device can be asked for.
 
     On `acc` that is three confirmed queries — users, photos, templates — and
     NOT attendance, which is not pulled from these terminals at all because it
     arrives on its own over the push channel. Three commands at one per poll
     is roughly thirty seconds and shows as three rows in Commands.
+
+    On `att` it is one query, which returns users and fingerprints together.
+    Attendance is not included there either: those punches arrive as ATTLOG.
     """
     device = _get_device_or_404(sn, db)
     if _uses_command_queue(device):
@@ -493,20 +501,24 @@ def trigger_pull(sn: str, background_tasks: BackgroundTasks, response: Response,
         # which is what the UI shows in a toast.
         body["attendance"] = provisioning.NO_ATTENDANCE_QUERY
         return body
-    background_tasks.add_task(pull_device, sn)
-    return {"message": "Pull started", "device": sn}
+    row, created = provisioning.query_att_users(db, sn)
+    return _queued_query_response(
+        sn, [row], int(created), response, "its people and fingerprints",
+        extra=" Attendance is not included — this terminal pushes punches up "
+              "by itself.",
+    )
 
 
 @router.post("/{sn}/pull/employees", dependencies=[Depends(require_admin)])
-def trigger_pull_employees(sn: str, background_tasks: BackgroundTasks, response: Response,
-                           db: Session = Depends(get_db)):
+def trigger_pull_employees(sn: str, response: Response, db: Session = Depends(get_db)):
     """Read the device's user table into `employees`."""
     device = _get_device_or_404(sn, db)
     if _uses_command_queue(device):
         row, created = provisioning.query_users(db, sn)
         return _queued_query_response(sn, [row], int(created), response, "its user table")
-    background_tasks.add_task(pull_employees, sn)
-    return {"message": "Employee sync started", "device": sn}
+    row, created = provisioning.query_att_users(db, sn)
+    return _queued_query_response(sn, [row], int(created), response,
+                                  "its user table (fingerprints come with it)")
 
 
 @router.post("/{sn}/pull/attendance", dependencies=[Depends(require_admin)])
@@ -1691,10 +1703,13 @@ def clear_device_attendance(
 
 @router.post("/{sn}/templates/pull", response_model=None, dependencies=[Depends(require_admin)])
 def pull_templates(sn: str, response: Response, db: Session = Depends(get_db)):
-    """Read the biometrics a device holds. Two transports, as everywhere else.
+    """Read the biometrics a device holds. Both transports queue a query.
 
-    * `att` — the SDK reads templates over TCP 4370 now and saves them to
-      `fingerprint_templates`. 200, and the list it read, exactly as before.
+    * `att` — `DATA QUERY USERINFO`, the same command Sync sends: the
+      terminal answers with its users and their fingerprints on
+      cdata?table=OPERLOG, and adms._store_operlog writes
+      `fingerprint_templates`. There is no fingerprint-only query that works
+      without a PIN, so the users come along.
     * `acc` — ONE `DATA QUERY tablename=biodata` on the outbox. **202,
       `status: "queued"`** — the device answers on /iclock/querydata a poll
       later and E9 writes `biometric_templates`.
@@ -1711,45 +1726,9 @@ def pull_templates(sn: str, response: Response, db: Session = Depends(get_db)):
         return _queued_query_response(sn, [row], int(created), response,
                                       "its biometric templates")
 
-    try:
-        with device_connection(device) as conn:
-            users = conn.get_users()
-            uid_map = {u.uid: u.user_id for u in users}
-            fingers = conn.get_templates()
-
-            result = []
-            for finger in fingers:
-                user_id = uid_map.get(finger.uid)
-                if not user_id:
-                    continue
-                packed = finger.json_pack()
-                ft = db.query(FingerprintTemplate).filter_by(
-                    user_id=user_id, finger_id=finger.fid
-                ).first()
-                if ft:
-                    ft.valid = finger.valid
-                    ft.template = packed["template"]
-                    ft.source_device_sn = sn
-                else:
-                    ft = FingerprintTemplate(
-                        user_id=user_id,
-                        finger_id=finger.fid,
-                        valid=finger.valid,
-                        template=packed["template"],
-                        source_device_sn=sn,
-                    )
-                    db.add(ft)
-                result.append(ft)
-
-            db.commit()
-            for r in result:
-                db.refresh(r)
-            # Serialised here rather than by `response_model`, which this
-            # endpoint gave up when it grew a second transport that answers
-            # with a queue receipt. The `att` body is unchanged.
-            return [FingerprintTemplateOut.model_validate(r) for r in result]
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+    row, created = provisioning.query_att_users(db, sn)
+    return _queued_query_response(sn, [row], int(created), response,
+                                  "its fingerprints (and the users they belong to)")
 
 
 def _queue_templates_to_device(sn, user_id, request, response, db, admin):
