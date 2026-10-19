@@ -991,6 +991,17 @@ NO_ATTENDANCE_QUERY = (
 # not asked for either: these terminals push every punch as ATTLOG.
 QUERY_ATT_USERS = "DATA QUERY USERINFO"
 
+# Every punch an `att` terminal still holds (§12.1.3). The device re-uploads
+# them as ordinary `cdata?table=ATTLOG` pushes, which `_store_attlog` already
+# stores and de-duplicates on (device, user, timestamp), so asking again is
+# harmless. Live pushes alone are not enough: the SA20 reported 62,501 stored
+# records but only uploads what is punched after it is pointed here. The range
+# is wide on purpose — the times are the device's wall clock, so a range that
+# covers every year needs no timezone arithmetic. The separator is a TAB.
+QUERY_ATT_ATTENDANCE = (
+    "DATA QUERY ATTLOG StartTime=2000-01-01 00:00:00\tEndTime=2099-12-31 23:59:59"
+)
+
 
 def queue_query(db: Session, device_sn: str, command: str) -> tuple:
     """Queue one ``DATA QUERY``, reusing an identical one already outstanding.
@@ -1041,6 +1052,11 @@ def query_templates(db: Session, device_sn: str) -> tuple:
 def query_att_users(db: Session, device_sn: str) -> tuple:
     """Ask an `att` terminal for its users and fingerprints — one query."""
     return queue_query(db, device_sn, QUERY_ATT_USERS)
+
+
+def query_att_attendance(db: Session, device_sn: str) -> tuple:
+    """Ask an `att` terminal to re-upload every punch it holds."""
+    return queue_query(db, device_sn, QUERY_ATT_ATTENDANCE)
 
 
 def query_everything(db: Session, device_sn: str) -> tuple:

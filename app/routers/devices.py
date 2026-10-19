@@ -29,7 +29,6 @@ from app.schemas import (
 from app.services import (
     commands, devicecontrol, employee_sync, pairing, provisioning,
 )
-from app.services.poller import pull_attendance
 from app.services.sdk import device_connection, enroll_user_task
 
 router = APIRouter(prefix="/devices", tags=["devices"], dependencies=[Depends(require_auth)])
@@ -445,11 +444,10 @@ def delete_device(sn: str, request: Request, db: Session = Depends(get_db), admi
 #          answers with `USER` and `FP` lines on cdata?table=OPERLOG, which
 #          adms._store_operlog ingests. Until 2026-10-19 this dialled TCP 4370,
 #          which reaches a LAN terminal and never one behind NAT; the push
-#          channel reaches both. Attendance is the exception, below.
+#          channel reaches both.
 #
 # Attendance has no `acc` branch on purpose — see provisioning.NO_ATTENDANCE_QUERY.
-# On `att` it still reads the device over the SDK: punches arrive as ATTLOG
-# pushes anyway, and the documented `DATA QUERY ATTLOG` has not been tried.
+# On `att` it is `DATA QUERY ATTLOG` over every date, answered as ATTLOG pushes.
 
 def _queued_query_response(sn: str, rows, created: int, response: Response,
                            what: str, extra: str = "") -> dict:
@@ -487,7 +485,8 @@ def trigger_pull(sn: str, response: Response, db: Session = Depends(get_db)):
     is roughly thirty seconds and shows as three rows in Commands.
 
     On `att` it is one query, which returns users and fingerprints together.
-    Attendance is not included there either: those punches arrive as ATTLOG.
+    Attendance is not included: re-sending every punch the terminal holds is
+    a heavier job, left to Sync Attendance.
     """
     device = _get_device_or_404(sn, db)
     if _uses_command_queue(device):
@@ -504,8 +503,8 @@ def trigger_pull(sn: str, response: Response, db: Session = Depends(get_db)):
     row, created = provisioning.query_att_users(db, sn)
     return _queued_query_response(
         sn, [row], int(created), response, "its people and fingerprints",
-        extra=" Attendance is not included — this terminal pushes punches up "
-              "by itself.",
+        extra=" Attendance is not included — use Sync Attendance to fetch the "
+              "punches this terminal already holds.",
     )
 
 
@@ -522,9 +521,13 @@ def trigger_pull_employees(sn: str, response: Response, db: Session = Depends(ge
 
 
 @router.post("/{sn}/pull/attendance", dependencies=[Depends(require_admin)])
-def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks,
-                            db: Session = Depends(get_db)):
-    """Read buffered punches off the device (`att` only).
+def trigger_pull_attendance(sn: str, response: Response, db: Session = Depends(get_db)):
+    """Have the device re-upload the punches it holds (`att` only).
+
+    On `att` this queues `DATA QUERY ATTLOG` over the whole range the
+    terminal could hold. It answers with ordinary ATTLOG pushes, which are
+    stored once each however often they arrive. Live pushes only carry new
+    punches, so this is how a terminal's history reaches the server.
 
     On an `acc` terminal this is REFUSED — 501 — and, as with the per-template
     delete E8 refused for the same kind of reason, the refusal is a finding
@@ -551,8 +554,12 @@ def trigger_pull_attendance(sn: str, background_tasks: BackgroundTasks,
                 "from this device appear in Attendance without any action here."
             ),
         )
-    background_tasks.add_task(pull_attendance, sn)
-    return {"message": "Attendance sync started", "device": sn}
+    row, created = provisioning.query_att_attendance(db, sn)
+    return _queued_query_response(
+        sn, [row], int(created), response, "every punch it holds",
+        extra=" A terminal with years of punches takes a few minutes to send "
+              "them all; ones already stored are not duplicated.",
+    )
 
 
 # ---------------------------------------------------------------------------

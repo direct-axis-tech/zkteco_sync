@@ -8198,6 +8198,10 @@ CONFIRMED_PHOTO_QUERY = "DATA QUERY tablename=biophoto,fielddesc=*,filter=Type=9
 CONFIRMED_TEMPLATE_QUERY = "DATA QUERY tablename=biodata,fielddesc=*,filter=type=9"
 # The att query, as BioPro SA20 CPV2232560497 answered it on 2026-10-19.
 CONFIRMED_ATT_USER_QUERY = "DATA QUERY USERINFO"
+# Attendance PUSH §12.1.3, every date, TAB-separated.
+SPEC_ATT_ATTENDANCE_QUERY = (
+    "DATA QUERY ATTLOG StartTime=2000-01-01 00:00:00\tEndTime=2099-12-31 23:59:59"
+)
 
 
 class PullRoutingTestCase(ProvisioningTestCase):
@@ -8234,7 +8238,7 @@ class PullRoutingTestCase(ProvisioningTestCase):
 
         patches = [
             mock.patch(f"app.routers.devices.{name}", _record(name))
-            for name in ("pull_attendance", "device_connection")
+            for name in ("device_connection",)
         ]
         return patches, calls
 
@@ -8394,32 +8398,35 @@ class PullTransportRoutingTests(PullRoutingTestCase):
         self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
                          [CONFIRMED_ATT_USER_QUERY])
 
-    def test_att_sync_attendance_still_reaches_the_poller(self):
-        from unittest import mock
+    def test_att_sync_attendance_queues_the_whole_attlog_range_and_never_dials(self):
+        patches, calls = self.no_sdk()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
 
-        seen = []
-        with mock.patch("app.routers.devices.pull_attendance",
-                        lambda sn: seen.append(("attendance", sn))):
-            self.assertEqual(self.sync_attendance(self.ATT_SN).status_code, 200)
+        response = self.sync_attendance(self.ATT_SN)
 
-        self.assertEqual(seen, [("attendance", self.ATT_SN)])
-        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(calls, [])
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_ATT_ATTENDANCE_QUERY])
+        self.assertIn("\t", self.outbox(self.ATT_SN)[0].command)
+
+    def test_att_sync_all_does_not_ask_for_the_attendance_history(self):
+        body = self.sync_all(self.ATT_SN).json()
+
+        self.assertEqual(body["commands"], [CONFIRMED_ATT_USER_QUERY])
+        self.assertIn("Sync Attendance", body["message"])
 
     def test_a_device_with_no_protocol_set_is_synced_as_att(self):
         """The column defaults to att, so an unclassified device gets the att
-        query — never the acc one, which an attendance terminal refuses
+        queries — never the acc ones, which an attendance terminal refuses
         with -1004."""
-        from unittest import mock
+        self.assertEqual(self.sync_all(self.DEFAULT_SN).status_code, 202)
+        self.assertEqual(self.sync_attendance(self.DEFAULT_SN).status_code, 202)
 
-        seen = []
-        with mock.patch("app.routers.devices.pull_attendance",
-                        lambda sn: seen.append("attendance")):
-            self.assertEqual(self.sync_all(self.DEFAULT_SN).status_code, 202)
-            self.assertEqual(self.sync_attendance(self.DEFAULT_SN).status_code, 200)
-
-        self.assertEqual(seen, ["attendance"])
         self.assertEqual([r.command for r in self.outbox(self.DEFAULT_SN)],
-                         [CONFIRMED_ATT_USER_QUERY])
+                         [CONFIRMED_ATT_USER_QUERY, SPEC_ATT_ATTENDANCE_QUERY])
 
     def test_approving_an_acc_terminal_queues_the_queries_instead_of_dialling(self):
         """The fifth caller of the SDK pull, and it had the same defect."""
