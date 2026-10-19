@@ -26,6 +26,7 @@ actually confirmed.
 """
 
 import logging
+import re
 import secrets
 import threading
 import time
@@ -475,6 +476,13 @@ async def adms_receive(
     if name == "OPERLOG":
         # Operation logs have never been parsed here and still are not; the
         # reply is the same "OK" the legacy devices have always received.
+        # They are logged, though: an `att` terminal answers
+        # `DATA QUERY USERINFO` / `FINGERTMP` on this table (Attendance PUSH
+        # §11.5, §11.9 — confirmed on BioPro SA20 CPV2232560497, 2026-10-19),
+        # and until a parser exists the log is the only place that user list
+        # can be read.
+        raw = await request.body()
+        _log_operlog(SN, raw.decode("utf-8", errors="ignore"))
         return PlainTextResponse(content="OK")
 
     # --- Security PUSH tables (lowercase) ---------------------------------
@@ -585,6 +593,35 @@ def _log_bulk_payload(source: str, sn: str, tablename: str, count: str,
             source, sn, tablename, count, _clip(body, _TABLEDATA_LOG_LIMIT),
         )
     return count
+
+
+# A template or photo value inside an OPERLOG line: `TMP=` on `FP`/`FACE`,
+# `Tmp=` on `FVEIN`/`BIODATA`, `Content=` on `USERPIC`/`BIOPHOTO`. Base64, and
+# the reason one record can be kilobytes, so the log keeps only its length.
+_OPERLOG_BLOB_VALUE = re.compile(r"\b(tmp|content)=([^\t\r\n]*)", re.IGNORECASE)
+
+
+def _log_operlog(sn: str, body: str) -> None:
+    """Record one OPERLOG upload: a tally by record kind, then the lines.
+
+    Each line opens with its kind and a space (`USER PIN=…`, `FP PIN=…`,
+    `OPLOG …`). Blob values are shortened to their length, as `tabledata`
+    does for its blob tables, and the rest is kept up to
+    ``_TABLEDATA_LOG_LIMIT``.
+    """
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    kinds = {}
+    for line in lines:
+        kind = line.split(" ", 1)[0]
+        kinds[kind] = kinds.get(kind, 0) + 1
+    tally = ", ".join(f"{kind}={n}" for kind, n in kinds.items()) or "empty"
+    shown = _OPERLOG_BLOB_VALUE.sub(
+        lambda m: f"{m.group(1)}=<{len(m.group(2))} chars>", "\n".join(lines)
+    )
+    log.info(
+        "ADMS OPERLOG from %s: %d record(s) (%s) body=%s",
+        sn, len(lines), tally, _clip(shown, _TABLEDATA_LOG_LIMIT),
+    )
 
 
 def _store_bulk_table(db: Session, sn: str, tablename: str, body: str,

@@ -293,6 +293,25 @@ class LegacyHandshakeRegressionTests(AdmsTestCase):
         self.assertEqual(response.text, "OK")
         self.assertEqual(self.attendance_rows(), [])
 
+    def test_operlog_user_list_reaches_the_log_with_templates_shortened(self):
+        """An att terminal's answer to DATA QUERY USERINFO is readable in the log."""
+        self.add_device(LEGACY_SN)
+        template = "QUJD" * 300
+        body = (
+            "USER PIN=080\tName=Test Person\tPri=0\tPasswd=\tCard=\tGrp=1\tTZ=0000000000000000\tVerify=0\n"
+            f"FP PIN=080\tFID=6\tSize=1200\tValid=1\tTMP={template}\n"
+        )
+        with self.assertLogs("app.routers.adms", level="INFO") as captured:
+            response = self.client.post(
+                f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG&Stamp=9999", content=body
+            )
+        self.assertEqual(response.text, "OK")
+        log = "\n".join(captured.output)
+        self.assertIn("2 record(s) (USER=1, FP=1)", log)
+        self.assertIn("USER PIN=080\tName=Test Person", log)
+        self.assertIn(f"TMP=<{len(template)} chars>", log)
+        self.assertNotIn(template, log)
+
     def test_attlog_push_demotes_a_stale_acc_classification(self):
         """A terminal converted back to T&A mode recovers on its own."""
         self.add_device(LEGACY_SN, protocol="acc")
