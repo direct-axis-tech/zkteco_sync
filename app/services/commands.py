@@ -152,6 +152,41 @@ def is_query(command_name: str) -> bool:
     return bool(_DATA_QUERY.match(command_name or ""))
 
 
+# `ENROLL_FP`, an attendance terminal's remote fingerprint enrolment (Attendance
+# PUSH 2.4.1 §12.6.1). Matches both the device's `CMD=ENROLL_FP` and the
+# command queued (`ENROLL_FP PIN=…⇥FID=…`).
+_ENROLMENT = re.compile(r"^\s*ENROLL_FP\b", re.IGNORECASE)
+
+# Appendix 1, "Enroll_FP/Enroll_BIO Error Code": the failures an enrolment
+# answers with, all POSITIVE. From the document; not yet observed on hardware.
+# Worded for the operator reading the command's history.
+ENROLMENT_REFUSALS = {
+    2: "the person already has a fingerprint on that finger at this terminal "
+       "(it is not overwritten; delete that finger first)",
+    4: "enrolment failed, usually poor-quality scans or three scans that did "
+       "not match",
+    5: "that fingerprint is already enrolled at this terminal",
+    6: "enrolment was cancelled at the terminal",
+    7: "the terminal was busy and could not enrol",
+}
+
+
+def is_enrolment(command_name: str) -> bool:
+    """True for an ``ENROLL_FP``, from either a ``CMD=`` field or a command."""
+    return bool(_ENROLMENT.match(command_name or ""))
+
+
+def refusal_meaning(return_code, command_name: str = ""):
+    """What a refusal code says, in words, where the document says it; else None.
+
+    Only an enrolment has documented meanings for its codes (Appendix 1's
+    ENROLL_FP list). For everything else the code is shown as the number it is.
+    """
+    if return_code is None or not is_enrolment(command_name):
+        return None
+    return ENROLMENT_REFUSALS.get(return_code)
+
+
 def verdict_for(return_code, command_name: str = "") -> str:
     """Read one ``Return=`` code. Returns SUCCESS, REFUSAL or UNREADABLE.
 
@@ -247,6 +282,17 @@ def verdict_for(return_code, command_name: str = "") -> str:
     ever answers a ``DATA DELETE`` with a count-like number, this rule reads it
     as UNREADABLE, the revocation is concluded unconfirmed, and ACCESS NOT
     REVOKED fires. Spurious, and the right way round.
+
+    ``ENROLL_FP``: some positive codes are documented refusals
+    ----------------------------------------------------------
+    An attendance terminal's remote enrolment (Attendance PUSH 2.4.1 §12.6.1)
+    answers ``0`` for an enrolled finger and a negative code like any other
+    command, and Appendix 1 adds failures of its own that are *positive*:
+    2, 4, 5, 6 and 7 (:data:`ENROLMENT_REFUSALS`). From the document; not yet
+    observed on hardware. Those five are REFUSAL, with the meaning
+    :func:`refusal_meaning` gives the history. Any other positive code on an
+    enrolment stays UNREADABLE, and no other command's positive codes are
+    touched: the list is the enrolment's, not a general one.
     """
     if return_code is None:
         return UNREADABLE
@@ -257,6 +303,8 @@ def verdict_for(return_code, command_name: str = "") -> str:
     if return_code == 0:
         return SUCCESS
     if return_code < 0:
+        return REFUSAL
+    if refusal_meaning(return_code, command_name):
         return REFUSAL
     return UNREADABLE
 
@@ -299,10 +347,12 @@ def history_detail(outcome: str, return_code=None, command: str = ""):
 
     Exists so an operator reading E10's history sees what the device actually
     told us. For a query that is a record count — and "no records matched" is
-    a real operational answer worth showing, not an absence.
+    a real operational answer worth showing, not an absence. For a refused
+    enrolment it is what the code means ("enrolment was cancelled at the
+    terminal"), which is what tells the operator whether to try again.
     """
     if outcome != "acknowledged":
-        return None
+        return refusal_meaning(return_code, command)
     count = record_count(return_code, command)
     if count is None:
         return None
@@ -657,6 +707,13 @@ def acknowledge(
     # null code rather than a synthetic zero, because now that `Return` on a
     # query is known to be a record count, storing 0 there would claim the
     # query matched nothing, which for a payload we just parsed is false.
+    #
+    # An enrolment is judged as one whatever its `CMD=` echo says: its
+    # positive refusal codes belong to the command, and the history reads
+    # them off the queued command text (history_verdict), so judging the ack
+    # by the same text keeps the outcome and the history's label in step.
+    if is_enrolment(row.command):
+        command_name = row.command
     verdict = known_verdict or verdict_for(return_code, command_name)
 
     if verdict == SUCCESS:
@@ -666,10 +723,14 @@ def acknowledge(
         return "acknowledged" if moved else "duplicate"
 
     if verdict == REFUSAL:
+        meaning = refusal_meaning(return_code, command_name)
         moved = conclude(
             db, row, "failed",
             return_code=return_code,
-            last_error=f"device refused the command with Return={return_code}",
+            last_error=(
+                f"device refused the command with Return={return_code}"
+                + (f": {meaning}" if meaning else "")
+            ),
         )
         if moved:
             log.warning(

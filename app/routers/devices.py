@@ -1241,15 +1241,16 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 #
 # Pushing people — one (push_user_to_device) or several (push_users_bulk) —
 # removing one (remove_user_from_device), pushing a person's fingerprints
-# (push_templates_to_device) and deleting one of them (delete_user_template)
-# no longer use the SDK for `att`: each person is one `DATA UPDATE USERINFO`
-# or `DATA DELETE USERINFO`, each finger one `DATA UPDATE FINGERTMP` or
-# `DATA DELETE FINGERTMP`, on the same outbox, with the same acknowledgement
-# rules, because an attendance terminal behind NAT can never be dialled (the
-# BioPro SA20 CPV2232560497 is one). Remote enrolment, attendance clear,
-# unlock, restart and device info still route `att` to the SDK until they
-# are moved too; clock, lock state and LCD message stay there for good,
-# having no attendance-mode command.
+# (push_templates_to_device), deleting one of them (delete_user_template) and
+# enrolling one at the terminal (enroll_user) no longer use the SDK for
+# `att`: each person is one `DATA UPDATE USERINFO` or `DATA DELETE USERINFO`,
+# each finger one `DATA UPDATE FINGERTMP`, `DATA DELETE FINGERTMP` or
+# `ENROLL_FP`, on the same outbox, with the same acknowledgement rules,
+# because an attendance terminal behind NAT can never be dialled (the BioPro
+# SA20 CPV2232560497 is one). Attendance clear, unlock, restart and device
+# info still route `att` to the SDK until they are moved too; clock, lock
+# state and LCD message stay there for good, having no attendance-mode
+# command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
@@ -1996,27 +1997,99 @@ def delete_user_template(
 # Live enrollment
 # ---------------------------------------------------------------------------
 
-@router.post("/{sn}/users/{user_id}/enroll", status_code=202, dependencies=[Depends(require_admin)])
+@router.post("/{sn}/users/{user_id}/enroll", status_code=202)
 def enroll_user(
     sn: str,
     user_id: str,
     payload: EnrollRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
+    response: Response,
     db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
 ):
+    """Have a terminal enrol one of this person's fingers, with them standing at it.
+
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — one `ENROLL_FP PIN=<pin><HT>FID=<n>
+      <HT>RETRY=3<HT>OVERWRITE=0` on the ADMS outbox
+      (provisioning.att_fingerprint_enrol_command, Attendance PUSH 2.4.1
+      §12.6.1). **202, `status: "queued"`**, the shape of every other queued
+      reply. Until 2026-10-19 this dialled the SDK, TCP 4370, from a
+      background task that swallowed every error — which on a terminal behind
+      NAT meant a 202 for an enrolment that could never start.
+
+      The terminal opens its enrolment screen when it collects the command,
+      so the person has to be there then. A person the terminal has not
+      confirmed (no `device_employees` row) gets their USERINFO queued ahead
+      of it, because §12.6.1 enrols a PIN the terminal must already hold.
+      Nothing is written on the acknowledgement: a new finger reaches
+      `fingerprint_templates` when the terminal uploads it as an `FP` line on
+      OPERLOG (adms._store_operlog), the same as one enrolled at the keypad.
+      A refusal is recorded with what Appendix 1 says the code means
+      (commands.refusal_meaning): finger already there, scans failed,
+      fingerprint already in the database, cancelled, terminal busy.
+
+    * `acc` — unchanged: the SDK enrolment in the background
+      (sdk.enroll_user_task), for a person the terminal already holds.
     """
-    Trigger a live fingerprint enrollment on the device.
-    Returns immediately (202). The device will prompt the person to scan their
-    finger 3 times. Check DB templates after ~30s to confirm success.
-    The user must already exist on the device (call /push first).
-    """
-    _get_device_or_404(sn, db)
-    if not db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first():
-        raise HTTPException(status_code=404, detail="User not enrolled on this device — call /push first")
-    background_tasks.add_task(enroll_user_task, sn, user_id, payload.finger_id)
+    device = _get_device_or_404(sn, db)
+
+    if _uses_command_queue(device):
+        if not db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first():
+            raise HTTPException(status_code=404, detail="User not enrolled on this device — call /push first")
+        background_tasks.add_task(enroll_user_task, sn, user_id, payload.finger_id)
+        return {
+            "message": "Enrollment started — person must scan their finger on the device",
+            "device_sn": sn,
+            "user_id": user_id,
+            "finger_id": payload.finger_id,
+        }
+
+    finger_id = payload.finger_id
+    try:
+        provisioning.att_fingerprint_enrol_command(user_id, finger_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Same rule as every push: an enrolment behind an uncollected delete of
+    # the person would be undone by it, or ask the terminal to enrol somebody
+    # it is about to forget.
+    blocked = _revocation_block(db, sn, user_id)
+    if blocked:
+        raise blocked
+
+    already_there = provisioning.is_on_device(db, sn, user_id)
+    emp = None
+    if not already_there:
+        emp = db.query(Employee).filter_by(user_id=user_id).first()
+        if not emp:
+            # The terminal does not hold this person and there is no record
+            # here to put them there with.
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+    rows = provisioning.enrol_att_fingerprint(db, sn, user_id, finger_id, employee=emp)
+    audit.record(db, admin.username, "fingerprint_enrol",
+                 target=f"{sn}/{user_id}/{finger_id}", ip=client_ip(request),
+                 detail=f"queued={[r.id for r in rows]} user_record={not already_there}")
+    response.status_code = 202
     return {
-        "message": "Enrollment started — person must scan their finger on the device",
         "device_sn": sn,
         "user_id": user_id,
-        "finger_id": payload.finger_id,
+        "finger_id": finger_id,
+        "transport": "adms_queue",
+        "status": "queued",
+        "user_record_queued": not already_there,
+        "command_ids": [r.id for r in rows],
+        "commands": [r.command for r in rows],
+        "message": (
+            f"Queued the enrolment of finger {finger_id} for {user_id} at {sn}"
+            + (" behind the person's user record, which this terminal has not "
+               "confirmed yet" if not already_there else "")
+            + f" — nothing has started yet. The terminal opens its enrolment "
+            f"screen when it collects this, in about {len(rows) * 10} seconds; "
+            "the person must be standing at it then to press that finger. "
+            "Watch Commands for the outcome; the new fingerprint is stored "
+            "when the terminal uploads it."
+        ),
     }

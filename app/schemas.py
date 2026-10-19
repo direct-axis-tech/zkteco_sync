@@ -224,7 +224,9 @@ class CommandLogOut(BaseModel):
         For a ``DATA QUERY`` the ``Return`` code is a record count, not a
         status (E11, field-confirmed), so this is where that count is shown —
         including "no records matched", which is a real answer to a real query
-        and must not read as a failure.
+        and must not read as a failure. For a refused ``ENROLL_FP`` it is what
+        Appendix 1 says the code means ("enrolment was cancelled at the
+        terminal").
         """
         from app.services import commands
         return commands.history_detail(

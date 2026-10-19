@@ -7842,6 +7842,361 @@ class AttFingerprintDeleteTests(RevocationTestCase):
         self.assertEqual(self.stored_fingers(), [6])
 
 
+# ---------------------------------------------------------------------------
+# 20h. Enrolling a finger at an attendance terminal, started from here
+# ---------------------------------------------------------------------------
+#
+# `ENROLL_FP PIN=<s><HT>FID=<n><HT>RETRY=3<HT>OVERWRITE=0` (Attendance PUSH
+# 2.4.1 §12.6.1), queued behind the person's USERINFO when the terminal has not
+# confirmed them. The reply is `CMD=ENROLL_FP`; Appendix 1 gives its failures
+# 2, 4, 5, 6 and 7, all positive. The new template arrives on OPERLOG.
+
+ENROL_0036_FINGER_6 = "ENROLL_FP PIN=0036\tFID=6\tRETRY=3\tOVERWRITE=0"
+
+
+class AttFingerprintEnrolCommandShapeTests(unittest.TestCase):
+    """The literal bytes, against §12.6.1, with <HT> spelled as the tab it is::
+
+        ENROLL_FP PIN=<s><HT>FID=<n><HT>RETRY=<n><HT>OVERWRITE=<n>
+    """
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def test_the_enrolment_is_exactly_the_documented_shape(self):
+        """RETRY=3, the document's own example value (§12.6.2); OVERWRITE=0,
+        so a finger the terminal holds is never replaced in place."""
+        self.assertEqual(
+            self.provisioning.att_fingerprint_enrol_command("0036", 6),
+            ENROL_0036_FINGER_6,
+        )
+
+    def test_finger_zero_is_sent_as_a_fid(self):
+        self.assertEqual(
+            self.provisioning.att_fingerprint_enrol_command("9001", 0),
+            "ENROLL_FP PIN=9001\tFID=0\tRETRY=3\tOVERWRITE=0",
+        )
+
+    def test_a_finger_outside_zero_to_nine_is_refused(self):
+        for finger_id in (-1, 10, None, True):
+            with self.assertRaises(ValueError, msg=finger_id):
+                self.provisioning.att_fingerprint_enrol_command("9001", finger_id)
+
+    def test_a_pin_that_is_empty_once_made_wire_safe_is_refused(self):
+        for pin in ("", "\t", None):
+            with self.assertRaises(ValueError, msg=repr(pin)):
+                self.provisioning.att_fingerprint_enrol_command(pin, 1)
+
+    def test_a_tab_in_the_pin_cannot_invent_a_field(self):
+        command = self.provisioning.att_fingerprint_enrol_command("90\t01", 1)
+        self.assertEqual(command.count("\t"), 3)
+        self.assertTrue(command.startswith("ENROLL_FP PIN=90 01\tFID=1\t"))
+
+    def test_its_pin_is_read_back_for_withdrawal(self):
+        command = self.provisioning.att_fingerprint_enrol_command("0036", 6)
+        self.assertEqual(self.provisioning.pin_from_enrolment_command(command), "0036")
+
+    def test_it_is_not_read_as_a_person_or_a_revocation(self):
+        """No link written on its ack, no revocation group, no short backoff."""
+        from app.services import commands
+        command = self.provisioning.att_fingerprint_enrol_command("0036", 6)
+        self.assertIsNone(self.provisioning.pin_from_user_command(command))
+        self.assertFalse(self.provisioning.is_revocation_command(command))
+        self.assertFalse(commands.is_revocation(command))
+
+
+class EnrolmentVerdictTests(unittest.TestCase):
+    """commands.verdict_for on Appendix 1's ENROLL_FP codes, from either the
+    device's `CMD=ENROLL_FP` echo or the queued command text."""
+
+    def setUp(self):
+        from app.services import commands
+        self.commands = commands
+
+    def refused_with(self, code, meaning):
+        """Refusal by verdict_for, label and detail alike, from both names."""
+        for name in ("ENROLL_FP", ENROL_0036_FINGER_6):
+            with self.subTest(name=name):
+                self.assertEqual(self.commands.verdict_for(code, name),
+                                 self.commands.REFUSAL)
+                self.assertEqual(
+                    self.commands.history_verdict("failed", code, None, name),
+                    "refused")
+                self.assertIn(meaning,
+                              self.commands.history_detail("failed", code, name))
+
+    def test_return_zero_is_an_enrolled_finger(self):
+        self.assertEqual(self.commands.verdict_for(0, "ENROLL_FP"),
+                         self.commands.SUCCESS)
+
+    def test_2_is_refused_as_a_finger_already_there(self):
+        self.refused_with(2, "already has a fingerprint on that finger")
+
+    def test_4_is_refused_as_failed_scans(self):
+        self.refused_with(4, "enrolment failed")
+
+    def test_5_is_refused_as_a_fingerprint_already_in_the_database(self):
+        self.refused_with(5, "already enrolled at this terminal")
+
+    def test_6_is_refused_as_cancelled(self):
+        self.refused_with(6, "cancelled at the terminal")
+
+    def test_7_is_refused_as_a_busy_terminal(self):
+        self.refused_with(7, "busy")
+
+    def test_a_negative_code_is_a_refusal_with_no_invented_meaning(self):
+        self.assertEqual(self.commands.verdict_for(-1, "ENROLL_FP"),
+                         self.commands.REFUSAL)
+        self.assertIsNone(self.commands.history_detail("failed", -1, "ENROLL_FP"))
+
+    def test_an_undocumented_positive_code_stays_unconfirmed(self):
+        for code in (1, 3, 8):
+            with self.subTest(code=code):
+                self.assertEqual(self.commands.verdict_for(code, "ENROLL_FP"),
+                                 self.commands.UNREADABLE)
+
+    def test_the_same_codes_on_any_other_command_are_still_unconfirmed(self):
+        for name in ("DATA", "DATA UPDATE", "DATA DELETE USERINFO PIN=1",
+                     "ENROLL_MF", "REBOOT"):
+            for code in (2, 4, 5, 6, 7):
+                with self.subTest(name=name, code=code):
+                    self.assertEqual(self.commands.verdict_for(code, name),
+                                     self.commands.UNREADABLE)
+                    self.assertIsNone(
+                        self.commands.history_detail("failed", code, name))
+
+
+class AttFingerprintEnrolTests(RevocationTestCase):
+    """The endpoint on an attendance terminal, and the acc one left alone."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("0036", name="Basila Haider")
+
+    def enrol(self, sn=None, user_id="0036", finger_id=6):
+        return self.client.post(f"/devices/{sn or self.ATT_SN}/users/{user_id}/enroll",
+                                json={"finger_id": finger_id})
+
+    def deliver_and_ack(self, return_code, cmd="ENROLL_FP"):
+        command_id = self.outbox(self.ATT_SN)[-1].id
+        self.poll(self.ATT_SN)
+        self.ack(command_id, return_code=return_code, cmd=cmd, sn=self.ATT_SN)
+
+    def stored_fingers(self, user_id="0036"):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            return sorted(r.finger_id for r in
+                          db.query(FingerprintTemplate).filter_by(user_id=user_id))
+        finally:
+            db.close()
+
+    def tripwires(self):
+        """`device_connection` and `enroll_user_task`, both of which dial."""
+        from unittest import mock
+
+        def _dial(*args, **kwargs):
+            raise AssertionError("an att enrolment dialled the SDK")
+
+        task = mock.Mock()
+        return [mock.patch("app.routers.devices.device_connection", _dial),
+                mock.patch("app.routers.devices.enroll_user_task", task)], task
+
+    # -- routing -------------------------------------------------------------
+
+    def test_an_att_device_queues_the_exact_enrolment_and_never_opens_a_socket(self):
+        """Until 2026-10-19 this dialled TCP 4370 from a background task,
+        which never reaches a terminal behind NAT."""
+        self.link(self.ATT_SN, "0036")
+        patches, task = self.tripwires()
+        for p in patches:
+            p.start()
+        try:
+            response = self.enrol()
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(response.status_code, 202, response.text)
+        task.assert_not_called()
+        self.assertEqual(self.commands_on(self.ATT_SN), [ENROL_0036_FINGER_6])
+
+    def test_the_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.link(self.ATT_SN, "0036")
+        self.enrol()
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         f"C:{command_id}:{ENROL_0036_FINGER_6}".encode())
+
+    def test_an_unclassified_device_is_enrolled_at_as_an_attendance_terminal(self):
+        self.link(self.DEFAULT_SN, "0036")
+        response = self.enrol(sn=self.DEFAULT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.commands_on(self.DEFAULT_SN), [ENROL_0036_FINGER_6])
+
+    def test_the_response_says_queued_the_way_the_other_queued_replies_do(self):
+        """Employees.jsx awaits the call and toasts its own text on any 2xx."""
+        self.link(self.ATT_SN, "0036")
+        response = self.enrol()
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["finger_id"], 6)
+        self.assertFalse(body["user_record_queued"])
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+        self.assertEqual(body["commands"], [ENROL_0036_FINGER_6])
+        self.assertIn("nothing has started yet", body["message"])
+        self.assertIn("must be standing at it", body["message"])
+
+    def test_a_finger_outside_zero_to_nine_is_a_422_and_queues_nothing(self):
+        self.link(self.ATT_SN, "0036")
+        response = self.enrol(finger_id=10)
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_acc_device_still_enrols_over_the_sdk_and_queues_nothing(self):
+        self.link(self.SN, "0036")
+        patches, task = self.tripwires()
+        for p in patches:
+            p.start()
+        try:
+            response = self.enrol(sn=self.SN)
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(response.status_code, 202, response.text)
+        task.assert_called_once_with(self.SN, "0036", 6)
+        self.assertNotIn("transport", response.json())
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_acc_device_without_the_person_is_still_a_404(self):
+        response = self.enrol(sn=self.SN)
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(self.outbox(), [])
+
+    # -- the person first ----------------------------------------------------
+
+    def test_a_person_the_terminal_has_not_confirmed_gets_their_user_record_first(self):
+        """§12.6.1 enrols a PIN the terminal holds; Appendix 1's -10 is the
+        answer for one it does not."""
+        response = self.enrol()
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertTrue(response.json()["user_record_queued"])
+        self.assertEqual(
+            [c.split("\t")[0] for c in self.commands_on(self.ATT_SN)],
+            ["DATA UPDATE USERINFO PIN=0036", "ENROLL_FP PIN=0036"],
+        )
+
+    def test_the_user_record_is_delivered_before_the_enrolment(self):
+        self.enrol()
+        user_record, enrolment = self.outbox(self.ATT_SN)
+
+        self.assertTrue(self.poll(self.ATT_SN).startswith(f"C:{user_record.id}:DATA UPDATE USERINFO"))
+        self.ack(user_record.id, return_code=0, cmd="DATA", sn=self.ATT_SN)
+        self.assertEqual(self.poll(self.ATT_SN),
+                         f"C:{enrolment.id}:{ENROL_0036_FINGER_6}")
+
+    def test_a_refused_user_record_withdraws_the_enrolment_behind_it(self):
+        self.enrol()
+        user_record, enrolment = self.outbox(self.ATT_SN)
+        self.poll(self.ATT_SN)
+        self.ack(user_record.id, return_code=-1004, cmd="DATA", sn=self.ATT_SN)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        withdrawn = [r for r in self.history(self.ATT_SN) if r.command == ENROL_0036_FINGER_6]
+        self.assertEqual(len(withdrawn), 1)
+        self.assertIsNone(withdrawn[0].return_code)
+        self.assertIn("nobody there to enrol", withdrawn[0].last_error)
+
+    def test_a_person_with_no_record_here_and_not_on_the_terminal_is_a_404(self):
+        response = self.enrol(user_id="7777")
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_outstanding_revocation_refuses_it_and_queues_nothing(self):
+        self.link(self.ATT_SN, "0036")
+        self.revoke(self.ATT_SN, "0036")
+
+        response = self.enrol()
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.commands_on(self.ATT_SN), ["DATA DELETE USERINFO PIN=0036"])
+
+    def test_revoking_the_person_withdraws_a_queued_enrolment(self):
+        self.link(self.ATT_SN, "0036")
+        enrolment_id = self.enrol().json()["command_ids"][0]
+
+        response = self.revoke(self.ATT_SN, "0036")
+        self.assertEqual(response.json()["withdrawn_command_ids"], [enrolment_id])
+        self.assertEqual(self.commands_on(self.ATT_SN), ["DATA DELETE USERINFO PIN=0036"])
+
+    # -- the reply -------------------------------------------------------------
+
+    def test_return_zero_concludes_it_and_writes_nothing_by_itself(self):
+        """The enrolment's ack carries no template; the upload does."""
+        self.link(self.ATT_SN, "0036")
+        self.enrol()
+        self.deliver_and_ack(0)
+
+        self.assertEqual([(r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
+                         [("acknowledged", 0)])
+        self.assertEqual(self.stored_fingers(), [])
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["0036"])
+
+    def test_the_new_finger_is_stored_when_the_terminal_uploads_it(self):
+        """TransFlag digit 4, "Enrolling a new fingerprint": an `FP` line on
+        OPERLOG, filed by adms._store_operlog."""
+        self.link(self.ATT_SN, "0036")
+        self.enrol()
+        self.deliver_and_ack(0)
+        tmp = base64.b64encode(bytes(range(64))).decode()
+        self.client.post(
+            f"/iclock/cdata?SN={self.ATT_SN}&table=OPERLOG&Stamp=9999",
+            content=f"FP PIN=0036\tFID=6\tSize={len(tmp)}\tValid=1\tTMP={tmp}\n",
+        )
+
+        self.assertEqual(self.stored_fingers(), [6])
+
+    def test_a_cancelled_enrolment_is_refused_with_its_meaning_in_history(self):
+        self.link(self.ATT_SN, "0036")
+        self.enrol()
+        self.deliver_and_ack(6)
+
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual((row.outcome, row.return_code), ("failed", 6))
+        self.assertIn("cancelled at the terminal", row.last_error)
+        [listed] = self.client.get(f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual(listed["verdict"], "refused")
+        self.assertEqual(listed["verdict_detail"], "enrolment was cancelled at the terminal")
+
+    def test_a_refused_enrolment_is_not_offered_again(self):
+        self.link(self.ATT_SN, "0036")
+        self.enrol()
+        self.deliver_and_ack(4)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(self.poll(self.ATT_SN), "OK")
+
+    def test_a_documented_code_is_read_as_a_refusal_whatever_the_echo_says(self):
+        """Judged by the queued command, so the outcome and the history's label
+        agree even if the terminal's `CMD=` is not the documented one."""
+        self.link(self.ATT_SN, "0036")
+        self.enrol()
+        self.deliver_and_ack(7, cmd="")
+
+        [row] = self.history(self.ATT_SN)
+        self.assertIn("busy", row.last_error)
+        [listed] = self.client.get(f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual(listed["verdict"], "refused")
+
+
 class RevocationSingleWriterTests(RevocationTestCase):
     """`device_employees` has one creator and now one destroyer."""
 
@@ -10279,6 +10634,19 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
          "Attendance-protocol remote enrolment."),
     ]
 
+    # Markers now implemented for `att` terminals from the Attendance PUSH
+    # document, and the only modules allowed to hold them: where the command
+    # is built and where its reply is read. Anywhere else — devicecontrol.py,
+    # the acc module, above all — is still the mistake this guard exists for.
+    # That the built command reaches only an `att` terminal is pinned by its
+    # routing tests, not here.
+    ATTENDANCE_HOMES = {
+        # Built in provisioning.att_fingerprint_enrol_command (§12.6.1); its
+        # positive refusal codes read in commands.verdict_for (Appendix 1).
+        # Routing: AttFingerprintEnrolTests.
+        "ENROLL_FP": {"provisioning.py", "commands.py"},
+    }
+
     def string_literals(self, tree):
         """Every str constant in the module except its docstrings."""
         import ast
@@ -10305,6 +10673,8 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
         for path in sorted(root.rglob("*.py")):
             for literal in self.string_literals(ast.parse(path.read_text())):
                 for marker, why in self.FORBIDDEN:
+                    if path.name in self.ATTENDANCE_HOMES.get(marker, ()):
+                        continue
                     if marker in literal:
                         offenders.append(f"{path.name}: {marker!r} — {why}")
         self.assertEqual(offenders, [])

@@ -724,9 +724,13 @@ def withdraw_orphaned_templates(db: Session, device_sn: str = None) -> list:
         query = query.filter(DeviceCommandOutbox.device_sn == device_sn)
     outstanding = query.order_by(DeviceCommandOutbox.id).all()
 
+    # A remote enrolment (`ENROLL_FP`) is withdrawn on the same terms: it names
+    # a PIN the terminal must hold, and delivered behind a refused USERINFO it
+    # would open an enrolment screen for somebody the terminal does not have.
     templates = [
         (row, pin) for row, pin in
-        ((row, pin_from_template_command(row.command)) for row in outstanding)
+        ((row, pin_from_template_command(row.command)
+          or pin_from_enrolment_command(row.command)) for row in outstanding)
         if pin
     ]
     if not templates:
@@ -748,11 +752,14 @@ def withdraw_orphaned_templates(db: Session, device_sn: str = None) -> list:
             continue
 
         row_id, row_sn = row.id, row.device_sn
+        what = ("there was nobody there to enrol"
+                if pin_from_enrolment_command(row.command)
+                else "this template had nothing to attach to")
         if commands.conclude(
             db, row, "failed",
             last_error=(
                 f"withdrawn: {row_sn} has no confirmed user record for Pin={pin}, "
-                f"so this template had nothing to attach to"
+                f"so {what}"
             ),
         ):
             withdrawn.append(row_id)
@@ -1000,12 +1007,18 @@ def withdraw_pushes_for(db: Session, device_sn: str, user_id: str, reason: str) 
     and in the person's "not delivered" list rather than silently evaporating.
     Called *before* the deletes are queued, so the outbox never holds the
     contradiction at all.
+
+    A queued remote enrolment (`ENROLL_FP`) goes too. It is not a `DATA
+    UPDATE`, but it contradicts the delete the same way: delivered first, it
+    either has the person enrol a finger the delete then takes away, or opens
+    an enrolment screen at which nobody is standing.
     """
     withdrawn = []
     for row in db.query(DeviceCommandOutbox).filter(
         DeviceCommandOutbox.device_sn == device_sn
     ).order_by(DeviceCommandOutbox.id).all():
-        if pin_from_push_command(row.command) != str(user_id):
+        pin = pin_from_push_command(row.command) or pin_from_enrolment_command(row.command)
+        if pin != str(user_id):
             continue
         row_id, name = row.id, row.command.split("\t")[0]
         if commands.conclude(db, row, "failed", last_error=reason):
@@ -1372,6 +1385,124 @@ def note_fingerprint_delete_acknowledged(db: Session, device_sn: str, command: s
         "" if removed else " (no stored template for that finger to forget)",
     )
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Enrolling a finger at an attendance terminal, started from here
+# ---------------------------------------------------------------------------
+#
+# The one write in this module that carries no credential. `ENROLL_FP`
+# (Attendance PUSH 2.4.1 §12.6.1) tells the terminal to open its own
+# enrolment screen for one PIN and one finger; the person has to be standing
+# at it when it is collected and press that finger. The reply is a result and
+# nothing else (`ID=…&Return=…&CMD=ENROLL_FP`). The template itself comes up
+# the way every finger enrolled at that keypad does, as an `FP PIN=…⇥FID=…`
+# line on cdata?table=OPERLOG — the handshake's TransFlag=1111000000 has digit
+# 4, "Enrolling a new fingerprint", set — which adms._store_operlog files in
+# `fingerprint_templates`. So nothing is written on the acknowledgement: the
+# upload is the evidence, and it carries the bytes.
+#
+# Here rather than in devicecontrol.py because it is about a person, not the
+# device. It names a PIN the terminal must already hold (Appendix 1's -10,
+# "The user specified by PIN does not exist in the equipment"), so it is
+# queued behind the person's USERINFO when the terminal has not confirmed
+# them, withdrawn behind a refused one (:func:`withdraw_orphaned_templates`),
+# and withdrawn with the person's pushes when they are removed
+# (:func:`withdraw_pushes_for`) — all rules this module already keeps for a
+# FINGERTMP push.
+#
+# Its replies are judged in commands.verdict_for: Appendix 1 gives
+# ENROLL_FP failures that are POSITIVE (2, 4, 5, 6, 7), which no other
+# command here has.
+
+# §12.6.1: "RETRY: Number of retries required if enrollment fails". The value
+# §12.6.2 prints in its own example (`ENROLL_MF PIN=408\tRETRY=3`): a few
+# chances for a person with a hard-to-read finger, bounded so that a terminal
+# which collects the command when nobody is at it gives up and goes back to
+# taking attendance.
+ATT_ENROL_RETRY = 3
+
+# §12.6.1: "0 means the fingerprint of corresponding user exists and will not
+# be overwritten and error information is returned. 1 means … will be
+# overwritten." Never overwrite. A finger the terminal already holds is
+# answered with Appendix 1's 2 and the operator deletes it first (DATA DELETE
+# FINGERTMP, which also forgets the stored copy on its ack). Overwriting in
+# place would replace the finger as a *change*, not an enrolment — and the
+# handshake's TransFlag has digit 8, "Changing a fingerprint", at 0, so the
+# new template might never be uploaded, leaving `fingerprint_templates`
+# holding the old one to push to every other terminal.
+ATT_ENROL_OVERWRITE = 0
+
+
+def att_fingerprint_enrol_command(user_id, finger_id) -> str:
+    """`ENROLL_FP PIN=<s><HT>FID=<n><HT>RETRY=<n><HT>OVERWRITE=<n>` — start
+    enrolling one finger at an `att` terminal.
+
+    Attendance PUSH 2.4.1 §12.6.1, from the document; not yet observed on
+    hardware::
+
+        ENROLL_FP PIN=<s><HT>FID=<n><HT>RETRY=<n><HT>OVERWRITE=<n>
+
+    ``PIN`` goes out verbatim, as the string it is (`036` and `0036` are two
+    people on the SA20); an empty one names nobody and is refused. ``FID`` is
+    refused outside 0–9, the fingers §12.1.1.3 and §12.1.2.2 number — §12.6.1
+    gives no range of its own, and a finger this application cannot store or
+    push again is not one to enrol. ``RETRY`` and ``OVERWRITE`` are
+    :data:`ATT_ENROL_RETRY` and :data:`ATT_ENROL_OVERWRITE`.
+    """
+    pin = _wire_safe(user_id)
+    if not pin:
+        raise ValueError("no PIN; an enrolment has to name its person")
+    if isinstance(finger_id, bool) or finger_id not in ATT_FINGER_IDS:
+        raise ValueError(
+            f"finger {finger_id} is outside 0-9, the only fingers the "
+            f"Attendance PUSH document numbers; nothing was queued"
+        )
+    return (
+        "ENROLL_FP "
+        + HT.join([
+            f"PIN={pin}",
+            f"FID={int(finger_id)}",
+            f"RETRY={ATT_ENROL_RETRY}",
+            f"OVERWRITE={ATT_ENROL_OVERWRITE}",
+        ])
+    )
+
+
+_ENROLMENT_PIN = re.compile(r"^ENROLL_FP\s+PIN=([^\t]*)", re.IGNORECASE)
+
+
+def pin_from_enrolment_command(command: str):
+    """The PIN in an `ENROLL_FP` command, or None if it is not one."""
+    match = _ENROLMENT_PIN.match((command or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def enrol_att_fingerprint(db: Session, device_sn: str, user_id: str,
+                          finger_id: int, employee: Employee = None) -> list:
+    """Queue a remote enrolment of one finger at one `att` terminal. Returns
+    the outbox rows.
+
+    ``employee`` is passed when the terminal has not confirmed the person
+    (:func:`is_on_device`): their USERINFO (:func:`provision_att`) is queued
+    first, so the FIFO outbox hands the terminal the person before the
+    enrolment, as :func:`push_templates` does for a template. Raises
+    ValueError, queueing nothing, for what
+    :func:`att_fingerprint_enrol_command` refuses.
+    """
+    body = att_fingerprint_enrol_command(user_id, finger_id)
+    rows = provision_att(db, device_sn, employee) if employee is not None else []
+    rows.append(commands.queue(db, device_sn, body))
+    log.info(
+        "enrolling finger %s of %s at %s: queued command id(s) %s%s — the "
+        "person must be at the terminal when it collects it",
+        finger_id, user_id, device_sn, [r.id for r in rows],
+        " (behind the user record, which the device has not confirmed yet)"
+        if employee is not None else "",
+    )
+    return rows
 
 
 # ---------------------------------------------------------------------------
