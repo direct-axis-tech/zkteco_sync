@@ -9956,6 +9956,9 @@ SPEC_SET_TIME_INSTANT = datetime(2018, 2, 22, 14, 54, 54)
 # §12.1.2.5, verbatim: "Delete all the access control records:
 # C:123:DATA DELETE transaction *"
 SPEC_CLEAR_RECORDS = "DATA DELETE transaction *"
+# Attendance PUSH 2.4.1 §12.2.1, verbatim: "To clear the client attendance
+# record, the command format is: C:${CmdID}:CLEAR${SP}LOG"
+SPEC_CLEAR_LOG = "CLEAR LOG"
 
 
 class DeviceControlShapeTests(unittest.TestCase):
@@ -10019,6 +10022,11 @@ class DeviceControlShapeTests(unittest.TestCase):
 
     def test_the_clear_records_command_is_the_documented_shape(self):
         self.assertEqual(self.dc.CLEAR_RECORDS, SPEC_CLEAR_RECORDS)
+
+    def test_the_attendance_clear_command_is_the_documented_shape(self):
+        """One space between CLEAR and LOG, nothing after it: §12.2.1 takes
+        no parameters."""
+        self.assertEqual(self.dc.CLEAR_ATT_RECORDS, SPEC_CLEAR_LOG)
 
     def test_get_options_is_comma_separated_with_no_trailing_comma(self):
         """§12.5.2: "Multiple parameters are separated by commas, but the last
@@ -10280,17 +10288,6 @@ class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
         self.assertEqual([c[0] for c in conn.log], ["set_time"])
         self.assertEqual(self.outbox(self.ATT_SN), [])
 
-    def test_clear_attendance_on_an_att_device_still_answers_204(self):
-        from unittest import mock
-
-        conn = self.sdk(clear_attendance=None)
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.clear_attendance(self.ATT_SN)
-
-        self.assertEqual(response.status_code, 204, response.text)
-        self.assertEqual([c[0] for c in conn.log], ["clear_attendance"])
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-
     def test_the_lcd_actions_still_work_over_the_sdk(self):
         from unittest import mock
 
@@ -10314,6 +10311,148 @@ class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
 
         self.assertEqual(sorted(c[0] for c in conn.log), ["restart", "unlock"])
         self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+
+
+class AttAttendanceClearTests(DeviceControlRoutingTestCase):
+    """Clearing an attendance terminal's punches, over the queue.
+
+    Until 2026-10-19 the `att` branch dialled the SDK, TCP 4370, which never
+    reaches a terminal behind NAT. It now queues `CLEAR LOG` (Attendance PUSH
+    2.4.1 §12.2.1) and answers the way the `acc` branch always has.
+    """
+
+    def tripwire(self):
+        """`device_connection`, which must not be reached on any branch now."""
+        from unittest import mock
+
+        def _dial(*args, **kwargs):
+            raise AssertionError("clearing attendance dialled the SDK")
+
+        return mock.patch("app.routers.devices.device_connection", _dial)
+
+    def deliver_and_ack(self, return_code, sn=None):
+        serial = sn or self.ATT_SN
+        command_id = self.outbox(serial)[-1].id
+        self.poll(serial)
+        self.ack(command_id, return_code=return_code, cmd="CLEAR_LOG", sn=serial)
+
+    def add_punch(self, sn):
+        from app.models import AttendanceLog
+        db = self.Session()
+        try:
+            db.add(AttendanceLog(device_sn=sn, user_id="0036",
+                                 timestamp=datetime(2026, 10, 19, 8, 0),
+                                 status=0, source="adms_push"))
+            db.commit()
+        finally:
+            db.close()
+
+    def punches(self, sn):
+        from app.models import AttendanceLog
+        db = self.Session()
+        try:
+            return db.query(AttendanceLog).filter_by(device_sn=sn).count()
+        finally:
+            db.close()
+
+    def audit_rows(self, action):
+        from app.models import AuditLog
+        db = self.Session()
+        try:
+            return db.query(AuditLog).filter_by(action=action).all()
+        finally:
+            db.close()
+
+    # -- routing -------------------------------------------------------------
+
+    def test_an_att_device_queues_clear_log_and_never_opens_a_socket(self):
+        with self.tripwire():
+            response = self.clear_attendance(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_CLEAR_LOG])
+
+    def test_the_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.clear_attendance(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         f"C:{command_id}:CLEAR LOG".encode())
+
+    def test_an_unclassified_device_is_cleared_as_an_attendance_terminal(self):
+        with self.tripwire():
+            response = self.clear_attendance(self.DEFAULT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.DEFAULT_SN)],
+                         [SPEC_CLEAR_LOG])
+
+    def test_an_acc_device_still_queues_the_transaction_delete(self):
+        """The two protocols' clears are not interchangeable: an acc terminal
+        has no ATTLOG, an att one has no `transaction` table."""
+        self.clear_attendance(self.ATT_SN)
+        self.clear_attendance(self.SN)
+
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_CLEAR_RECORDS])
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_CLEAR_LOG])
+
+    def test_the_reply_has_the_queued_shape_the_acc_reply_has(self):
+        """Devices.jsx toasts `message`; everything else matches acc's so one
+        caller reads either."""
+        att = self.clear_attendance(self.ATT_SN)
+        acc = self.clear_attendance(self.SN)
+
+        self.assertEqual(att.status_code, acc.status_code)
+        body = att.json()
+        self.assertEqual(sorted(body), sorted(acc.json()))
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["command"], SPEC_CLEAR_LOG)
+        self.assertEqual(body["command_id"], self.outbox(self.ATT_SN)[0].id)
+        self.assertIn("Queued: clear the attendance records", body["message"])
+        self.assertIn("polls", body["message"])
+        self.assertIn("Nothing has been deleted yet", body["message"])
+
+    def test_it_is_audited_as_a_queued_clear_like_acc(self):
+        self.clear_attendance(self.ATT_SN)
+
+        [entry] = self.audit_rows("clear_attendance_queued")
+        self.assertEqual(entry.target, self.ATT_SN)
+        self.assertEqual(entry.detail,
+                         f"command_id={self.outbox(self.ATT_SN)[0].id}")
+
+    # -- acknowledgement -----------------------------------------------------
+
+    def test_return_zero_concludes_it_acknowledged(self):
+        self.clear_attendance(self.ATT_SN)
+        self.deliver_and_ack(0)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual([(r.command, r.outcome, r.return_code)
+                          for r in self.history(self.ATT_SN)],
+                         [(SPEC_CLEAR_LOG, "acknowledged", 0)])
+
+    def test_a_negative_return_concludes_it_refused(self):
+        self.clear_attendance(self.ATT_SN)
+        self.deliver_and_ack(-1004)
+
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual((row.outcome, row.return_code), ("failed", -1004))
+        [listed] = self.client.get(
+            f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual(listed["verdict"], "refused")
+
+    def test_the_servers_attendance_history_survives_the_clear(self):
+        """It empties the terminal's buffer, not this database: the punches
+        already uploaded are still here after the terminal confirms."""
+        self.add_punch(self.ATT_SN)
+        self.clear_attendance(self.ATT_SN)
+        self.deliver_and_ack(0)
+
+        self.assertEqual(self.punches(self.ATT_SN), 1)
 
 
 class ControlActionsWithNoAccCommandTests(DeviceControlRoutingTestCase):
@@ -10622,7 +10761,9 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
          "Attendance-protocol verb. An acc terminal has no ATTLOG; its stored "
          "events are the `transaction` table."),
         ("CLEAR DATA",
-         "Attendance-protocol verb, and a destructive one."),
+         "Attendance PUSH §12.2.3, 'Clearing All Data': wipes every person, "
+         "fingerprint and record on the terminal. Never sent to any terminal, "
+         "and so given no home below."),
         ("CONTROL DEVICE 1 ",
          "the space-separated decimal form used by two open-source ADMS "
          "servers. The spec's parameters are concatenated hex."),
@@ -10636,15 +10777,17 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
 
     # Markers now implemented for `att` terminals from the Attendance PUSH
     # document, and the only modules allowed to hold them: where the command
-    # is built and where its reply is read. Anywhere else — devicecontrol.py,
-    # the acc module, above all — is still the mistake this guard exists for.
-    # That the built command reaches only an `att` terminal is pinned by its
-    # routing tests, not here.
+    # is built and where its reply is read. Anywhere else is still the mistake
+    # this guard exists for. That the built command reaches only an `att`
+    # terminal is pinned by its routing tests, not here.
     ATTENDANCE_HOMES = {
         # Built in provisioning.att_fingerprint_enrol_command (§12.6.1); its
         # positive refusal codes read in commands.verdict_for (Appendix 1).
         # Routing: AttFingerprintEnrolTests.
         "ENROLL_FP": {"provisioning.py", "commands.py"},
+        # devicecontrol.CLEAR_ATT_RECORDS (§12.2.1). Its reply is a plain
+        # status, so no reader needs the text. Routing: AttAttendanceClearTests.
+        "CLEAR LOG": {"devicecontrol.py"},
     }
 
     def string_literals(self, tree):
@@ -10678,6 +10821,12 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
                     if marker in literal:
                         offenders.append(f"{path.name}: {marker!r} — {why}")
         self.assertEqual(offenders, [])
+
+    def test_the_clear_everything_command_has_no_home_anywhere(self):
+        """`CLEAR LOG` is one word from §12.2.3's clear-everything command.
+        Giving that one a home would let it into the app unnoticed."""
+        self.assertNotIn("CLEAR DATA", self.ATTENDANCE_HOMES)
+        self.assertIn("CLEAR DATA", [m for m, _ in self.FORBIDDEN])
 
     def test_the_guard_would_actually_catch_one(self):
         """A guard nobody has seen fail is a guard nobody knows works."""

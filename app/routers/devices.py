@@ -1247,9 +1247,10 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 # each finger one `DATA UPDATE FINGERTMP`, `DATA DELETE FINGERTMP` or
 # `ENROLL_FP`, on the same outbox, with the same acknowledgement rules,
 # because an attendance terminal behind NAT can never be dialled (the BioPro
-# SA20 CPV2232560497 is one). Attendance clear, unlock, restart and device
-# info still route `att` to the SDK until they are moved too; clock, lock
-# state and LCD message stay there for good, having no attendance-mode
+# SA20 CPV2232560497 is one). Clearing a terminal's attendance
+# (clear_device_attendance) is queued too, as `CLEAR LOG`. Unlock, restart and
+# device info still route `att` to the SDK until they are moved too; clock,
+# lock state and LCD message stay there for good, having no attendance-mode
 # command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
@@ -1605,7 +1606,7 @@ def cancel_user_revocation(
 # Attendance: clear device memory
 # ---------------------------------------------------------------------------
 
-@router.delete("/{sn}/attendance", status_code=204, response_model=None)
+@router.delete("/{sn}/attendance", status_code=202, response_model=None)
 def clear_device_attendance(
     sn: str,
     request: Request,
@@ -1613,13 +1614,27 @@ def clear_device_attendance(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    """Wipe attendance logs from device memory. Does not touch our DB.
+    """Wipe the punches a terminal holds. Does not touch our DB.
 
-    * `att` — SDK, synchronous, unchanged. Still 204.
-    * `acc` — `DATA DELETE transaction *` on the outbox (§12.1.2.5, "Delete
-      all the access control records", `*` meaning clear the table). **202
-      with a body**, not 204, because there is something to say: which command
-      is queued and that nothing has been deleted yet.
+    Both protocols queue one command on the ADMS outbox and answer **202 with
+    a body**, `status: "queued"`, `transport: "adms_queue"`: which command is
+    queued and that nothing has been deleted yet.
+
+    * `acc` — `DATA DELETE transaction *` (§12.1.2.5, "Delete all the access
+      control records", `*` meaning clear the table).
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — `CLEAR LOG`
+      (devicecontrol.CLEAR_ATT_RECORDS, Attendance PUSH 2.4.1 §12.2.1,
+      "Clearing Attendance Record"). Until 2026-10-19 this dialled the SDK,
+      TCP 4370, which never reaches a terminal behind NAT, and answered 204.
+      Never §12.2.3's clear-everything command, which would take every
+      person and fingerprint off the terminal with the punches.
+
+    The same safeguards on both, because the loss is the same and cannot be
+    undone on the terminal: admin only, the frontend's password confirmation,
+    and an audit row (`clear_attendance_queued`) carrying the command's id.
+    Nothing is written when the terminal acknowledges: `attendance_logs` is
+    this server's history, and what the terminal already uploaded stays here.
 
     Note what this is not. E12 refused to invent a `DATA QUERY
     tablename=transaction` and that refusal stands — no server-issued *query*
@@ -1633,22 +1648,20 @@ def clear_device_attendance(
     device = _get_device_or_404(sn, db)
 
     if _uses_command_queue(device):
-        row = commands.queue(db, sn, devicecontrol.CLEAR_RECORDS)
-        audit.record(db, admin.username, "clear_attendance_queued", target=sn,
-                     ip=client_ip(request), detail=f"command_id={row.id}")
-        return _queued_control_response(
-            sn, row, response,
-            "clear the access-control records held on the terminal",
-            extra=" Nothing has been deleted yet, and nothing already synced "
-                  "to this database is affected either way.",
-        )
+        command = devicecontrol.CLEAR_RECORDS
+        what = "clear the access-control records held on the terminal"
+    else:
+        command = devicecontrol.CLEAR_ATT_RECORDS
+        what = "clear the attendance records held on the terminal"
 
-    try:
-        with device_connection(device) as conn:
-            conn.clear_attendance()
-            audit.record(db, admin.username, "clear_attendance", target=sn, ip=client_ip(request))
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+    row = commands.queue(db, sn, command)
+    audit.record(db, admin.username, "clear_attendance_queued", target=sn,
+                 ip=client_ip(request), detail=f"command_id={row.id}")
+    return _queued_control_response(
+        sn, row, response, what,
+        extra=" Nothing has been deleted yet, and nothing already synced "
+              "to this database is affected either way.",
+    )
 
 
 # ---------------------------------------------------------------------------

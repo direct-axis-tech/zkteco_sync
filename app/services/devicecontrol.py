@@ -1,4 +1,4 @@
-"""Device-control commands for `acc` terminals, and the honest gaps.
+"""Device-control commands for `acc` and `att` terminals, and the honest gaps.
 
 E15. The nine device-control endpoints in `app/routers/devices.py` all opened
 an SDK connection with no `acc` path, so every one of them 503'd on a terminal
@@ -54,6 +54,16 @@ TWO SHAPES THAT WOULD HAVE BEEN PLAUSIBLE GUESSES, AND ARE WRONG
 
 Had this module been written from analogy or from the most popular open-source
 implementation, it would have shipped one of those two.
+
+ATTENDANCE-MODE COMMANDS
+------------------------
+
+Since 2026-10-19 the module also holds the device-control commands for `att`
+terminals, which an `acc` one does not understand and the reverse. Those are
+quoted from a different document — ZKTeco's *Attendance PUSH Communication
+Protocol*, software version 2.4.1, doc v3.7, March 2020 — and each one says so
+where it is defined, with its section and whether it has been seen working on
+hardware. Everything not so marked is from the Security PUSH document above.
 """
 
 import logging
@@ -344,9 +354,9 @@ def options_as_info(options: dict) -> dict:
 # Verbatim: "Delete all the access control records: C:123:DATA DELETE
 # transaction *", where "$(Cond): * means deleting all the records."
 #
-# This is the `acc` equivalent of the SDK's clear_attendance, and the same
-# caveat applies as on the SDK path: it wipes the DEVICE's stored events and
-# does not touch anything already ingested here.
+# This is the `acc` equivalent of the SDK's clear_attendance (CLEAR_ATT_RECORDS
+# below is the `att` one), and the same caveat applies: it wipes the DEVICE's
+# stored events and does not touch anything already ingested here.
 #
 # Note what this is NOT. E12 refused to invent `DATA QUERY tablename=transaction`
 # and that refusal still stands, for its original reason: no server-issued
@@ -357,6 +367,38 @@ def options_as_info(options: dict) -> dict:
 # a terminal whose event buffer is full. Reading E12's refusal as "the
 # transaction table is off limits" would be over-reading it.
 CLEAR_RECORDS = "DATA DELETE transaction *"
+
+
+# ---------------------------------------------------------------------------
+# CLEAR LOG — Attendance PUSH 2.4.1 §12.2.1, p.88 (`att` terminals)
+# ---------------------------------------------------------------------------
+#
+# The attendance-mode counterpart of CLEAR_RECORDS above, and the one string
+# in this module that is NOT from the Security PUSH document. Verbatim from
+# ZKTeco's Attendance PUSH Communication Protocol, software 2.4.1, doc v3.7:
+# "Clearing Attendance Record. To clear the client attendance record, the
+# command format is: C:${CmdID}:CLEAR${SP}LOG", answered with
+# `ID=${XXX}&Return=${XXX}&CMD=CLEAR_LOG`. From the document; not yet observed
+# on hardware. The reply needs no reading of its own: CLEAR_LOG is neither a
+# query nor an enrolment, so commands.verdict_for takes Return=0 as done and a
+# negative code as a refusal, as it does for any other status.
+#
+# Same caveat as CLEAR_RECORDS: it empties the TERMINAL's punch buffer and
+# nothing already ingested here — `attendance_logs` is the server's history and
+# no acknowledgement of this command touches it.
+#
+# Two neighbours in the same §12.2 are one word away and must never be sent in
+# its place. §12.2.2 `CLEAR PHOTO` clears attendance photos, which is not what
+# "clear attendance" means to an operator. §12.2.3 is "Clearing All Data. To
+# clear all client data" — CLEAR followed by DATA — which wipes every user,
+# fingerprint and record on the terminal: a factory reset of its contents, with
+# no undo. Nothing in this application builds that string, and the AST guard
+# in tests/test_adms.py (UnverifiedControlCommandsAreNotInventedTests) keeps
+# it out of every module, this one included.
+#
+# Not on an `acc` terminal either: it has no ATTLOG, and its stored events are
+# the `transaction` table above.
+CLEAR_ATT_RECORDS = "CLEAR LOG"
 
 
 # ---------------------------------------------------------------------------

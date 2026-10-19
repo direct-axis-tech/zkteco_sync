@@ -293,6 +293,14 @@ def verdict_for(return_code, command_name: str = "") -> str:
     :func:`refusal_meaning` gives the history. Any other positive code on an
     enrolment stays UNREADABLE, and no other command's positive codes are
     touched: the list is the enrolment's, not a general one.
+
+    ``CLEAR LOG``: a status, read by the general rule
+    -------------------------------------------------
+    An attendance terminal's attendance clear (Attendance PUSH 2.4.1 §12.2.1)
+    answers ``CMD=CLEAR_LOG`` with a status from Appendix 1: ``0`` cleared,
+    negative refused. From the document; not yet observed on hardware. It
+    needs nothing of its own here, and a positive code on one stays
+    UNREADABLE like any other unexplained one.
     """
     if return_code is None:
         return UNREADABLE
