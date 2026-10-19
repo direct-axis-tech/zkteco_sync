@@ -33,6 +33,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -330,10 +331,36 @@ def _acc_identity(db: Session, device: Device) -> tuple:
 # Handshake bodies
 # ---------------------------------------------------------------------------
 
-def _legacy_option_block(sn: str) -> str:
-    """The Attendance PUSH handshake reply — **byte-for-byte as it has always
-    been**. Two production devices depend on this exact string; the fixture
-    test pins its SHA-256. Do not "tidy" it."""
+def _timezone_option(zone: str, now: datetime = None) -> int:
+    """``TimeZone=`` for the handshake: ``zone``'s UTC offset right now.
+
+    Attendance PUSH 2.4.1 §5 defines it as "the time zone where the server is
+    located, primarily for server time synchronization": the terminal sets its
+    clock from the reply's ``Date:`` header, which is GMT, shifted by this. So
+    it has to be the offset of the wall clock the terminal should show, which
+    is the device's own zone. Units are the document's: whole hours while
+    -12 < TimeZone < 12 (``4`` is East 4), minutes otherwise (``330`` is half
+    of East 5). Read at the moment of the handshake, so a zone with daylight
+    saving is answered with the offset in force then.
+    """
+    offset = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(zone)).utcoffset()
+    minutes = int(offset.total_seconds() // 60)
+    if minutes % 60 == 0 and -12 < minutes // 60 < 12:
+        return minutes // 60
+    return minutes
+
+
+def _legacy_option_block(sn: str, timezone_option: int) -> str:
+    """The Attendance PUSH handshake reply — byte-for-byte as it has always
+    been, except ``TimeZone``. Two production devices depend on this exact
+    string; the fixture test pins its SHA-256. Do not "tidy" it.
+
+    ``TimeZone`` was a constant ``0`` until 2026-10-19. A terminal that honours
+    it sets its clock to GMT: the BioPro SA20 CPV2232560497 did, and showed
+    Dubai time four hours behind, stamping every punch four hours early. It is
+    now the device's own zone (:func:`_timezone_option`). The two production
+    devices show correct local time under ``0``, so they ignore it, and their
+    zone's value changes nothing for them."""
     return "\n".join([
         f"GET OPTION FROM: {sn}",
         "ATTLOGStamp=9999",
@@ -344,7 +371,7 @@ def _legacy_option_block(sn: str) -> str:
         "TransTimes=00:00;14:05",
         "TransInterval=1",
         "TransFlag=1111000000",
-        "TimeZone=0",
+        f"TimeZone={timezone_option}",
         "Realtime=1",
         "Encrypt=None",
     ])
@@ -456,7 +483,8 @@ def adms_handshake(
         _set_protocol(db, device, "att", f"DeviceType={declared!r} on handshake",
                       client_ip(request))
     _touch(db, device, request)
-    return PlainTextResponse(content=_legacy_option_block(SN))
+    return PlainTextResponse(content=_legacy_option_block(
+        SN, _timezone_option(_device_timezone(device))))
 
 
 @router.post("/iclock/cdata", response_class=PlainTextResponse)

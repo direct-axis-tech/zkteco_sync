@@ -59,6 +59,12 @@ from app.services import employee_sync                         # noqa: E402
 # both its literal text and its digest. Two live devices
 # (ESY4241100079, CQZ7230961348) parse this string. If a change to adms.py
 # makes this test fail, the change is wrong — not the test.
+#
+# One deliberate exception: `TimeZone` was `0` and is now the device's zone,
+# here the suite's pinned DEFAULT_DEVICE_TIMEZONE, Asia/Dubai, so `4`. `0`
+# set the BioPro SA20 CPV2232560497's clock to GMT, four hours behind
+# (2026-10-19); the two production devices show local time under `0`, so they
+# ignore the value. Everything else is the original byte for byte.
 LEGACY_BLOCK_TEMPLATE = (
     "GET OPTION FROM: {sn}\n"
     "ATTLOGStamp=9999\n"
@@ -69,16 +75,16 @@ LEGACY_BLOCK_TEMPLATE = (
     "TransTimes=00:00;14:05\n"
     "TransInterval=1\n"
     "TransFlag=1111000000\n"
-    "TimeZone=0\n"
+    "TimeZone=4\n"
     "Realtime=1\n"
     "Encrypt=None"
 )
 
-# SHA-256 of the block as served to ESY4241100079. This same digest was
-# recorded independently by an earlier unit (D8) after verifying the wire
-# format was unchanged, so it is a cross-check against two separate readings
-# of the original code.
-LEGACY_BLOCK_SHA256 = "d412946d1b53bdf811b9d72af25075651232f62d4deec76e73a872c69adb8f7b"
+# SHA-256 of the block as served to ESY4241100079 in Asia/Dubai. The digest
+# of the original `TimeZone=0` block, recorded independently by D8, was
+# d412946d1b53bdf811b9d72af25075651232f62d4deec76e73a872c69adb8f7b; this is
+# the same bytes with that one digit changed.
+LEGACY_BLOCK_SHA256 = "14ae09f75a870982960014347c7014dd8fae618cff839222e0f96103be6be25a"
 
 LEGACY_SN = "ESY4241100079"
 LEGACY_SN_2 = "CQZ7230961348"
@@ -224,6 +230,31 @@ class LegacyHandshakeRegressionTests(AdmsTestCase):
         # No trailing newline, and the length the original code produced.
         self.assertEqual(len(response.content), 202)
         self.assertFalse(response.text.endswith("\n"))
+
+    def test_the_handshake_timezone_is_the_device_s_own_zone(self):
+        """The terminal sets its clock from the GMT `Date:` header shifted by
+        `TimeZone`, so `TimeZone` must be the offset of the clock it should
+        show, in §5's units: hours, or minutes for a part-hour zone."""
+        for zone, expected in (("Asia/Kolkata", "330"), ("Asia/Kathmandu", "345"),
+                               ("Etc/GMT+5", "-5"), ("UTC", "0"),
+                               ("Pacific/Kiritimati", "840")):
+            with self.subTest(zone=zone):
+                serial = f"TZTEST{expected.replace('-', 'M')}"
+                self.add_device(serial, timezone=zone)
+                response = self.client.get(f"/iclock/cdata?SN={serial}&options=all")
+                self.assertIn(f"\nTimeZone={expected}\n", response.text)
+
+    def test_a_device_without_a_zone_gets_the_default_zone_s_offset(self):
+        self.add_device(LEGACY_SN, timezone=None)
+        response = self.client.get(f"/iclock/cdata?SN={LEGACY_SN}&options=all")
+        self.assertIn("\nTimeZone=4\n", response.text)
+
+    def test_the_timezone_follows_daylight_saving(self):
+        """Read at the moment of the handshake, not fixed per zone."""
+        winter = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+        summer = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(adms._timezone_option("Europe/London", winter), 0)
+        self.assertEqual(adms._timezone_option("Europe/London", summer), 1)
 
     def test_second_production_serial_gets_the_same_block(self):
         self.add_device(LEGACY_SN_2)
