@@ -1240,6 +1240,12 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 #          arrives (app/services/provisioning.note_acknowledged), not here,
 #          because until then "this person is on this device" is not true yet.
 #
+# The single-person push no longer uses the SDK for `att`: it queues one
+# `DATA UPDATE USERINFO` on the same outbox, with the same acknowledgement
+# rule, because an attendance terminal behind NAT can never be dialled (the
+# BioPro SA20 CPV2232560497 is one). See push_user_to_device. The other
+# endpoints here still route `att` to the SDK until they are moved too.
+#
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
 # both go through employee_sync.link_device_employee, which is the single
@@ -1357,81 +1363,56 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
 def push_user_to_device(sn: str, user_id: str, response: Response, db: Session = Depends(get_db)):
     """Put one employee onto one device. Explicit, per device, never fanned out.
 
-    Two transports, chosen by Device.protocol (see _uses_command_queue above),
-    and the response says which one ran and what actually happened:
+    Both protocols queue on the ADMS outbox, chosen by Device.protocol (see
+    _uses_command_queue above), and answer the same way:
 
-    * `att` — the SDK writes the device now. 200, `status: "written"`.
-    * `acc` — two commands are queued (the user record and the door
-      permission). **202, `status: "queued"`** — the device has not seen them
-      yet, will collect them on its next poll, and may still refuse them.
-      Calling that a success would be a lie the operator can only discover by
-      walking to the terminal.
+    * `acc` — two commands, the user record and the door permission.
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — one `DATA UPDATE USERINFO`.
+      Until 2026-10-19 this wrote over the SDK, TCP 4370, which never reaches
+      a terminal behind NAT; the push channel reaches every terminal that
+      polls.
 
-    In neither case does this enrol a biometric. The person walks up to the
-    terminal and registers their face or finger there; the device uploads the
-    template back by itself.
+    **202, `status: "queued"`** — the device has not seen the command yet,
+    will collect it on its next poll, and may still refuse it. Calling that a
+    success would be a lie the operator can only discover by walking to the
+    terminal. The device link is written only when it acknowledges.
+
+    This does not enrol a biometric. The person walks up to the terminal and
+    registers their face or finger there; the device uploads the template
+    back by itself.
     """
     device = _get_device_or_404(sn, db)
     emp = db.query(Employee).filter_by(user_id=user_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    blocked = _revocation_block(db, sn, user_id)
+    if blocked:
+        raise blocked
     if _uses_command_queue(device):
-        blocked = _revocation_block(db, sn, user_id)
-        if blocked:
-            raise blocked
         rows = provisioning.provision(db, sn, emp)
-        response.status_code = 202
-        return {
-            "device_sn": sn,
-            "user_id": user_id,
-            "transport": "adms_queue",
-            "status": "queued",
-            "command_ids": [r.id for r in rows],
-            "commands": [r.command for r in rows],
-            # Said in the response rather than only in a docstring, because
-            # this string is what the UI shows and what stops "pushed" from
-            # being read as "done".
-            "message": (
-                f"Queued {len(rows)} commands for {sn}. The device collects "
-                "them on its next poll (about 10 seconds) and acknowledges "
-                "afterwards — this is not delivered yet."
-            ),
-        }
-
-    try:
-        with device_connection(device) as conn:
-            users_on_device = conn.get_users()  # also initialises conn.next_uid
-            existing = next((u for u in users_on_device if u.user_id == str(user_id)), None)
-
-            uid = existing.uid if existing else None
-            pre_uid = conn.next_uid  # pyzk will assign this if uid is None
-
-            conn.set_user(
-                uid=uid,
-                name=emp.name,
-                privilege=emp.privilege,
-                user_id=emp.user_id,
-                card=int(emp.card) if emp.card and emp.card != "0" else 0,
-            )
-
-            actual_uid = uid if uid is not None else pre_uid
-
-            # One writer for this table, shared with the SDK pull, the ADMS
-            # upload ingest and the ADMS acknowledgement path (E1's rule).
-            employee_sync.link_device_employee(db, sn, user_id, uid=actual_uid)
-            db.commit()
-
-        return {
-            "device_sn": sn,
-            "user_id": user_id,
-            "uid": actual_uid,
-            "transport": "sdk",
-            "status": "written",
-            "message": "User written to device",
-        }
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+    else:
+        rows = provisioning.provision_att(db, sn, emp)
+    response.status_code = 202
+    plural = len(rows) != 1
+    return {
+        "device_sn": sn,
+        "user_id": user_id,
+        "transport": "adms_queue",
+        "status": "queued",
+        "command_ids": [r.id for r in rows],
+        "commands": [r.command for r in rows],
+        # Said in the response rather than only in a docstring, because
+        # this string is what the UI shows and what stops "pushed" from
+        # being read as "done".
+        "message": (
+            f"Queued {len(rows)} command{'s' if plural else ''} for {sn}. The "
+            f"device collects {'them' if plural else 'it'} on its next poll "
+            "(about 10 seconds) and acknowledges afterwards — this is not "
+            "delivered yet."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -4331,6 +4331,72 @@ class ProvisioningCommandShapeTests(unittest.TestCase):
         self.assertIsNone(self.provisioning.pin_from_user_command("REBOOT"))
 
 
+class AttProvisioningCommandShapeTests(unittest.TestCase):
+    """The literal bytes of an attendance-mode user push, Attendance PUSH
+    2.4.1 §12.1.1.1, with <HT> spelled as the tab it is::
+
+        DATA UPDATE USERINFO PIN=<s><HT>Name=<s><HT>Pri=<n><HT>Passwd=<s><HT>
+        Card=<s><HT>Grp=<n><HT>TZ=<s><HT>Verify=<n><HT>ViceCard=<s>
+
+    sent without Passwd and ViceCard, which this application does not hold.
+    """
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def employee(self, **fields):
+        values = dict(user_id="0036", name="Basila Haider", privilege=0, card="7495825")
+        values.update(fields)
+        return Employee(**values)
+
+    def test_the_userinfo_command_is_exactly_the_documented_shape(self):
+        self.assertEqual(
+            self.provisioning.att_user_command(self.employee()),
+            "DATA UPDATE USERINFO PIN=0036\tName=Basila Haider\tPri=0\t"
+            "Card=7495825\tGrp=1\tTZ=0000000100000000\tVerify=0",
+        )
+
+    def test_a_cardless_person_is_sent_with_an_empty_card_not_card_zero(self):
+        """`Card=` empty is how the SA20 reports a cardless person; the "0"
+        this database stores would be a card numbered 0 on this wire."""
+        for empty in ("0", "", None):
+            self.assertEqual(
+                self.provisioning.att_user_command(self.employee(card=empty)),
+                "DATA UPDATE USERINFO PIN=0036\tName=Basila Haider\tPri=0\t"
+                "Card=\tGrp=1\tTZ=0000000100000000\tVerify=0",
+                empty,
+            )
+
+    def test_an_administrator_is_sent_with_their_privilege(self):
+        self.assertIn("\tPri=14\t",
+                      self.provisioning.att_user_command(self.employee(privilege=14)))
+
+    def test_no_password_or_secondary_card_is_asserted(self):
+        command = self.provisioning.att_user_command(self.employee())
+        names = [f.split("=")[0] for f in command.split("\t")]
+        self.assertNotIn("Passwd", names)
+        self.assertNotIn("ViceCard", names)
+
+    def test_a_tab_in_a_name_cannot_forge_an_extra_field(self):
+        command = self.provisioning.att_user_command(
+            self.employee(name="Basila\tPri=14\nDATA DELETE USERINFO PIN=1")
+        )
+        fields = command.split("\t")
+        self.assertNotIn("\n", command)
+        self.assertEqual(len(fields), 7)
+        self.assertEqual(fields[1], "Name=Basila Pri=14 DATA DELETE USERINFO PIN=1")
+        self.assertEqual(fields[2], "Pri=0")
+
+    def test_the_acknowledgement_hook_reads_the_pin_with_its_leading_zeros(self):
+        command = self.provisioning.att_user_command(self.employee())
+        self.assertEqual(self.provisioning.pin_from_user_command(command), "0036")
+
+    def test_a_revocation_withdraws_it_like_any_other_push(self):
+        command = self.provisioning.att_user_command(self.employee())
+        self.assertEqual(self.provisioning.pin_from_push_command(command), "0036")
+
+
 # ---------------------------------------------------------------------------
 # 20b. Employee creation and editing
 # ---------------------------------------------------------------------------
@@ -4609,6 +4675,60 @@ class AccProvisioningTests(ProvisioningTestCase):
         self.assertEqual(config.COMMAND_BATCH_SIZE, 1)
 
 
+class AttProvisioningTests(ProvisioningTestCase):
+    """The same push to an attendance terminal: one USERINFO command, queued,
+    linked only on the terminal's Return=0. The SA20 echoes `CMD=DATA` for
+    every DATA command, so the acks here say that."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("0036", name="Basila Haider", card="7495825")
+
+    def ack_att(self, command_id, return_code):
+        return self.ack(command_id, return_code=return_code, cmd="DATA", sn=self.ATT_SN)
+
+    def test_a_push_queues_one_userinfo_command(self):
+        self.push(self.ATT_SN, "0036")
+        self.assertEqual([row.command for row in self.outbox(self.ATT_SN)], [
+            "DATA UPDATE USERINFO PIN=0036\tName=Basila Haider\tPri=0\t"
+            "Card=7495825\tGrp=1\tTZ=0000000100000000\tVerify=0",
+        ])
+
+    def test_the_response_says_queued_the_way_the_acc_branch_does(self):
+        response = self.push(self.ATT_SN, "0036")
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertIn("Queued 1 command for", body["message"])
+        self.assertIn("not delivered yet", body["message"])
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+
+    def test_no_device_link_exists_until_the_device_acknowledges(self):
+        self.push(self.ATT_SN, "0036")
+        self.poll(self.ATT_SN)
+        self.assertEqual(self.links(), [])
+
+    def test_the_link_appears_when_the_device_answers_return_zero(self):
+        self.push(self.ATT_SN, "0036")
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, 0)
+
+        links = self.links(self.ATT_SN)
+        self.assertEqual([(l.user_id, l.uid) for l in links], [("0036", 0)])
+
+    def test_a_refused_userinfo_command_leaves_no_link_behind(self):
+        self.push(self.ATT_SN, "0036")
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, -1004)
+
+        self.assertEqual(self.links(), [])
+        self.assertEqual([(r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
+                         [("failed", -1004)])
+
+
 # ---------------------------------------------------------------------------
 # 20d. Transport routing: never both, for the same (device, user)
 # ---------------------------------------------------------------------------
@@ -4626,19 +4746,19 @@ class TransportRoutingTests(ProvisioningTestCase):
         super().setUp()
         self.create_employee("9001", name="Aisha Rahman", card="778899")
 
-    def test_an_att_device_uses_the_sdk_and_never_touches_the_outbox(self):
+    def test_an_att_device_uses_the_queue_and_never_opens_a_socket(self):
+        """A terminal behind NAT can never be dialled, so the push goes on the
+        outbox it polls — and the link waits for its acknowledgement."""
         from unittest import mock
-        conn = FakeConnection(next_uid=5)
+        conn = FakeConnection()
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
             response = self.push(self.ATT_SN, "9001")
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["transport"], "sdk")
-        self.assertEqual(response.json()["status"], "written")
-        self.assertEqual(len(conn.written), 1)
-        self.assertEqual(conn.written[0]["user_id"], "9001")
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-        self.assertEqual([l.uid for l in self.links(self.ATT_SN)], [5])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(conn.written, [])
+        self.assertEqual([r.command.split(" ", 3)[:3] for r in self.outbox(self.ATT_SN)],
+                         [["DATA", "UPDATE", "USERINFO"]])
+        self.assertEqual(self.links(self.ATT_SN), [])
 
     def test_an_acc_device_uses_the_queue_and_never_opens_a_socket(self):
         from unittest import mock
@@ -4675,19 +4795,15 @@ class TransportRoutingTests(ProvisioningTestCase):
         self.assertEqual(self.outbox(self.ATT_SN), [])
         self.assertEqual(len(conn.written), 2)
 
-    def test_a_device_with_no_protocol_set_takes_the_sdk_path(self):
-        """Predictable, and deliberately the loud direction: an SDK push to a
-        device that cannot answer fails with a 503 in front of the operator,
-        whereas acc-shaped commands queued to an attendance terminal would sit
-        in the outbox looking healthy and be refused on collection."""
-        from unittest import mock
-        conn = FakeConnection(next_uid=9)
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.push(self.DEFAULT_SN, "9001")
+    def test_a_device_with_no_protocol_set_is_pushed_as_att(self):
+        """The column defaults to att, so an unclassified device gets the
+        attendance command, as Sync does — never the acc pair, which an
+        attendance terminal refuses."""
+        response = self.push(self.DEFAULT_SN, "9001")
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["transport"], "sdk")
-        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command.split(" ", 3)[:3] for r in self.outbox(self.DEFAULT_SN)],
+                         [["DATA", "UPDATE", "USERINFO"]])
 
     def test_the_routing_function_is_total_and_defaults_to_the_sdk(self):
         """Including for values no column constraint allows but a stale row
@@ -4718,15 +4834,13 @@ class TransportRoutingTests(ProvisioningTestCase):
                       _inspect.getsource(provisioning))
 
     def test_one_pair_ends_with_one_link_even_if_the_protocol_is_corrected(self):
-        """The only way a pair could see both transports is an operator
-        correcting the protocol between two pushes (E6). The link converges on
-        one row rather than growing a second."""
-        from unittest import mock
-
+        """An operator correcting the protocol between two pushes (E6) changes
+        which command is sent, not what the acknowledgement writes: the link
+        converges on one row rather than growing a second."""
         self.push(self.SN, "9001")
-        user_command_id = self.outbox(self.SN)[0].id
-        self.poll()
-        self.ack(user_command_id, return_code=0)
+        for row in self.outbox(self.SN):
+            self.poll()
+            self.ack(row.id, return_code=0)
         self.assertEqual(len(self.links(self.SN)), 1)
         self.assertEqual(self.links(self.SN)[0].uid, 0)
 
@@ -4737,30 +4851,15 @@ class TransportRoutingTests(ProvisioningTestCase):
         finally:
             db.close()
 
-        conn = FakeConnection(next_uid=11)
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            self.push(self.SN, "9001")
+        self.push(self.SN, "9001")
+        userinfo_command_id = self.outbox(self.SN)[0].id
+        self.assertIn("USERINFO", self.outbox(self.SN)[0].command)
+        self.poll()
+        self.ack(userinfo_command_id, return_code=0, cmd="DATA")
 
         links = self.links(self.SN)
         self.assertEqual(len(links), 1)
-        self.assertEqual(links[0].uid, 11)   # converged on the real slot number
-
-    def test_an_unreachable_att_device_reports_a_failure_rather_than_queueing(self):
-        """Asymmetric fallback, per the shared constraint: SDK failure is
-        detectable, so it is reported. It does NOT silently become a queued
-        acc-shaped command the terminal has no tables for."""
-        from unittest import mock
-        from zk.exception import ZKNetworkError
-
-        def _boom(device):
-            raise ZKNetworkError("unreachable")
-
-        with mock.patch("app.routers.devices.device_connection", _boom):
-            response = self.push(self.ATT_SN, "9001")
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-        self.assertEqual(self.links(self.ATT_SN), [])
+        self.assertEqual(links[0].uid, 0)
 
 
 # ---------------------------------------------------------------------------

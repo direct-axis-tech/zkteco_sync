@@ -200,17 +200,124 @@ def provision(db: Session, device_sn: str, employee: Employee) -> list:
 
 
 # ---------------------------------------------------------------------------
+# The `att` side: one command, because there is no door permission
+# ---------------------------------------------------------------------------
+#
+# An attendance terminal keeps the person in a single table, USERINFO, so the
+# whole push is one `DATA UPDATE USERINFO` line (Attendance PUSH 2.4.1
+# §12.1.1.1). From the document; not yet observed on hardware. What HAS been
+# observed is the other direction: the BioPro SA20 CPV2232560497 answering
+# `DATA QUERY USERINFO` on 2026-10-19 with lines of exactly these fields,
+#
+#     USER PIN=036<HT>Name=…<HT>Pri=0<HT>Passwd=<HT>Card=<HT>Grp=1<HT>
+#     TZ=0000000100000000<HT>Verify=0<HT>ViceCard=<HT>StartDatetime=0<HT>…
+#
+# which is where the fixed values below come from.
+
+# Group 1 is the document's default ("group 1 by default") and what the SA20
+# reported for every person enrolled at its keypad.
+ATT_USER_GROUP = 1
+
+# The SA20's own value for every person enrolled at its keypad. Digits 1-4 are
+# 0000, which §12.1.1.1 reads as "use the group time period" — the person
+# punches whenever the group may. Sent rather than left to the firmware because
+# what a terminal defaults a missing TZ to is not documented, and a person the
+# terminal treats as outside their time period is refused at the reader while
+# everything the server can see says the push worked.
+ATT_USER_TIME_ZONES = "0000000100000000"
+
+# Appendix 7: 0 is "finger vein or face or fingerprint or card or password
+# (automatic identification)" — whatever the person has enrolled. Also what
+# the SA20 reported for its own people.
+ATT_USER_VERIFY = 0
+
+
+def att_user_command(employee: Employee) -> str:
+    """The `DATA UPDATE USERINFO` line for one person, §12.1.1.1 field order.
+
+    The document's shape is
+    ``PIN Name Pri Passwd Card Grp TZ Verify ViceCard``; this sends it with
+    two fields left out. Field by field:
+
+    ``PIN``
+        The employee's user_id, as the string it is. Leading zeros are part of
+        the identity on these terminals (`036` and `0036` are two people on the
+        SA20), so it is never turned into a number.
+    ``Name``
+        May be empty, as on the acc side: the terminal then shows the PIN.
+    ``Pri``
+        0 = ordinary user, 14 = super administrator (§12.1.1.1's table; the
+        SA20's admins report 14). From the employee row, never implied.
+    ``Passwd`` — not sent
+        This application holds no keypad password. Sending ``Passwd=`` empty
+        would assert one — that the person has none — and DATA UPDATE is an
+        upsert, so on a terminal that merges fields it would wipe a password
+        set at the keypad. Left out, a terminal that merges keeps it, and one
+        that replaces the record clears it either way. The vendor's own sample
+        records (§12.5.2, `DATA UPDATE USERINFO PIN=1 Name=1 Pri=0 Passwd=1
+        Grp=1`) leave fields out the same way.
+    ``Card``
+        The card number as a string (§12.1.1.1's format b). "No card" is
+        ``Card=`` empty, which is how the SA20 reports a cardless person — the
+        "0" this database stores for "no card" is never sent, because on this
+        wire it would be a card numbered 0.
+    ``Grp`` / ``TZ`` / ``Verify``
+        :data:`ATT_USER_GROUP`, :data:`ATT_USER_TIME_ZONES`,
+        :data:`ATT_USER_VERIFY` — what the terminal itself reports for the
+        people enrolled at it, so a person pushed from here is set up the same
+        way as one enrolled at the keypad.
+    ``ViceCard`` — not sent
+        A secondary card this application has no notion of, left alone for
+        the same reason as ``Passwd``.
+    """
+    card = _wire_safe(employee.card)
+    return (
+        "DATA UPDATE USERINFO "
+        + HT.join([
+            f"PIN={_wire_safe(employee.user_id)}",
+            f"Name={_wire_safe(employee.name)}",
+            f"Pri={int(employee.privilege or 0)}",
+            f"Card={'' if card in _NO_CARD else card}",
+            f"Grp={ATT_USER_GROUP}",
+            f"TZ={ATT_USER_TIME_ZONES}",
+            f"Verify={ATT_USER_VERIFY}",
+        ])
+    )
+
+
+def provision_att(db: Session, device_sn: str, employee: Employee) -> list:
+    """Queue one person onto one `att` terminal. Returns the outbox rows.
+
+    One row, returned as a list so a caller answers the same way it does for
+    :func:`provision`. Queued, not delivered: the link to the device is
+    written when the terminal acknowledges (:func:`note_acknowledged`).
+    """
+    rows = [commands.queue(db, device_sn, att_user_command(employee))]
+    log.info(
+        "provisioning %s onto %s: queued command id %s (USERINFO) — awaiting "
+        "the device's next getrequest",
+        employee.user_id, device_sn, rows[0].id,
+    )
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # What an acknowledgement means
 # ---------------------------------------------------------------------------
 
-# Matches only the person-record command, and only its Pin. `userauthorize`
+# Matches only the person-record command, and only its Pin: `DATA UPDATE user
+# Pin=…` on an `acc` terminal, `DATA UPDATE USERINFO PIN=…` on an `att` one
+# (case-insensitive, which is what lets `Pin=` match `PIN=`). `userauthorize`
 # deliberately does not match: a door permission acknowledged for somebody the
 # terminal never accepted is not evidence that the person is on the device.
-_USER_PIN = re.compile(r"^DATA UPDATE user\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECASE)
+_USER_PIN = re.compile(
+    r"^DATA UPDATE (?:user|USERINFO)\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECASE
+)
 
 
 def pin_from_user_command(command: str):
-    """The Pin in a `DATA UPDATE user` command, or None if it is not one."""
+    """The Pin in a `DATA UPDATE user` or `DATA UPDATE USERINFO` command, or
+    None if it is not one."""
     match = _USER_PIN.match((command or "").strip())
     if not match:
         return None
