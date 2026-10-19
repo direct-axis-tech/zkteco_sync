@@ -438,6 +438,34 @@ UNLOCK_ATT_DOOR = "AC_UNLOCK"
 
 
 # ---------------------------------------------------------------------------
+# REBOOT — Attendance PUSH 2.4.1 §12.7.1, p.96 (`att` terminals)
+# ---------------------------------------------------------------------------
+#
+# The attendance-mode counterpart of restart_command above. Verbatim from the
+# Attendance PUSH document: "Rebooting the Client. To reboot the client, the
+# command format is: C:${CmdID}:REBOOT", answered with
+# `ID=${XXX}&Return=${XXX}&CMD=REBOOT`. From the document; not yet observed on
+# hardware. No parameters.
+#
+# THE REPLY MAY NEVER COME. The section says the terminal answers, and says
+# nothing about whether it answers before it goes down. A terminal that
+# reboots first has no command left to reply about when it comes back, and
+# the queue's ordinary rule for silence — offer it again after the backoff,
+# up to COMMAND_MAX_ATTEMPTS times — would turn one lost reply into a terminal
+# restarting itself every few minutes for an hour, mid-shift. So this command
+# is handed over once and never again (commands.delivery_limit): no reply
+# within the first backoff and it is concluded unacknowledged, not re-sent.
+# Whether the SA20 replies first is the thing to watch on hardware.
+#
+# A reply that does come is a plain status, read by commands.verdict_for's
+# general rule: Return=0 accepted, negative refused.
+#
+# No deadline, like the `acc` restart: queued with the queue's usual patience,
+# so a terminal that is offline when asked restarts when it next polls.
+RESTART_ATT_DEVICE = "REBOOT"
+
+
+# ---------------------------------------------------------------------------
 # The gaps — what an `acc` terminal genuinely cannot be asked
 # ---------------------------------------------------------------------------
 #

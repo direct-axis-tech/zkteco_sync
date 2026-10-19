@@ -1173,32 +1173,44 @@ def restart_device(sn: str, request: Request, response: Response,
                    admin: User = Depends(require_admin)):
     """Reboot the device.
 
-    * `att` — SDK, synchronous, unchanged.
-    * `acc` — `CONTROL DEVICE 03000000` on the outbox (§12.4 example (3),
-      "restarting the current device"). 202: queued, not restarting.
+    Both protocols queue one restart on the ADMS outbox. 202: queued, not
+    restarting. Both are audited the same way, `device_restart_queued`.
 
-    No deadline on this one, unlike the door. A reboot collected late is still
+    * `acc` — `CONTROL DEVICE 03000000` (§12.4 example (3), "restarting the
+      current device").
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — `REBOOT`
+      (devicecontrol.RESTART_ATT_DEVICE, Attendance PUSH 2.4.1 §12.7.1). Until
+      2026-10-19 this dialled the SDK, TCP 4370, which never reaches a
+      terminal behind NAT, and answered 200 "Device restarting". It is handed
+      to the terminal once only (commands.delivery_limit): a terminal can go
+      down before it replies, and re-sending a restart whose reply was lost
+      would restart it again, and again, through the retry schedule.
+
+    No deadline on either, unlike the door. A reboot collected late is still
     a reboot, and there is no equivalent of "the person has walked away".
     """
     device = _get_device_or_404(sn, db)
 
     if _uses_command_queue(device):
-        row = commands.queue(db, sn, devicecontrol.restart_command())
-        audit.record(db, admin.username, "device_restart_queued", target=sn,
-                     ip=client_ip(request), detail=f"command_id={row.id}")
-        return _queued_control_response(
-            sn, row, response, "restart the terminal",
-            extra=" It will go offline briefly once it collects this, and "
-                  "reconnect by itself.",
+        command = devicecontrol.restart_command()
+        delivery_note = ""
+    else:
+        command = devicecontrol.RESTART_ATT_DEVICE
+        delivery_note = (
+            " It is handed over once: if the terminal restarts before it "
+            "replies, Commands shows it unacknowledged, and it is not sent "
+            "again."
         )
 
-    try:
-        with device_connection(device) as conn:
-            conn.restart()
-            audit.record(db, admin.username, "device_restart", target=sn, ip=client_ip(request))
-            return {"device_sn": sn, "message": "Device restarting"}
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+    row = commands.queue(db, sn, command)
+    audit.record(db, admin.username, "device_restart_queued", target=sn,
+                 ip=client_ip(request), detail=f"command_id={row.id}")
+    return _queued_control_response(
+        sn, row, response, "restart the terminal",
+        extra=" It will go offline briefly once it collects this, and "
+              "reconnect by itself." + delivery_note,
+    )
 
 
 @router.post("/{sn}/lcd", dependencies=[Depends(require_admin)])
@@ -1275,11 +1287,12 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 # `ENROLL_FP`, on the same outbox, with the same acknowledgement rules,
 # because an attendance terminal behind NAT can never be dialled (the BioPro
 # SA20 CPV2232560497 is one). Clearing a terminal's attendance
-# (clear_device_attendance) is queued too, as `CLEAR LOG`, and so is opening
+# (clear_device_attendance) is queued too, as `CLEAR LOG`, and so are opening
 # its door (unlock_door), as `AC_UNLOCK` with the same short deadline as acc's
-# door command. Restart and device info still route `att` to the SDK until
-# they are moved too; clock, lock state and LCD message stay there for good,
-# having no attendance-mode command.
+# door command, and restarting it (restart_device), as `REBOOT`, handed over
+# once only. Device info still routes `att` to the SDK until it is moved too;
+# clock, lock state and LCD message stay there for good, having no
+# attendance-mode command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:

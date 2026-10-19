@@ -9962,6 +9962,9 @@ SPEC_CLEAR_LOG = "CLEAR LOG"
 # Attendance PUSH 2.4.1 §12.7.2, verbatim: "The access equipment outputs the
 # door unlocking signal. The command format is: C: ${CmdID}: AC_UNLOCK"
 SPEC_AC_UNLOCK = "AC_UNLOCK"
+# Attendance PUSH 2.4.1 §12.7.1, verbatim: "To reboot the client, the command
+# format is: C: ${CmdID}: REBOOT"
+SPEC_REBOOT = "REBOOT"
 
 
 class DeviceControlShapeTests(unittest.TestCase):
@@ -10035,6 +10038,10 @@ class DeviceControlShapeTests(unittest.TestCase):
         """The verb alone: §12.7.2 defines no door and no duration, so
         nothing follows it."""
         self.assertEqual(self.dc.UNLOCK_ATT_DOOR, SPEC_AC_UNLOCK)
+
+    def test_the_attendance_restart_command_is_the_documented_shape(self):
+        """The verb alone: §12.7.1 defines no parameters."""
+        self.assertEqual(self.dc.RESTART_ATT_DEVICE, SPEC_REBOOT)
 
     def test_get_options_is_comma_separated_with_no_trailing_comma(self):
         """§12.5.2: "Multiple parameters are separated by commas, but the last
@@ -10260,17 +10267,6 @@ class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
             setattr(conn, name, _make(name, result))
         return conn
 
-    def test_restart_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
-        from unittest import mock
-
-        conn = self.sdk(restart=None)
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.restart(self.ATT_SN)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual([c[0] for c in conn.log], ["restart"])
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-
     def test_set_clock_on_an_att_device_dials_the_sdk_and_queues_nothing(self):
         from unittest import mock
 
@@ -10298,11 +10294,12 @@ class ControlCommandsUseTheSdkOnAttTests(DeviceControlRoutingTestCase):
         visible, not a queue that looks healthy."""
         from unittest import mock
 
-        conn = self.sdk(restart=None)
+        conn = self.sdk(set_time=None)
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            self.assertEqual(self.restart(self.DEFAULT_SN).status_code, 200)
+            response = self.set_time(self.DEFAULT_SN, sync=True)
 
-        self.assertEqual([c[0] for c in conn.log], ["restart"])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([c[0] for c in conn.log], ["set_time"])
         self.assertEqual(self.outbox(self.DEFAULT_SN), [])
 
 
@@ -10645,6 +10642,198 @@ class AttDoorUnlockTests(DeviceControlRoutingTestCase):
         self.assertEqual(listed["verdict"], "refused")
 
 
+class AttRestartTests(DeviceControlRoutingTestCase):
+    """Restarting an attendance terminal, over the queue.
+
+    Until 2026-10-19 the `att` branch dialled the SDK, TCP 4370, which never
+    reaches a terminal behind NAT. It now queues `REBOOT` (Attendance PUSH
+    2.4.1 §12.7.1), answers the way the `acc` branch always has, and is
+    handed to the terminal once only, because a terminal can go down before
+    it replies.
+    """
+
+    def tripwire(self):
+        """`device_connection`, which must not be reached on any branch now."""
+        from unittest import mock
+
+        def _dial(*args, **kwargs):
+            raise AssertionError("restarting the device dialled the SDK")
+
+        return mock.patch("app.routers.devices.device_connection", _dial)
+
+    def deliver_and_ack(self, return_code):
+        command_id = self.outbox(self.ATT_SN)[-1].id
+        self.poll(self.ATT_SN)
+        self.ack(command_id, return_code=return_code, cmd="REBOOT",
+                 sn=self.ATT_SN)
+
+    def deliver_and_hear_nothing(self, sn):
+        """Handed over, no reply, and the first retry window gone by."""
+        command_id = self.outbox(sn)[-1].id
+        self.poll(sn)
+        self.rewind_backoff(command_id)
+        return command_id
+
+    def audit_rows(self, action):
+        from app.models import AuditLog
+        db = self.Session()
+        try:
+            return db.query(AuditLog).filter_by(action=action).all()
+        finally:
+            db.close()
+
+    # -- routing -------------------------------------------------------------
+
+    def test_an_att_device_queues_reboot_and_never_opens_a_socket(self):
+        with self.tripwire():
+            response = self.restart(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_REBOOT])
+
+    def test_the_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.restart(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         f"C:{command_id}:REBOOT".encode())
+
+    def test_an_unclassified_device_is_restarted_as_an_attendance_terminal(self):
+        with self.tripwire():
+            response = self.restart(self.DEFAULT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.DEFAULT_SN)],
+                         [SPEC_REBOOT])
+
+    def test_an_acc_device_still_queues_the_control_device_command(self):
+        """REBOOT is not a command on an acc terminal, and CONTROL DEVICE is
+        not one on an att terminal."""
+        self.restart(self.ATT_SN)
+        self.restart(self.SN)
+
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [SPEC_RESTART])
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_REBOOT])
+
+    def test_the_reply_has_the_queued_shape_the_acc_reply_has(self):
+        """Devices.jsx toasts `message`; everything else matches acc's so one
+        caller reads either."""
+        att = self.restart(self.ATT_SN)
+        acc = self.restart(self.SN)
+
+        self.assertEqual(att.status_code, acc.status_code)
+        body = att.json()
+        self.assertEqual(sorted(body), sorted(acc.json()))
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["command"], SPEC_REBOOT)
+        self.assertEqual(body["command_id"], self.outbox(self.ATT_SN)[0].id)
+        self.assertIn("Queued: restart the terminal", body["message"])
+        self.assertIn("polls", body["message"])
+        self.assertIn("it is not sent again", body["message"])
+
+    def test_it_is_audited_as_a_queued_restart_like_acc(self):
+        self.restart(self.ATT_SN)
+
+        [entry] = self.audit_rows("device_restart_queued")
+        self.assertEqual(entry.target, self.ATT_SN)
+        self.assertEqual(entry.detail,
+                         f"command_id={self.outbox(self.ATT_SN)[0].id}")
+
+    def test_it_keeps_the_queues_patience_like_acc(self):
+        """No deadline, as on acc: a terminal offline when asked restarts
+        when it next polls."""
+        self.restart(self.ATT_SN)
+
+        self.assertIsNone(self.outbox(self.ATT_SN)[0].expires_at)
+
+    # -- delivered once ------------------------------------------------------
+
+    def test_an_unanswered_one_is_not_handed_over_a_second_time(self):
+        """The terminal may restart before it replies. Offering it again
+        would restart it again."""
+        self.restart(self.ATT_SN)
+        self.deliver_and_hear_nothing(self.ATT_SN)
+
+        self.assertEqual(self.poll(self.ATT_SN).strip(), "OK")
+
+    def test_an_unanswered_one_is_concluded_unacknowledged_on_the_next_poll(self):
+        self.restart(self.ATT_SN)
+        self.deliver_and_hear_nothing(self.ATT_SN)
+        self.poll(self.ATT_SN)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual((row.command, row.outcome, row.attempts),
+                         (SPEC_REBOOT, "failed", 1))
+        self.assertIn("delivered once and never acknowledged", row.last_error)
+
+    def test_the_sweep_concludes_one_from_a_terminal_that_stopped_polling(self):
+        from app.services import commands as command_service
+
+        self.restart(self.ATT_SN)
+        self.deliver_and_hear_nothing(self.ATT_SN)
+        db = self.Session()
+        try:
+            result = command_service.sweep(db)
+        finally:
+            db.close()
+
+        self.assertEqual(result["exhausted"], 1)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual((row.command, row.attempts), (SPEC_REBOOT, 1))
+
+    def test_one_queued_by_hand_is_handed_over_once_too(self):
+        self.queue("REBOOT", sn=self.ATT_SN)
+        self.deliver_and_hear_nothing(self.ATT_SN)
+
+        self.assertEqual(self.poll(self.ATT_SN).strip(), "OK")
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_an_unanswered_acc_restart_is_still_retried(self):
+        """acc's restart keeps the queue's retry schedule, unchanged."""
+        self.restart(self.SN)
+        self.deliver_and_hear_nothing(self.SN)
+
+        self.assertIn(SPEC_RESTART, self.poll(self.SN))
+
+    # -- acknowledgement -----------------------------------------------------
+
+    def test_return_zero_concludes_it_acknowledged(self):
+        self.restart(self.ATT_SN)
+        self.deliver_and_ack(0)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual([(r.command, r.outcome, r.return_code)
+                          for r in self.history(self.ATT_SN)],
+                         [(SPEC_REBOOT, "acknowledged", 0)])
+
+    def test_a_negative_return_concludes_it_refused(self):
+        self.restart(self.ATT_SN)
+        self.deliver_and_ack(-1002)
+
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual((row.outcome, row.return_code), ("failed", -1002))
+        [listed] = self.client.get(
+            f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual(listed["verdict"], "refused")
+
+    def test_a_reply_after_it_was_given_up_on_changes_nothing(self):
+        """A terminal that answers once it is back up, after the server has
+        already concluded the silence, is told about a concluded command."""
+        self.restart(self.ATT_SN)
+        command_id = self.deliver_and_hear_nothing(self.ATT_SN)
+        self.poll(self.ATT_SN)
+        self.ack(command_id, return_code=0, cmd="REBOOT", sn=self.ATT_SN)
+
+        [row] = self.history(self.ATT_SN)
+        self.assertEqual(row.outcome, "failed")
+
+
 class ControlActionsWithNoAccCommandTests(DeviceControlRoutingTestCase):
     """Four actions the protocol does not define. 501, a reason, and no queue."""
 
@@ -10963,6 +11152,9 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
          "the singular is the Attendance protocol's. acc uses SET OPTIONS."),
         ("ENROLL_FP",
          "Attendance-protocol remote enrolment."),
+        ("REBOOT",
+         "Attendance-protocol restart. acc restarts with CONTROL DEVICE "
+         "03000000."),
     ]
 
     # Markers now implemented for `att` terminals from the Attendance PUSH
@@ -10982,6 +11174,10 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
         # its deadline is the outbox row's, so no reader needs the text.
         # Routing: AttDoorUnlockTests.
         "AC_UNLOCK": {"devicecontrol.py"},
+        # devicecontrol.RESTART_ATT_DEVICE (§12.7.1). A plain status reply;
+        # commands.delivery_limit reads the constant, not the text, to hand it
+        # over once only. Routing: AttRestartTests.
+        "REBOOT": {"devicecontrol.py"},
     }
 
     def string_literals(self, tree):

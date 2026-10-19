@@ -54,6 +54,7 @@ from sqlalchemy.orm import Session
 
 from app import config
 from app.models import DeviceCommandLog, DeviceCommandOutbox
+from app.services import devicecontrol
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +129,38 @@ def backoff_for(attempts: int, command: str = None) -> timedelta:
     )
     index = min(max(attempts, 1), len(schedule)) - 1
     return timedelta(seconds=schedule[index])
+
+
+# Commands a device is handed once and never again, acknowledged or not. Today
+# that is an attendance terminal's restart (devicecontrol.RESTART_ATT_DEVICE,
+# Attendance PUSH §12.7.1): a terminal can go down before it replies, and a
+# second delivery of a command whose reply was lost is a second restart. The
+# rule is matched on the text, like a revocation, so one queued by hand
+# through POST /devices/{sn}/commands is held to it too.
+_DELIVERED_ONCE = frozenset({devicecontrol.RESTART_ATT_DEVICE})
+
+
+def _is_delivered_once(command: str) -> bool:
+    return strip_envelope(command or "").upper() in _DELIVERED_ONCE
+
+
+def delivery_limit(command: str) -> int:
+    """How many times ``command`` may be handed to a device unacknowledged.
+
+    COMMAND_MAX_ATTEMPTS for everything except a command in
+    :data:`_DELIVERED_ONCE`, whose limit is one: past its first backoff
+    without a reply it is concluded, not offered again.
+    """
+    return 1 if _is_delivered_once(command) else config.COMMAND_MAX_ATTEMPTS
+
+
+def _never_acknowledged(attempts: int, command: str) -> str:
+    """The history's reason for a command given up on after silence."""
+    if _is_delivered_once(command):
+        return ("delivered once and never acknowledged — not delivered "
+                "again, since it may have run before the device could reply")
+    return (f"no acknowledgement after {attempts} "
+            f"attempt{'s' if attempts != 1 else ''}")
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +342,14 @@ def verdict_for(return_code, command_name: str = "") -> str:
     output, negative refused. From the document; not yet observed on hardware.
     Its one-shot deadline is the outbox row's ``expires_at``, not anything
     read here.
+
+    ``REBOOT``: a status, read by the general rule
+    ----------------------------------------------
+    An attendance terminal's restart (Attendance PUSH 2.4.1 §12.7.1) answers
+    ``CMD=REBOOT`` the same way: ``0`` accepted, negative refused. From the
+    document; not yet observed on hardware. The terminal may go down before it
+    answers at all; what silence leads to is :func:`delivery_limit`'s, not
+    anything read here.
     """
     if return_code is None:
         return UNREADABLE
@@ -619,7 +660,7 @@ def next_commands(db: Session, device_sn: str, limit: int = None, now: datetime 
     # dispatch from the same loop.
     live = []
     for row in _eligible(db, device_sn, now):
-        if row.attempts < config.COMMAND_MAX_ATTEMPTS:
+        if row.attempts < delivery_limit(row.command):
             live.append(row)
             continue
         # Read before concluding: the move deletes the row, after which the
@@ -627,10 +668,7 @@ def next_commands(db: Session, device_sn: str, limit: int = None, now: datetime 
         row_id, attempts = row.id, row.attempts
         conclude(
             db, row, "failed",
-            last_error=(
-                f"no acknowledgement after {attempts} "
-                f"attempt{'s' if attempts != 1 else ''}"
-            ),
+            last_error=_never_acknowledged(attempts, row.command),
         )
         log.warning(
             "command %s for %s failed: %s deliveries, never acknowledged",
@@ -896,20 +934,21 @@ def sweep(db: Session, now: datetime = None) -> dict:
     result = {"exhausted": 0, "door_expired": 0, "expired": 0, "pruned": 0}
 
     # 1. Delivered the maximum number of times, retry window elapsed, silent.
-    exhausted = (
-        db.query(DeviceCommandOutbox)
-        .filter(DeviceCommandOutbox.status == "sent")
-        .filter(DeviceCommandOutbox.attempts >= config.COMMAND_MAX_ATTEMPTS)
-        .filter(DeviceCommandOutbox.next_attempt_at <= now)
-        .all()
-    )
+    # The maximum is the command's own (delivery_limit), so the limit is read
+    # per row rather than in the query: a restart is exhausted after one.
+    exhausted = [
+        row for row in (
+            db.query(DeviceCommandOutbox)
+            .filter(DeviceCommandOutbox.status == "sent")
+            .filter(DeviceCommandOutbox.next_attempt_at <= now)
+            .all()
+        )
+        if row.attempts >= delivery_limit(row.command)
+    ]
     for row in exhausted:
         if conclude(
             db, row, "failed",
-            last_error=(
-                f"no acknowledgement after {row.attempts} "
-                f"attempt{'s' if row.attempts != 1 else ''}"
-            ),
+            last_error=_never_acknowledged(row.attempts, row.command),
         ):
             result["exhausted"] += 1
 

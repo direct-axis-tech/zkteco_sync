@@ -86,7 +86,8 @@ ADMS_PAIRING_MINUTES = _get_int("ADMS_PAIRING_MINUTES", 15)
 
 # How many times one command may be handed to a device without ever being
 # acknowledged before it is given up on. Deliveries, not seconds: a device
-# that never polls never consumes one.
+# that never polls never consumes one. An attendance terminal's restart is
+# handed over once whatever this says (commands.delivery_limit).
 COMMAND_MAX_ATTEMPTS = max(1, _get_int("COMMAND_MAX_ATTEMPTS", 5))
 
 # Delay before a delivered-but-unacknowledged command is offered again, one
