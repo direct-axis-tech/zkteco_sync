@@ -443,6 +443,16 @@ def adms_handshake(
         _touch(db, device, request)
         return PlainTextResponse(content=_acc_registry_block(registry_code, session_id))
 
+    # An explicit non-acc DeviceType is the device saying it speaks Attendance
+    # PUSH, and it has just been answered that way — so the stored protocol
+    # follows, or every command queued for it would still be acc-shaped and
+    # refused with -1004 (BioPro SA20 CPV2232560497, DeviceType='middle east',
+    # 2026-10-19). A handshake with no DeviceType says nothing, and changes
+    # nothing.
+    declared = _query(request, "DeviceType").strip()
+    if declared:
+        _set_protocol(db, device, "att", f"DeviceType={declared!r} on handshake",
+                      client_ip(request))
     _touch(db, device, request)
     return PlainTextResponse(content=_legacy_option_block(SN))
 

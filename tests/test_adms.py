@@ -401,6 +401,25 @@ class LegacyHandshakeRegressionTests(AdmsTestCase):
         )
         self.assertEqual(self.get_device(LEGACY_SN).protocol, "att")
 
+    def test_a_non_acc_device_type_on_handshake_clears_a_manual_acc_pin(self):
+        """The SA20 case: pinned acc by hand, announcing an att DeviceType."""
+        self.add_device(LEGACY_SN, protocol="acc", protocol_pinned=True)
+        response = self.client.get(
+            f"/iclock/cdata?SN={LEGACY_SN}&options=all&language=69&pushver=2.4.1"
+            "&DeviceType=middle%20east&PushOptionsFlag=1"
+        )
+        self.assertEqual(response.text, LEGACY_BLOCK_TEMPLATE.format(sn=LEGACY_SN))
+        device = self.get_device(LEGACY_SN)
+        self.assertEqual(device.protocol, "att")
+        self.assertFalse(device.protocol_pinned)
+
+    def test_a_handshake_without_device_type_leaves_the_stored_protocol_alone(self):
+        self.add_device(LEGACY_SN, protocol="acc", protocol_pinned=True)
+        self.client.get(f"/iclock/cdata?SN={LEGACY_SN}&options=all")
+        device = self.get_device(LEGACY_SN)
+        self.assertEqual(device.protocol, "acc")
+        self.assertTrue(device.protocol_pinned)
+
 
 # ---------------------------------------------------------------------------
 # 2. The new `acc` replies, against the spec's literals
