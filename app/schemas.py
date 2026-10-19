@@ -269,6 +269,10 @@ class RevocationGroupOut(BaseModel):
     device_sn: str
     user_id: str
     still_open: bool
+    # False for an attendance-mode terminal: it keeps no door permission, so
+    # its revocation is the single `DATA DELETE USERINFO` and `userauthorize`
+    # is None by design, not because a half went missing.
+    has_door_permission: bool = True
     user: Optional[RevocationRoleOut] = None
     userauthorize: Optional[RevocationRoleOut] = None
 
@@ -277,8 +281,11 @@ class RevocationGroupOut(BaseModel):
     def split(self) -> bool:
         """True when the two halves are genuinely in different states — one
         acknowledged, one refused, one cancelled, one still outstanding —
-        and must be shown as such rather than folded into one status."""
+        and must be shown as such rather than folded into one status. A
+        one-command revocation has nothing to be split from."""
         u, a = self.user, self.userauthorize
+        if u is not None and a is None and not self.has_door_permission:
+            return False
         if u is None or a is None:
             return True
         return (u.outstanding, u.state) != (a.outstanding, a.state)

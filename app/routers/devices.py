@@ -27,7 +27,7 @@ from app.schemas import (
     RevocationGroupOut, SetTimeRequest, UnlockRequest,
 )
 from app.services import (
-    commands, devicecontrol, employee_sync, pairing, provisioning,
+    commands, devicecontrol, pairing, provisioning,
 )
 from app.services.sdk import device_connection, enroll_user_task
 
@@ -86,10 +86,10 @@ def _with_pending_revocations(db: Session, rows) -> list:
     One extra query for the whole listing, not one per device: the outbox is
     the hot table on every device poll and this is an operator page.
 
-    Counted over the whole outbox rather than only `acc` rows because the
-    outbox is the only place a revocation can be outstanding at all — the SDK
-    transport has either done it or failed loudly by the time the request
-    returns, and never leaves anything behind to count.
+    Counted over the whole outbox, whatever the device's protocol: every
+    revocation is queued there — `DATA DELETE user` on `acc`, `DATA DELETE
+    USERINFO` on `att` — and the outbox is the only place one can be
+    outstanding at all.
     """
     serials = [r.serial_number for r in rows]
     counts = {}
@@ -1241,11 +1241,14 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 #          because until then "this person is on this device" is not true yet.
 #
 # Pushing people — one (push_user_to_device) or several (push_users_bulk) —
-# no longer uses the SDK for `att`: each person is one `DATA UPDATE USERINFO`
-# on the same outbox, with the same acknowledgement rule, because an
-# attendance terminal behind NAT can never be dialled (the BioPro SA20
-# CPV2232560497 is one). The other endpoints here still route `att` to the
-# SDK until they are moved too.
+# and removing one (remove_user_from_device) no longer use the SDK for `att`:
+# each person is one `DATA UPDATE USERINFO` or `DATA DELETE USERINFO` on the
+# same outbox, with the same acknowledgement rules, because an attendance
+# terminal behind NAT can never be dialled (the BioPro SA20 CPV2232560497 is
+# one). The fingerprint push and delete, remote enrolment, attendance clear,
+# unlock, restart and device info still route `att` to the SDK until they
+# are moved too; clock, lock state and LCD message stay there for good,
+# having no attendance-mode command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
@@ -1400,17 +1403,16 @@ def push_user_to_device(sn: str, user_id: str, response: Response, db: Session =
 # Revoking a person from a device (E8)
 # ---------------------------------------------------------------------------
 #
-# The mirror of the push above, on the same two transports and by the same
-# rule — but with one difference that is not cosmetic.
+# The mirror of the push above, on the same outbox and by the same rule — but
+# with one difference that is not cosmetic.
 #
 # A push that has not been delivered yet means somebody cannot get in yet. A
 # revocation that has not been delivered yet means somebody who should have
 # lost access still has it, at a physical door, with nothing at the door
-# saying so. So on the `acc` path this endpoint answers **202 and the word
-# "queued"**, never 204 and silence, and every layer above it — the response
-# message, the outbox listing, the person's page, the device list — is
-# required to keep saying "not yet confirmed at the door" until the terminal
-# acknowledges. The single worst outcome available to this unit is a screen
+# saying so. So this endpoint answers **202 and the word "queued"**, never
+# 204 and silence, and every layer above it — the response message, the
+# outbox listing, the person's page, the device list — is required to keep
+# saying "not yet confirmed at the door" until the terminal acknowledges. The single worst outcome available to this unit is a screen
 # that says access was revoked when it was not.
 
 
@@ -1460,101 +1462,82 @@ def remove_user_from_device(
 ):
     """Take one person off one device. Does not delete the employee from the DB.
 
-    Routed on Device.protocol exactly as the push is, and for the same reason:
+    Both protocols queue on the ADMS outbox, chosen by Device.protocol exactly
+    as the push is, and answer the same way:
 
-    * `att` — the SDK deletes the user over TCP 4370 now. **200,
-      `status: "removed"`.** By the time this returns it has happened, so the
-      local enrolment record is dropped in the same breath.
-    * `acc` — `DATA DELETE user` and `DATA DELETE userauthorize` go on the
-      outbox. **202, `status: "queued"`.** The terminal has not been told yet.
-      The local enrolment record deliberately **stays** until it acknowledges,
-      so the UI keeps showing this person as present-but-being-revoked rather
-      than quietly claiming a removal nobody has performed.
+    * `acc` — `DATA DELETE user` and `DATA DELETE userauthorize`.
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — one `DATA DELETE USERINFO`,
+      which takes the person's fingerprints and face with it
+      (provisioning.att_user_delete_command). Until 2026-10-19 this deleted
+      over the SDK, TCP 4370, which never reaches a terminal behind NAT.
 
-    Before this unit both paths dialled TCP 4370 unconditionally, so an `acc`
+    **202, `status: "queued"`.** The terminal has not been told yet. The
+    local enrolment record deliberately **stays** until it acknowledges, so
+    the UI keeps showing this person as present-but-being-revoked rather than
+    quietly claiming a removal nobody has performed.
+
+    Before E8 both paths dialled TCP 4370 unconditionally, so an `acc`
     terminal behind NAT — which is every one of them — answered 503 and there
     was no way at all to take back access this application could grant.
     """
     device = _get_device_or_404(sn, db)
     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
 
-    if _uses_command_queue(device):
-        # A person can be owed to a device without being on it: the push was
-        # queued and the terminal has not collected it. "Remove" then means
-        # "call it off", which is a real and useful thing to be able to do —
-        # and 404ing here would leave the push in the outbox to be delivered
-        # later, which is the opposite of what was asked for.
-        if not de:
-            withdrawn = provisioning.withdraw_pushes_for(
-                db, sn, user_id,
-                reason=f"withdrawn: {user_id} was removed from {sn} before delivery",
+    # A person can be owed to a device without being on it: the push was
+    # queued and the terminal has not collected it. "Remove" then means "call
+    # it off", which is a real and useful thing to be able to do — and
+    # 404ing here would leave the push in the outbox to be delivered later,
+    # which is the opposite of what was asked for.
+    if not de:
+        withdrawn = provisioning.withdraw_pushes_for(
+            db, sn, user_id,
+            reason=f"withdrawn: {user_id} was removed from {sn} before delivery",
+        )
+        if not withdrawn:
+            raise HTTPException(
+                status_code=404, detail="User not enrolled on this device"
             )
-            if not withdrawn:
-                raise HTTPException(
-                    status_code=404, detail="User not enrolled on this device"
-                )
-            audit.record(db, admin.username, "device_user_remove",
-                         target=f"{sn}/{user_id}", ip=client_ip(request),
-                         detail=f"withdrew {len(withdrawn)} undelivered push(es)")
-            return {
-                "device_sn": sn,
-                "user_id": user_id,
-                "transport": "adms_queue",
-                "status": "withdrawn",
-                "withdrawn_command_ids": withdrawn,
-                "message": (
-                    f"This person was never confirmed on {sn}; the "
-                    f"{len(withdrawn)} command(s) still waiting to put them "
-                    "there have been withdrawn. Nothing was sent to the device."
-                ),
-            }
-
-        rows, withdrawn = provisioning.revoke(db, sn, user_id)
         audit.record(db, admin.username, "device_user_remove",
                      target=f"{sn}/{user_id}", ip=client_ip(request),
-                     detail=f"queued={len(rows)} withdrew={len(withdrawn)}")
-        response.status_code = 202
+                     detail=f"withdrew {len(withdrawn)} undelivered push(es)")
         return {
             "device_sn": sn,
             "user_id": user_id,
             "transport": "adms_queue",
-            "status": "queued",
-            "command_ids": [r.id for r in rows],
-            "commands": [r.command for r in rows],
+            "status": "withdrawn",
             "withdrawn_command_ids": withdrawn,
-            # This string is what the operator reads. It is the difference
-            # between an accurate belief and a dangerous one, so it says the
-            # unwelcome thing first and does not soften it.
             "message": (
-                f"Access revoked in the system — NOT yet confirmed at the door. "
-                f"{sn} collects one command per poll (about 10 seconds) and "
-                "confirms afterwards; until it does, this person can still "
-                "open that door. If the terminal is offline the revocation "
-                "waits, and stays visible as outstanding."
+                f"This person was never confirmed on {sn}; the "
+                f"{len(withdrawn)} command(s) still waiting to put them "
+                "there have been withdrawn. Nothing was sent to the device."
             ),
         }
 
-    if not de:
-        raise HTTPException(status_code=404, detail="User not enrolled on this device")
-
-    try:
-        with device_connection(device) as conn:
-            conn.delete_user(uid=de.uid, user_id=user_id)
-        # Only now, and through the single deleter — the device has actually
-        # done it, which is what the SDK transport's synchronicity buys.
-        employee_sync.unlink_device_employee(db, sn, user_id)
-        db.commit()
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
-
-    audit.record(db, admin.username, "device_user_remove", target=f"{sn}/{user_id}",
-                 ip=client_ip(request), detail="transport=sdk")
+    revoke = provisioning.revoke if _uses_command_queue(device) else provisioning.revoke_att
+    rows, withdrawn = revoke(db, sn, user_id)
+    audit.record(db, admin.username, "device_user_remove",
+                 target=f"{sn}/{user_id}", ip=client_ip(request),
+                 detail=f"queued={len(rows)} withdrew={len(withdrawn)}")
+    response.status_code = 202
     return {
         "device_sn": sn,
         "user_id": user_id,
-        "transport": "sdk",
-        "status": "removed",
-        "message": f"Removed from {sn}. The device confirmed it.",
+        "transport": "adms_queue",
+        "status": "queued",
+        "command_ids": [r.id for r in rows],
+        "commands": [r.command for r in rows],
+        "withdrawn_command_ids": withdrawn,
+        # This string is what the operator reads. It is the difference
+        # between an accurate belief and a dangerous one, so it says the
+        # unwelcome thing first and does not soften it.
+        "message": (
+            f"Access revoked in the system — NOT yet confirmed at the door. "
+            f"{sn} collects one command per poll (about 10 seconds) and "
+            "confirms afterwards; until it does, this person can still "
+            "open that door. If the terminal is offline the revocation "
+            "waits, and stays visible as outstanding."
+        ),
     }
 
 

@@ -666,6 +666,13 @@ def withdraw_orphaned_templates(db: Session, device_sn: str = None) -> list:
 #
 # There is NO biometric delete here. Not a guessed one, not an UNVERIFIED one
 # — none. See :func:`revoke_commands_for`.
+#
+# An attendance terminal is revoked with ONE command, `DATA DELETE USERINFO
+# PIN=<n>` (Attendance PUSH 2.4.1 §12.1.2.1), from the document and not yet
+# observed on hardware. See :func:`att_user_delete_command`. Everything after
+# the queueing — tracking until acknowledged, unlinking on Return=0, blocking
+# pushes meanwhile, cancelling, grouping — is the same lifecycle, because the
+# parsers below recognise both shapes.
 
 
 def user_delete_command(user_id) -> str:
@@ -749,12 +756,42 @@ def revoke_commands_for(user_id) -> list:
     return [user_delete_command(user_id), authorize_delete_command(user_id)]
 
 
-# `DATA DELETE user Pin=…` only. `DATA DELETE userauthorize Pin=…` must not
-# match: an acknowledged permission delete is not evidence that the person is
-# off the terminal, and it is the person being off the terminal that the
-# `device_employees` row means. The `\s+` after `user` is what keeps the two
-# apart — "userauthorize" has no whitespace at that position.
-_DELETE_USER_PIN = re.compile(r"^DATA DELETE user\s+Pin=([^\t]*)", re.IGNORECASE)
+def att_user_delete_command(user_id) -> str:
+    """`DATA DELETE USERINFO PIN=<n>` — one person off an `att` terminal.
+
+    Attendance PUSH 2.4.1 §12.1.2.1, from the document; not yet observed on
+    hardware. The PIN goes out verbatim, as the string it is: leading zeros
+    are part of the identity on these terminals (`036` and `0036` are two
+    people on the SA20), so it is never turned into a number.
+
+    This one command is the whole revocation, biometrics included. §12.1.2.1
+    says the delete removes "specified user information, including
+    fingerprint template, face template and user photo", so a separate
+    `DATA DELETE FINGERTMP PIN=<n>` (§12.1.2.2) would be redundant — and a
+    second command is a second chance of a split revocation, the person's
+    record gone and a refusal on their templates reported as a failure for
+    something that had already happened. It is the same conclusion the `acc`
+    side reached (:func:`revoke_commands_for`): biometrics belong to the
+    person record and go when it goes. Here the document says so outright.
+
+    There is no door-permission half either: an attendance terminal keeps the
+    person in a single table, USERINFO, exactly as the push
+    (:func:`att_user_command`) found.
+    """
+    return f"DATA DELETE USERINFO PIN={_wire_safe(user_id)}"
+
+
+# The person-record delete, on either kind of terminal: `DATA DELETE user
+# Pin=…` on `acc`, `DATA DELETE USERINFO PIN=…` on `att` (case-insensitive,
+# which is what lets `Pin=` match `PIN=`). `DATA DELETE userauthorize Pin=…`
+# must not match: an acknowledged permission delete is not evidence that the
+# person is off the terminal, and it is the person being off the terminal that
+# the `device_employees` row means. The `\s+` after the table name is what
+# keeps the two apart — "userauthorize" has no whitespace at that position.
+_DELETE_USER_PIN = re.compile(
+    r"^DATA DELETE (?:user|USERINFO)\s+Pin=([^\t]*)", re.IGNORECASE
+)
+_DELETE_ATT_USER = re.compile(r"^DATA DELETE USERINFO\s", re.IGNORECASE)
 
 # Any `DATA UPDATE <table> … Pin=…` — the push commands a revocation
 # contradicts. Deliberately generic over the table so a future push command
@@ -763,7 +800,8 @@ _PUSH_PIN = re.compile(r"^DATA UPDATE \S+\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECA
 
 
 def pin_from_revocation_command(command: str):
-    """The Pin in a `DATA DELETE user` command, or None if it is not one."""
+    """The Pin in a `DATA DELETE user` or `DATA DELETE USERINFO` command, or
+    None if it is not one."""
     match = _DELETE_USER_PIN.match((command or "").strip())
     if not match:
         return None
@@ -779,7 +817,8 @@ def pin_from_push_command(command: str):
 
 
 def is_revocation_command(command: str) -> bool:
-    """True for either half of a revocation, for filtering the outbox."""
+    """True for either half of an `acc` revocation and for the single command
+    of an `att` one, for filtering the outbox."""
     text = (command or "").strip()
     return bool(
         _DELETE_USER_PIN.match(text)
@@ -788,7 +827,8 @@ def is_revocation_command(command: str) -> bool:
 
 
 def pin_from_any_delete_command(command: str):
-    """The Pin in either delete command, or None. For grouping, not for acting."""
+    """The Pin in any revocation command, `PIN=` of `att` included, or None.
+    For grouping, not for acting."""
     text = (command or "").strip()
     match = re.match(r"^DATA DELETE \S+\s+Pin=([^\t]*)", text, re.IGNORECASE)
     if not match:
@@ -850,6 +890,23 @@ def revoke(db: Session, device_sn: str, user_id: str) -> tuple:
 
     Returns ``(rows, withdrawn)`` — the outbox rows created and the ids of any
     contradicting pushes retired to make room for them.
+    """
+    return _queue_revocation(db, device_sn, user_id,
+                             revoke_commands_for(user_id), "user + userauthorize")
+
+
+def revoke_att(db: Session, device_sn: str, user_id: str) -> tuple:
+    """Queue one person's removal from one `att` terminal: one row,
+    :func:`att_user_delete_command`. Returns ``(rows, withdrawn)`` as
+    :func:`revoke` does, and keeps the same rule about the link.
+    """
+    return _queue_revocation(db, device_sn, user_id,
+                             [att_user_delete_command(user_id)], "USERINFO")
+
+
+def _queue_revocation(db: Session, device_sn: str, user_id: str,
+                      bodies: list, what: str) -> tuple:
+    """Withdraw the contradicting pushes, then queue ``bodies``.
 
     Writes nothing to `device_employees`. That row is this application's claim
     that the person is on that door, and it survives until the terminal
@@ -863,13 +920,12 @@ def revoke(db: Session, device_sn: str, user_id: str) -> tuple:
         db, device_sn, user_id,
         reason=f"withdrawn: {user_id} is being removed from {device_sn}",
     )
-    rows = [commands.queue(db, device_sn, body)
-            for body in revoke_commands_for(user_id)]
+    rows = [commands.queue(db, device_sn, body) for body in bodies]
     log.warning(
-        "revoking %s from %s: queued command ids %s (user + userauthorize)%s "
+        "revoking %s from %s: queued command ids %s (%s)%s "
         "— NOT yet revoked at the door; the terminal must collect and "
         "acknowledge these first",
-        user_id, device_sn, [r.id for r in rows],
+        user_id, device_sn, [r.id for r in rows], what,
         f", withdrew {len(withdrawn)} contradicting push(es)" if withdrawn else "",
     )
     return rows, withdrawn
@@ -979,19 +1035,28 @@ def revocation_groups(db: Session, device_sn: str, user_id: str = None) -> list:
     recognises this person (E8) — not inferred from either command's state,
     which is exactly the inference that produced a false "confirmed removal"
     once before.
+
+    An `att` revocation is one command, so it has a `user` half and no
+    `userauthorize` half at all; ``has_door_permission`` says so, so that the
+    missing half is read as absent by design rather than as a split.
     """
     pins = {}
+    att_pins = set()
     for row in outstanding_revocations(db, device_sn, user_id):
         role = "user" if pin_from_revocation_command(row.command) else "userauthorize"
         pin = pin_from_any_delete_command(row.command)
         pins.setdefault(pin, {})[role] = _outstanding_role_status(row)
+        if _DELETE_ATT_USER.match(row.command.strip()):
+            att_pins.add(pin)
 
     groups = []
     for pin, roles in pins.items():
-        for role, body in (
-            ("user", user_delete_command(pin)),
-            ("userauthorize", authorize_delete_command(pin)),
-        ):
+        halves = (
+            (("user", att_user_delete_command(pin)),) if pin in att_pins else
+            (("user", user_delete_command(pin)),
+             ("userauthorize", authorize_delete_command(pin)))
+        )
+        for role, body in halves:
             if role in roles:
                 continue
             log_row = (
@@ -1012,6 +1077,7 @@ def revocation_groups(db: Session, device_sn: str, user_id: str = None) -> list:
             "device_sn": device_sn,
             "user_id": pin,
             "still_open": still_open,
+            "has_door_permission": pin not in att_pins,
             "user": roles.get("user"),
             "userauthorize": roles.get("userauthorize"),
         })

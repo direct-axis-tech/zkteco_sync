@@ -6181,8 +6181,45 @@ class RevocationCommandShapeTests(unittest.TestCase):
         )
 
 
+class AttRevocationCommandShapeTests(unittest.TestCase):
+    """The literal bytes of an attendance-mode revocation, Attendance PUSH
+    2.4.1 §12.1.2.1::
+
+        DATA DELETE USERINFO PIN=<s>
+
+    From the document; not yet observed on hardware."""
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def test_the_userinfo_delete_is_exactly_the_documented_shape(self):
+        self.assertEqual(self.provisioning.att_user_delete_command("0036"),
+                         "DATA DELETE USERINFO PIN=0036")
+
+    def test_a_pin_with_wire_breaking_characters_cannot_break_the_framing(self):
+        self.assertEqual(self.provisioning.att_user_delete_command("00\t36\r\n"),
+                         "DATA DELETE USERINFO PIN=00 36")
+
+    def test_the_revocation_parser_reads_its_pin_with_the_leading_zeros(self):
+        """The hook that drops the link on acknowledgement keys on this."""
+        self.assertEqual(
+            self.provisioning.pin_from_revocation_command("DATA DELETE USERINFO PIN=0036"),
+            "0036",
+        )
+
+    def test_it_is_retried_on_the_short_revocation_schedule(self):
+        from app.services import commands as commands_service
+
+        self.assertEqual(
+            commands_service.backoff_for(1, "DATA DELETE USERINFO PIN=0036").total_seconds(),
+            config.REVOCATION_BACKOFF_SECONDS[0],
+        )
+
+
 class RevocationTransportRoutingTests(RevocationTestCase):
-    """acc queues, att dials. Never both — the E3 rule, applied to deletes."""
+    """Every protocol queues, each its own command: two deletes on acc, one
+    USERINFO delete on att. Nothing dials TCP 4370 any more."""
 
     def test_an_acc_revocation_queues_the_exact_command_and_never_opens_a_socket(self):
         from unittest import mock
@@ -6220,27 +6257,50 @@ class RevocationTransportRoutingTests(RevocationTestCase):
         second = self.poll()
         self.assertEqual(second, "C:2:DATA DELETE userauthorize Pin=9001")
 
-    def test_an_att_revocation_uses_the_sdk_and_leaves_the_outbox_empty(self):
+    def test_an_att_revocation_queues_the_userinfo_delete_and_never_opens_a_socket(self):
+        """Attendance PUSH 2.4.1 §12.1.2.1, one command, the PIN verbatim with
+        its leading zeros. Until 2026-10-19 this deleted over TCP 4370, which
+        never reaches a terminal behind NAT."""
         from unittest import mock
 
-        self.link(self.ATT_SN)
+        self.create_employee("0036", name="Basila Haider")
+        self.link(self.ATT_SN, "0036")
         conn = SdkRevocation()
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.revoke(self.ATT_SN)
+            response = self.revoke(self.ATT_SN, "0036")
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["transport"], "sdk")
-        self.assertEqual(response.json()["status"], "removed")
-        self.assertEqual(conn.deleted, [{"uid": 0, "user_id": "9001"}])
-        # Nothing queued anywhere — not on this device and not on any other.
-        self.assertEqual(self.outbox(), [])
-        # The SDK path IS synchronous, so the link goes now.
-        self.assertEqual(self.links(self.ATT_SN), [])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.commands_on(self.ATT_SN), ["DATA DELETE USERINFO PIN=0036"])
+        self.assertEqual(conn.deleted, [])
+        self.assertEqual(conn.written, [])
 
-    def test_an_unclassified_device_takes_the_sdk_path(self):
-        """Same safe default as every other write: anything not explicitly
-        `acc` fails loudly on TCP rather than sitting in a queue looking
-        healthy."""
+    def test_the_att_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.create_employee("0036", name="Basila Haider")
+        self.link(self.ATT_SN, "0036")
+        self.revoke(self.ATT_SN, "0036")
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         b"C:1:DATA DELETE USERINFO PIN=0036")
+
+    def test_an_att_revocation_answers_in_the_shape_the_acc_one_does(self):
+        """Employees.jsx reads `status` and shows `message`; a queued
+        revocation must never read as done on either protocol."""
+        self.link(self.ATT_SN)
+        response = self.revoke(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+        self.assertEqual(body["commands"], ["DATA DELETE USERINFO PIN=9001"])
+        self.assertEqual(body["withdrawn_command_ids"], [])
+        self.assertIn("NOT yet confirmed at the door", body["message"])
+
+    def test_an_unclassified_device_is_revoked_as_an_attendance_terminal(self):
+        """A device whose protocol was never set is treated as att, exactly
+        as Sync and the push treat it — so it gets the USERINFO delete, on
+        the queue."""
         from unittest import mock
 
         self.link(self.DEFAULT_SN)
@@ -6248,28 +6308,10 @@ class RevocationTransportRoutingTests(RevocationTestCase):
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
             response = self.revoke(self.DEFAULT_SN)
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
-        self.assertEqual(len(conn.deleted), 1)
-
-    def test_an_unreachable_att_device_still_reports_503_and_keeps_the_link(self):
-        from unittest import mock
-        from contextlib import contextmanager
-        from zk.exception import ZKNetworkError
-
-        self.link(self.ATT_SN)
-
-        @contextmanager
-        def _refuse(device):
-            raise ZKNetworkError("unreachable")
-            yield  # pragma: no cover
-
-        with mock.patch("app.routers.devices.device_connection", _refuse):
-            response = self.revoke(self.ATT_SN)
-
-        self.assertEqual(response.status_code, 503)
-        # Nothing was removed, so nothing may claim it was.
-        self.assertEqual(len(self.links(self.ATT_SN)), 1)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.commands_on(self.DEFAULT_SN),
+                         ["DATA DELETE USERINFO PIN=9001"])
+        self.assertEqual(conn.deleted, [])
 
 
 class RevocationLinkOnAckTests(RevocationTestCase):
@@ -6971,6 +7013,114 @@ class RevocationGroupingTests(RevocationTestCase):
         narrowed = self.groups(self.SN, user_id="9002").json()
         self.assertEqual(len(narrowed), 1)
         self.assertEqual(narrowed[0]["user_id"], "9002")
+
+
+class AttRevocationLifecycleTests(RevocationTestCase):
+    """The acc revocation lifecycle, on an attendance terminal: tracked until
+    the terminal acknowledges, the link dropped only on its Return=0, pushes
+    blocked meanwhile, cancellable, listed. The SA20 echoes `CMD=DATA` for
+    every DATA command, so the acks here say that."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("0036", name="Basila Haider")
+        self.link(self.ATT_SN, "0036")
+
+    def revoke_att(self):
+        return self.revoke(self.ATT_SN, "0036")
+
+    def ack_att(self, command_id, return_code):
+        return self.ack(command_id, return_code=return_code, cmd="DATA", sn=self.ATT_SN)
+
+    def groups(self):
+        return self.client.get(f"/devices/{self.ATT_SN}/revocations").json()
+
+    def test_the_link_goes_only_when_the_terminal_answers_return_zero(self):
+        self.revoke_att()
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.assertEqual(len(self.links(self.ATT_SN)), 1, "delivered is not confirmed")
+
+        self.ack_att(command_id, 0)
+        self.assertEqual(self.links(self.ATT_SN), [])
+
+    def test_a_refused_delete_keeps_the_link_and_is_recorded_as_failed(self):
+        self.revoke_att()
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, -1004)
+
+        self.assertEqual(len(self.links(self.ATT_SN)), 1)
+        self.assertEqual(
+            [(r.command, r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
+            [("DATA DELETE USERINFO PIN=0036", "failed", -1004)],
+        )
+
+    def test_an_outstanding_revocation_refuses_a_single_push(self):
+        self.revoke_att()
+
+        response = self.push(self.ATT_SN, "0036")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.commands_on(self.ATT_SN), ["DATA DELETE USERINFO PIN=0036"])
+
+    def test_an_outstanding_revocation_skips_the_person_in_a_bulk_push(self):
+        self.revoke_att()
+
+        response = self.client.post(f"/devices/{self.ATT_SN}/users/push_bulk",
+                                    json={"user_ids": ["0036", "9001"]})
+        body = response.json()
+        self.assertEqual(body["pushed"], ["9001"])
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertIn("0036", body["errors"][0])
+        self.assertIn("revocation", body["errors"][0])
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.ATT_SN)],
+                         ["DATA DELETE USERINFO PIN=0036", "DATA UPDATE USERINFO PIN=9001"])
+
+    def test_queueing_the_delete_withdraws_a_queued_push_for_the_person(self):
+        self.push(self.ATT_SN, "0036")
+        push_id = self.outbox(self.ATT_SN)[0].id
+
+        response = self.revoke_att()
+        self.assertEqual(response.json()["withdrawn_command_ids"], [push_id])
+        self.assertEqual(self.commands_on(self.ATT_SN), ["DATA DELETE USERINFO PIN=0036"])
+
+    def test_cancelling_clears_it_and_leaves_the_person_on_the_terminal(self):
+        self.revoke_att()
+
+        response = self.cancel(self.ATT_SN, "0036")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["cancelled_command_ids"]), 1)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(len(self.links(self.ATT_SN)), 1)
+
+    def test_it_is_listed_as_one_revocation_with_no_door_permission_half(self):
+        """One command, so not `split`: RevocationCard would otherwise show a
+        "door permission: never queued" line for a table the terminal does
+        not have."""
+        self.revoke_att()
+
+        [group] = self.groups()
+        self.assertEqual(group["user_id"], "0036")
+        self.assertTrue(group["still_open"])
+        self.assertFalse(group["has_door_permission"])
+        self.assertFalse(group["split"])
+        self.assertTrue(group["user"]["outstanding"])
+        self.assertEqual(group["user"]["command"], "DATA DELETE USERINFO PIN=0036")
+        self.assertIsNone(group["userauthorize"])
+
+    def test_it_leaves_the_listing_once_acknowledged(self):
+        self.revoke_att()
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, 0)
+
+        self.assertEqual(self.groups(), [])
+
+    def test_it_is_counted_on_the_device_until_confirmed(self):
+        self.revoke_att()
+
+        device = self.client.get(f"/devices/{self.ATT_SN}").json()
+        self.assertEqual(device["pending_revocations"], 1)
 
 
 class TemplateDeleteOnAccTests(RevocationTestCase):
