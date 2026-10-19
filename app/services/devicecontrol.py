@@ -312,9 +312,17 @@ def parse_options(text: str) -> dict:
 
 
 # The subset of parsed keys the Device Info drawer knows how to show, mapped
-# onto the field names the `att` branch has always returned so one drawer can
-# render either transport. A key the device did not send is simply absent, and
-# the drawer already renders a missing value as an em dash.
+# onto the field names the SDK read used to return so one drawer renders
+# either protocol. A key the device did not send is simply absent, and the
+# drawer already renders a missing value as an em dash. The `acc` names come
+# first in each list; the names after them are the ones an `att` terminal's
+# report is filed under (UPDATE_INFORMATION_KEYS below), and are only reached
+# when the `acc` name is missing.
+#
+# `sizes` carries the enrolment counts an `att` terminal reports on every poll
+# (§9) beside the capacities. The drawer does not show counts on a last-known
+# reading today — it shows capacities only — but they are what an attendance
+# terminal actually tells us, so they are returned for when it does.
 def options_as_info(options: dict) -> dict:
     """Map a parsed parameter dict onto the Device Info shape."""
     def pick(*names):
@@ -326,11 +334,12 @@ def options_as_info(options: dict) -> dict:
     return {
         "serial_number": pick("~SerialNumber", "SerialNumber"),
         "device_name": pick("~DeviceName", "DeviceName"),
-        "firmware_version": pick("FirmVer", "FirmwareVersion"),
+        "firmware_version": pick("FirmVer", "FirmwareVersion", "FWVersion"),
         "platform": pick("MachineType", "~Platform", "Platform"),
         "mac": pick("MAC", "~MAC"),
-        "face_version": pick("ZKFaceVersion", "~ZKFaceVersion", "FaceFunOn"),
-        "fp_version": pick("~ZKFPVersion", "ZKFPVersion"),
+        "face_version": pick("ZKFaceVersion", "~ZKFaceVersion", "FaceVersion",
+                             "FaceFunOn"),
+        "fp_version": pick("~ZKFPVersion", "ZKFPVersion", "FPVersion"),
         "pin_width": pick("~PIN2Width", "PIN2Width"),
         "network": {
             "ip": pick("IPAddress"),
@@ -341,6 +350,10 @@ def options_as_info(options: dict) -> dict:
         "readers": pick("ReaderCount"),
         "aux_outputs": pick("AuxOutCount"),
         "sizes": {
+            "users": pick("UserCount"),
+            "fingers": pick("FPCount"),
+            "records": pick("TransactionCount"),
+            "faces": pick("FaceCount"),
             "users_cap": pick("~MaxUserCount"),
             "rec_cap": pick("~MaxAttLogCount"),
             "fingers_cap": pick("~MaxUserFingerCount"),
@@ -463,6 +476,137 @@ UNLOCK_ATT_DOOR = "AC_UNLOCK"
 # No deadline, like the `acc` restart: queued with the queue's usual patience,
 # so a terminal that is offline when asked restarts when it next polls.
 RESTART_ATT_DEVICE = "REBOOT"
+
+
+# ---------------------------------------------------------------------------
+# What an `att` terminal reports about itself — three doors, one record
+# ---------------------------------------------------------------------------
+#
+# The attendance-mode counterpart of GET OPTIONS above. An `att` terminal
+# behind NAT cannot be dialled for its Device Info any more than an `acc` one
+# can, so its Device Info is the last thing it reported, from whichever of
+# three doors the report came through. All three are Attendance PUSH 2.4.1:
+#
+#   1. §8 "Pushing Configuration Information": `POST cdata?table=options`, a
+#      comma-separated `key=value` line, the same shape parse_options reads.
+#      The terminal sends it unasked after it connects.
+#   2. §9 "Uploading Update Information": an `INFO=` parameter on
+#      `GET /iclock/getrequest`, ten POSITIONAL comma-separated values with no
+#      keys (UPDATE_INFORMATION_KEYS below). Seen on the BioPro SA20
+#      CPV2232560497 as `INFO=Ver 8.0.4.6-20211123,459,479,62501,10.39.1.200,
+#      10,-1,0,0,101,4,14,0` — thirteen values, of which the document names the
+#      first ten.
+#   3. §12.4.3 `INFO`, the command below, answered on /iclock/devicecmd with
+#      `key=value` lines after the ID/Return/CMD line.
+#
+# Each door carries a different part of the picture, and a later report on one
+# door must not erase what another one said — the options push arrives after
+# every connection and may carry only `FingerFunOn=1,FaceFunOn=1` (the §8
+# example). So for an `att` terminal the three are folded into one parameter
+# line, newest value per key (merge_parameters), kept where an `acc`
+# terminal's line is kept, `Device.capabilities`. An `acc` terminal's line is
+# still replaced whole, as it always was: GET OPTIONS answers with every key
+# asked for, so replacing it loses nothing.
+
+
+# INFO — Attendance PUSH 2.4.1 §12.4.3, p.91. Verbatim: "Sending Client
+# Information to the Server. The server gets information such as client
+# configuration. The command format is: C:${CmdID}:INFO", answered with
+# `ID=${XXX}&Return=${XXX}&CMD=INFO${LF}${Key}=${Value}${LF}${Key}=${Value}…`,
+# "specific customer configuration information, in the form of key-value".
+# From the document; not yet observed on hardware. No parameters.
+#
+# The document names none of the keys, so none is assumed: parse_info_reply
+# keeps every line as the terminal wrote it, and options_as_info shows the
+# ones whose names it knows. Which keys the SA20 actually sends is the thing
+# to read in its stored line (or the first 500 characters the devicecmd log
+# line keeps) the first time it answers — and, if they
+# include `~MaxUserCount` or `~MaxAttLogCount`, whether those are plain
+# capacities: options_as_info shows them as Max Users / Max Records verbatim,
+# and attendance firmware is said, unverified, to report them in hundreds and
+# ten-thousands.
+#
+# The reply's Return is a plain status, read by commands.verdict_for's general
+# rule: 0 answered, negative refused. Its key=value lines are stored only from
+# a reply that is acknowledged (adms_devicecmd). Repeating it is harmless — it
+# changes nothing on the terminal — so it keeps the queue's ordinary retries
+# and patience, and an identical one already outstanding is reused, as GET
+# OPTIONS is.
+QUERY_ATT_INFO = "INFO"
+
+
+# §9's ten positional values, in order, under the key names this server
+# files them as. THE NAMES ARE THIS SERVER'S, NOT THE DOCUMENT'S: §9 numbers
+# the values and describes them ("Firmware version number", "Number of
+# enrolled users", …) without naming them. The ones chosen are the names
+# ZKTeco attendance firmware is commonly seen to use for the same facts in an
+# INFO reply, so that a reply carrying them (once one is observed) updates the
+# same entries rather than sitting beside them under a second name. `None`
+# marks a value not kept: Value8 ("Number of faces required for face
+# enrollment") is an enrolment setting, not something Device Info shows, and
+# Value10 is a string of function-support bits whose fourth and fifth digits
+# depend on terminal parameters. Anything past the tenth (the SA20 sends three
+# more) has no meaning in the document and is not kept either.
+UPDATE_INFORMATION_PARAMETER = "INFO"   # the getrequest parameter's name, §9
+
+UPDATE_INFORMATION_KEYS = (
+    "FWVersion",          # Value1  "Firmware version number"
+    "UserCount",          # Value2  "Number of enrolled users"
+    "FPCount",            # Value3  "Number of enrolled fingerprints"
+    "TransactionCount",   # Value4  "Number of attendance records"
+    "IPAddress",          # Value5  "IP address of Equipment"
+    "FPVersion",          # Value6  "Version of fingerprint algorithm"
+    "FaceVersion",        # Value7  "Version of face algorithm"
+    None,                 # Value8  "Number of faces required for face enrollment"
+    "FaceCount",          # Value9  "Number of enrolled faces"
+    None,                 # Value10 "Identifier of functions supported"
+)
+
+
+def parse_update_information(value: str) -> dict:
+    """§9's positional ``INFO=`` value, as a dict under UPDATE_INFORMATION_KEYS.
+
+    Values are kept as strings, exactly as sent (the SA20's face algorithm
+    version is ``-1``, which is what it says, not an error to correct). An
+    empty position says nothing and is left out, so it never blanks a value
+    another report supplied. Never raises.
+    """
+    out = {}
+    for key, raw in zip(UPDATE_INFORMATION_KEYS, (value or "").split(",")):
+        raw = raw.strip()
+        if key and raw:
+            out[key] = raw
+    return out
+
+
+def parse_info_reply(lines) -> dict:
+    """The ``${Key}=${Value}`` lines of an ``INFO`` reply (§12.4.3), as a dict.
+
+    One pair per line. Split on the first ``=`` only, so a value containing
+    one survives; a line with no ``=`` is not a pair and is skipped. Values are
+    kept as sent, like parse_options. Never raises.
+    """
+    out = {}
+    for line in lines or ():
+        key, sep, value = (line or "").partition("=")
+        key = key.strip()
+        if sep and key:
+            out[key] = value.strip()
+    return out
+
+
+def merge_parameters(line: str, fields: dict) -> str:
+    """``line`` with ``fields`` folded in, newest value per key.
+
+    The stored form stays the comma-separated parameter line parse_options
+    reads, so one reader serves both protocols. That form cannot carry a comma
+    inside a value: parse_options would cut such a value at the comma, as it
+    always has for an `acc` line. Device Info is display-only, and no value a
+    terminal is known to report contains one.
+    """
+    merged = parse_options(line)
+    merged.update(fields)
+    return ",".join(f"{key}={value}" for key, value in merged.items())
 
 
 # ---------------------------------------------------------------------------

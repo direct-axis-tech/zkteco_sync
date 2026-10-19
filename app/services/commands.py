@@ -350,6 +350,15 @@ def verdict_for(return_code, command_name: str = "") -> str:
     document; not yet observed on hardware. The terminal may go down before it
     answers at all; what silence leads to is :func:`delivery_limit`'s, not
     anything read here.
+
+    ``INFO``: a status, read by the general rule
+    --------------------------------------------
+    An attendance terminal's self-report (Attendance PUSH 2.4.1 §12.4.3)
+    answers ``CMD=INFO`` with a status and then ``key=value`` lines. The
+    status is read like any other: ``0`` answered, negative refused. It is not
+    a ``DATA QUERY``, so ``Return`` is not a count. From the document; not yet
+    observed on hardware. The lines are stored by the devicecmd endpoint, not
+    read here.
     """
     if return_code is None:
         return UNREADABLE

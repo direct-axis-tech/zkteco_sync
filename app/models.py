@@ -83,9 +83,17 @@ class Device(Base):
     # one column — FaceFunOn, MultiBioDataSupport, MachineType and the rest —
     # and is stored verbatim rather than parsed, because nothing here needs
     # to understand it yet and a parser would be a guess.
+    #
+    # An `att` terminal reports itself in pieces instead — its options push,
+    # the `INFO=` parameter on every poll, its answer to an `INFO` command —
+    # so for one of those this is the same line shape with each piece folded
+    # in, newest value per key (devicecontrol.merge_parameters). Device Info
+    # reads it the same way for both.
     capabilities = Column(Text, nullable=True)
 
-    # When that line last arrived (E15). Without it, the Device Info drawer on
+    # When that line last arrived (E15) — for an `att` terminal, when any piece
+    # of it last did, which on a polling terminal is its last poll that
+    # carried `INFO=`. Without it, the Device Info drawer on
     # an `acc` terminal could say "last known" but not "last known as of when",
     # and an unfalsifiable "last known" is barely better than presenting stale
     # values as live. Nullable and additive: an existing row keeps its

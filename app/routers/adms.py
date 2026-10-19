@@ -44,7 +44,9 @@ from app.models import (
     AttendanceLog, BiometricTemplate, Device, DeviceCommandOutbox, EmployeePhoto,
 )
 from app.net import client_ip, ip_in_cidrs
-from app.services import commands, employee_sync, pairing, provisioning
+from app.services import (
+    commands, devicecontrol, employee_sync, pairing, provisioning,
+)
 
 router = APIRouter(tags=["adms"])
 
@@ -531,8 +533,17 @@ async def adms_receive(
         # PushOptionsFlag=1. Same one-line comma-separated shape as the
         # registration body, and just as useful to keep: it is a complete
         # capability inventory.
+        #
+        # An `att` terminal pushes this too (Attendance PUSH §8), after every
+        # connection, and it is one of three pieces of what that terminal
+        # reports about itself — possibly only `FingerFunOn=1,FaceFunOn=1` —
+        # so it is folded into the stored line instead of replacing it.
         raw = await request.body()
-        _store_capabilities(db, device, raw.decode("utf-8", errors="ignore"))
+        body = raw.decode("utf-8", errors="ignore")
+        if _uses_attendance_push(device):
+            _record_reported_parameters(device, devicecontrol.parse_options(body))
+        else:
+            _store_capabilities(db, device, body)
         _touch(db, device, request)
         return PlainTextResponse(content="OK")
 
@@ -1340,6 +1351,30 @@ def _store_capabilities(db: Session, device: Device, body: str) -> None:
     db.commit()
 
 
+def _uses_attendance_push(device: Device) -> bool:
+    """The same split devices._uses_command_queue makes: anything not `acc`."""
+    return (device.protocol or "att") != "acc"
+
+
+def _record_reported_parameters(device: Device, fields: dict) -> None:
+    """Fold what an `att` terminal just reported into its parameter line.
+
+    An attendance terminal reports itself in pieces, through three doors
+    (devicecontrol, "What an `att` terminal reports about itself"), so each
+    piece is merged into `capabilities` rather than replacing it; `acc`
+    terminals keep _store_capabilities' replace. `capabilities_at` moves on
+    every report, because it is when the terminal last spoke about itself.
+    Not committed here: every caller commits on its own path (_touch, or the
+    acknowledgement's commit), so a report rides on a write that was
+    happening anyway.
+    """
+    if device is None or not fields:
+        return
+    merged = devicecontrol.merge_parameters(device.capabilities or "", fields)
+    device.capabilities = merged[:_CAPABILITIES_LIMIT]
+    device.capabilities_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 @router.get("/iclock/ping", response_class=PlainTextResponse)
 def adms_ping(
     request: Request,
@@ -1364,6 +1399,15 @@ def adms_getrequest(
     device, refusal = _authorise(SN, request, db)
     if refusal:
         return refusal
+    # An `att` terminal tells the server its firmware, address and enrolment
+    # counts on this very request, unasked: the `INFO=` parameter (Attendance
+    # PUSH §9, devicecontrol.parse_update_information). Kept, so Device Info
+    # can answer from it without dialling the terminal. It rides on _touch's
+    # commit. A Security PUSH (`acc`) terminal has no such parameter.
+    if _uses_attendance_push(device):
+        _record_reported_parameters(
+            device, devicecontrol.parse_update_information(
+                _query(request, devicecontrol.UPDATE_INFORMATION_PARAMETER)))
     _touch(db, device, request)
 
     # Delivery, retry and the attempt counter all live in one place —
@@ -1395,9 +1439,16 @@ def _parse_devicecmd(raw: str) -> list:
     * some builds report several results in one POST, one per line, so each
       line is parsed separately;
     * ``Return`` may be signed (``Return=-14`` is a documented device-side
-      error), so it is parsed as a signed integer.
+      error), so it is parsed as a signed integer;
+    * a few replies carry more than the ack line. An attendance terminal's
+      ``INFO`` (Attendance PUSH §12.4.3) answers
+      ``ID=…&Return=…&CMD=INFO${LF}${Key}=${Value}${LF}…``, and §13 says "a
+      small number of replies contain other information". Lines that are not
+      an ack belong to the ack before them, and are handed back with it as
+      ``content``, in order and unparsed.
 
-    Returns ``[{"id": int, "return_code": int, "cmd": str}, …]``, skipping any
+    Returns ``[{"id": int, "return_code": int, "cmd": str}, …]``, plus
+    ``"content": [str, …]`` on an ack that had lines after it, skipping any
     fragment without a usable numeric ``ID``. Never raises: a malformed ack is
     worth a log line, not a 500 that makes the device retry the whole command.
     """
@@ -1416,6 +1467,8 @@ def _parse_devicecmd(raw: str) -> list:
 
         raw_id = fields.get("id", "")
         if not raw_id.lstrip("-").isdigit():
+            if results:
+                results[-1].setdefault("content", []).append(line)
             continue
 
         raw_return = fields.get("return", "")
@@ -1447,7 +1500,7 @@ async def adms_devicecmd(
     retried until it is declared failed. Both now come from the device's own
     report: the id it names, and the code it returned.
     """
-    _, refusal = _authorise(SN, request, db)
+    device, refusal = _authorise(SN, request, db)
     if refusal:
         return refusal
 
@@ -1542,6 +1595,14 @@ async def adms_devicecmd(
             # not when the delete was queued. A refusal leaves both the finger
             # on the terminal and the stored copy that matches it.
             provisioning.note_fingerprint_delete_acknowledged(db, SN, body)
+            # And an att terminal's answer to `INFO` (§12.4.3): the
+            # key=value lines after its ack are what it says about itself,
+            # folded into what Device Info shows. Only from an answered INFO
+            # this server queued — content on any other ack is left to the
+            # log line above.
+            if commands.strip_envelope(body).upper() == devicecontrol.QUERY_ATT_INFO:
+                _record_reported_parameters(
+                    device, devicecontrol.parse_info_reply(ack.get("content")))
             db.commit()
         elif outcome == "rejected":
             # The mirror image, and the reason E4 can queue a biometric behind

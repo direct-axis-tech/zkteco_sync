@@ -9965,6 +9965,9 @@ SPEC_AC_UNLOCK = "AC_UNLOCK"
 # Attendance PUSH 2.4.1 §12.7.1, verbatim: "To reboot the client, the command
 # format is: C: ${CmdID}: REBOOT"
 SPEC_REBOOT = "REBOOT"
+# Attendance PUSH 2.4.1 §12.4.3, verbatim: "The server gets information such as
+# client configuration. The command format is: C: ${CmdID}: INFO"
+SPEC_INFO = "INFO"
 
 
 class DeviceControlShapeTests(unittest.TestCase):
@@ -10042,6 +10045,10 @@ class DeviceControlShapeTests(unittest.TestCase):
     def test_the_attendance_restart_command_is_the_documented_shape(self):
         """The verb alone: §12.7.1 defines no parameters."""
         self.assertEqual(self.dc.RESTART_ATT_DEVICE, SPEC_REBOOT)
+
+    def test_the_attendance_info_command_is_the_documented_shape(self):
+        """The verb alone: §12.4.3 defines no parameters."""
+        self.assertEqual(self.dc.QUERY_ATT_INFO, SPEC_INFO)
 
     def test_get_options_is_comma_separated_with_no_trailing_comma(self):
         """§12.5.2: "Multiple parameters are separated by commas, but the last
@@ -10876,14 +10883,6 @@ class ControlActionsWithNoAccCommandTests(DeviceControlRoutingTestCase):
         detail = self.refused(self.clear_lcd, self.SN)
         self.assertIn("Nothing was queued", detail)
 
-    def test_refresh_info_is_refused_on_an_att_device(self):
-        """The mirror image: `att` reads live every time, so there is nothing
-        to refresh, and saying so beats a button that queues a command an
-        attendance terminal has no table for."""
-        response = self.refresh_info(self.ATT_SN)
-        self.assertEqual(response.status_code, 501, response.text)
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-
     def test_a_refused_action_never_leaves_anything_on_the_queue(self):
         """Stated once as a property over all four, because 'nothing was
         queued' is the claim the 501 text makes to the operator."""
@@ -11114,6 +11113,322 @@ class DeviceInfoOnAccTests(DeviceControlRoutingTestCase):
                 self.assertEqual(devicecontrol.parse_options(text), {})
 
 
+# The `INFO=` parameter the BioPro SA20 CPV2232560497 sends on
+# /iclock/getrequest (production log, 2026-10-19). Attendance PUSH 2.4.1 §9
+# names the first ten values; the SA20 sends thirteen.
+SA20_UPDATE_INFORMATION = (
+    "Ver 8.0.4.6-20211123,459,479,62501,10.39.1.200,10,-1,0,0,101,4,14,0")
+
+
+class AttDeviceInfoTests(DeviceControlRoutingTestCase):
+    """Device Info for an attendance terminal, from what it reported.
+
+    Until 2026-10-19 the `att` branch read the terminal live over the SDK, TCP
+    4370, which never reaches a terminal behind NAT (`GET
+    /devices/CPV2232560497/info 503` in production), and Refresh was refused.
+    Device Info now answers from what the terminal reported about itself — the
+    `INFO=` parameter on every poll (§9), its options push (§8) and its answer
+    to `INFO` (§12.4.3) — and Refresh queues `INFO`.
+    """
+
+    INFO_REPLY_LINES = (
+        "~DeviceName=SA20",
+        "MAC=00:17:61:aa:bb:cc",
+        "~Platform=ZMM220_TFT",
+        "NetMask=255.255.255.0",
+        "GATEIPAddress=10.39.1.1",
+    )
+
+    def tripwire(self):
+        """`device_connection`, which must not be reached on any branch now."""
+        from unittest import mock
+
+        def _dial(*args, **kwargs):
+            raise AssertionError("device info dialled the SDK")
+
+        return mock.patch("app.routers.devices.device_connection", _dial)
+
+    def poll_reporting(self, sn, update_information=SA20_UPDATE_INFORMATION):
+        """One /iclock/getrequest carrying §9's `INFO=` parameter."""
+        return self.client.get("/iclock/getrequest",
+                               params={"SN": sn, "INFO": update_information})
+
+    def push_options(self, sn, line):
+        return self.client.post(f"/iclock/cdata?SN={sn}&table=options",
+                                content=line)
+
+    def answer_info(self, sn, return_code=0, lines=INFO_REPLY_LINES, cmd="INFO"):
+        """Deliver the outstanding command and answer it as §12.4.3 shows."""
+        command_id = self.outbox(sn)[-1].id
+        self.poll(sn)
+        body = "\n".join([f"ID={command_id}&Return={return_code}&CMD={cmd}",
+                          *lines])
+        return self.client.post(f"/iclock/devicecmd?SN={sn}", content=body)
+
+    def capabilities(self, sn):
+        db = self.Session()
+        try:
+            return db.query(Device).filter_by(serial_number=sn).one().capabilities
+        finally:
+            db.close()
+
+    # -- reading -------------------------------------------------------------
+
+    def test_info_on_an_att_device_never_opens_a_socket_or_queues(self):
+        self.poll_reporting(self.ATT_SN)
+        with self.tripwire():
+            response = self.info(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_info_reports_what_the_poll_parameter_said(self):
+        self.poll_reporting(self.ATT_SN)
+
+        body = self.info(self.ATT_SN).json()
+        self.assertEqual(body["firmware_version"], "Ver 8.0.4.6-20211123")
+        self.assertEqual(body["network"]["ip"], "10.39.1.200")
+        self.assertEqual(body["fp_version"], "10")
+        self.assertEqual(body["face_version"], "-1")
+        self.assertEqual(
+            {k: body["sizes"][k] for k in ("users", "fingers", "records")},
+            {"users": "459", "fingers": "479", "records": "62501"})
+
+    def test_info_is_labelled_last_known_with_when_it_was_reported(self):
+        """The drawer shows its "Last known" banner and Refresh button on
+        `source`, and never presents these values as live."""
+        self.poll_reporting(self.ATT_SN)
+
+        body = self.info(self.ATT_SN).json()
+        self.assertEqual(body["source"], "last_known")
+        self.assertEqual(body["transport"], "adms_last_known")
+        self.assertIsNotNone(body["as_of"])
+        self.assertIn("not a live reading", body["message"])
+        self.assertIn("each time it polls", body["message"])
+
+    def test_a_later_poll_replaces_the_counts_it_reports(self):
+        self.poll_reporting(self.ATT_SN)
+        self.poll_reporting(self.ATT_SN, SA20_UPDATE_INFORMATION.replace(
+            ",459,", ",460,"))
+
+        self.assertEqual(self.info(self.ATT_SN).json()["sizes"]["users"], "460")
+
+    def test_a_poll_without_the_parameter_changes_nothing_stored(self):
+        self.poll(self.ATT_SN)
+
+        self.assertIsNone(self.capabilities(self.ATT_SN))
+        self.assertIsNone(self.info(self.ATT_SN).json()["as_of"])
+
+    def test_an_options_push_is_folded_in_rather_than_replacing(self):
+        """§8's own example push is two keys. Replacing the stored line with
+        it would erase the firmware and counts the last poll reported."""
+        self.poll_reporting(self.ATT_SN)
+        self.push_options(self.ATT_SN, "~DeviceName=SA20,FingerFunOn=1")
+
+        body = self.info(self.ATT_SN).json()
+        self.assertEqual(body["device_name"], "SA20")
+        self.assertEqual(body["firmware_version"], "Ver 8.0.4.6-20211123")
+
+    def test_an_unclassified_device_answers_from_what_it_reported(self):
+        self.poll_reporting(self.DEFAULT_SN)
+        with self.tripwire():
+            body = self.info(self.DEFAULT_SN).json()
+
+        self.assertEqual(body["firmware_version"], "Ver 8.0.4.6-20211123")
+        self.assertEqual(body["source"], "last_known")
+
+    def test_info_with_nothing_reported_says_so_rather_than_inventing(self):
+        body = self.info(self.ATT_SN).json()
+
+        self.assertEqual(body["parameter_count"], 0)
+        self.assertIn("has not reported anything about itself yet",
+                      body["message"])
+        self.assertEqual(body["serial_number"], self.ATT_SN)
+
+    # -- refresh -------------------------------------------------------------
+
+    def test_refresh_queues_info_and_never_opens_a_socket(self):
+        with self.tripwire():
+            response = self.refresh_info(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_INFO])
+
+    def test_the_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.refresh_info(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         f"C:{command_id}:INFO".encode())
+
+    def test_an_unclassified_device_is_asked_with_info(self):
+        self.refresh_info(self.DEFAULT_SN)
+
+        self.assertEqual([r.command for r in self.outbox(self.DEFAULT_SN)],
+                         [SPEC_INFO])
+
+    def test_an_acc_device_is_still_asked_with_get_options(self):
+        """INFO is not a command on an acc terminal, and GET OPTIONS is not
+        one on an att terminal."""
+        from app.services import devicecontrol
+
+        self.refresh_info(self.ATT_SN)
+        self.refresh_info(self.SN)
+
+        self.assertEqual([r.command for r in self.outbox(self.SN)],
+                         [devicecontrol.QUERY_OPTIONS])
+        self.assertEqual([r.command for r in self.outbox(self.ATT_SN)],
+                         [SPEC_INFO])
+
+    def test_the_reply_has_the_queued_shape_the_acc_reply_has(self):
+        """DeviceInfoDrawer toasts `message`; everything else matches acc's so
+        one caller reads either."""
+        att = self.refresh_info(self.ATT_SN)
+        acc = self.refresh_info(self.SN)
+
+        self.assertEqual(att.status_code, acc.status_code)
+        body = att.json()
+        self.assertEqual(sorted(body), sorted(acc.json()))
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["command"], SPEC_INFO)
+        self.assertIn("Queued: asked the terminal to report its information",
+                      body["message"])
+        self.assertIn("polls", body["message"])
+
+    def test_a_second_refresh_reuses_the_outstanding_one(self):
+        first = self.refresh_info(self.ATT_SN).json()
+        second = self.refresh_info(self.ATT_SN).json()
+
+        self.assertEqual(len(self.outbox(self.ATT_SN)), 1)
+        self.assertEqual(second["command_id"], first["command_id"])
+        self.assertIn("already waiting", second["message"])
+
+    # -- the INFO reply ------------------------------------------------------
+
+    def test_the_reply_lines_are_stored_and_shown(self):
+        self.refresh_info(self.ATT_SN)
+        self.answer_info(self.ATT_SN)
+
+        body = self.info(self.ATT_SN).json()
+        self.assertEqual(body["device_name"], "SA20")
+        self.assertEqual(body["mac"], "00:17:61:aa:bb:cc")
+        self.assertEqual(body["platform"], "ZMM220_TFT")
+        self.assertEqual(body["network"]["mask"], "255.255.255.0")
+        self.assertEqual(body["network"]["gateway"], "10.39.1.1")
+        self.assertIsNotNone(body["as_of"])
+
+    def test_the_reply_is_folded_in_beside_what_the_poll_reported(self):
+        self.poll_reporting(self.ATT_SN)
+        self.refresh_info(self.ATT_SN)
+        self.answer_info(self.ATT_SN)
+
+        body = self.info(self.ATT_SN).json()
+        self.assertEqual(body["device_name"], "SA20")
+        self.assertEqual(body["sizes"]["users"], "459")
+
+    def test_return_zero_concludes_it_acknowledged(self):
+        self.refresh_info(self.ATT_SN)
+        self.answer_info(self.ATT_SN)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual([(r.command, r.outcome, r.return_code)
+                          for r in self.history(self.ATT_SN)],
+                         [(SPEC_INFO, "acknowledged", 0)])
+
+    def test_a_refused_reply_stores_nothing(self):
+        self.refresh_info(self.ATT_SN)
+        self.answer_info(self.ATT_SN, return_code=-1002)
+
+        self.assertIsNone(self.capabilities(self.ATT_SN))
+        [listed] = self.client.get(
+            f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual(listed["verdict"], "refused")
+
+    def test_lines_after_another_commands_ack_are_not_stored(self):
+        """Only an answered INFO is the terminal describing itself."""
+        self.queue(SPEC_REBOOT, sn=self.ATT_SN)
+        self.answer_info(self.ATT_SN, cmd="REBOOT")
+
+        self.assertIsNone(self.capabilities(self.ATT_SN))
+
+    # -- acc unchanged -------------------------------------------------------
+
+    def test_an_acc_options_push_still_replaces_the_line(self):
+        self.push_options(self.SN, "~DeviceName=BioFace A1,LockCount=1")
+        self.push_options(self.SN, "FirmVer=Ver 8.0.1.3-20151229")
+
+        self.assertEqual(self.capabilities(self.SN),
+                         "FirmVer=Ver 8.0.1.3-20151229")
+
+    def test_an_acc_poll_never_writes_the_line(self):
+        """Security PUSH has no `INFO=` parameter; one appearing on an acc
+        terminal's poll is not read as §9's."""
+        self.poll_reporting(self.SN)
+
+        self.assertIsNone(self.capabilities(self.SN))
+
+
+class AttReportParsingTests(unittest.TestCase):
+    """The two attendance-only shapes a terminal reports itself in."""
+
+    def setUp(self):
+        from app.services import devicecontrol
+        self.dc = devicecontrol
+
+    def test_the_sa20s_poll_parameter_parses_to_the_documented_positions(self):
+        """§9 names ten values; the eighth and tenth are not kept, nor is
+        anything after the tenth."""
+        self.assertEqual(
+            self.dc.parse_update_information(SA20_UPDATE_INFORMATION),
+            {"FWVersion": "Ver 8.0.4.6-20211123", "UserCount": "459",
+             "FPCount": "479", "TransactionCount": "62501",
+             "IPAddress": "10.39.1.200", "FPVersion": "10",
+             "FaceVersion": "-1", "FaceCount": "0"})
+
+    def test_the_documents_own_example_parses_despite_its_stray_space(self):
+        """§9's example: `INFO=Ver 2.0.12-20150625,0,0,0,192.168.16.27,10,7,
+        15, 0,111` — a space before the ninth value."""
+        parsed = self.dc.parse_update_information(
+            "Ver 2.0.12-20150625,0,0,0,192.168.16.27,10,7,15, 0,111")
+        self.assertEqual(parsed["FaceCount"], "0")
+        self.assertEqual(parsed["IPAddress"], "192.168.16.27")
+
+    def test_an_empty_position_is_left_out_rather_than_blanking_a_value(self):
+        parsed = self.dc.parse_update_information("Ver 1,,5")
+        self.assertNotIn("UserCount", parsed)
+        self.assertEqual(parsed["FPCount"], "5")
+
+    def test_the_poll_parameter_parser_never_raises_on_rubbish(self):
+        for value in ("", None, ",,,"):
+            with self.subTest(value=value):
+                self.assertEqual(self.dc.parse_update_information(value), {})
+
+    def test_info_reply_lines_keep_values_containing_equals_and_commas(self):
+        parsed = self.dc.parse_info_reply(
+            ["~OEMVendor=ZKTeco, Inc.", "A=x=y", "no pair here", "=orphan"])
+        self.assertEqual(parsed, {"~OEMVendor": "ZKTeco, Inc.", "A": "x=y"})
+
+    def test_merging_keeps_old_keys_and_takes_the_newest_value(self):
+        merged = self.dc.merge_parameters(
+            "UserCount=459,FWVersion=Ver 8", {"UserCount": "460", "MAC": "m"})
+        self.assertEqual(self.dc.parse_options(merged),
+                         {"UserCount": "460", "FWVersion": "Ver 8", "MAC": "m"})
+
+    def test_devicecmd_lines_after_an_ack_belong_to_that_ack(self):
+        """§12.4.3's reply shape, followed by a second ack in the same POST
+        (§13: "${LF} is used to connect multiple command reply records")."""
+        parsed = adms._parse_devicecmd(
+            "ID=7&Return=0&CMD=INFO\n~DeviceName=SA20\nMAC=m\n"
+            "ID=8&Return=0&CMD=DATA\n")
+        self.assertEqual(parsed, [
+            {"id": 7, "return_code": 0, "cmd": "INFO",
+             "content": ["~DeviceName=SA20", "MAC=m"]},
+            {"id": 8, "return_code": 0, "cmd": "DATA"},
+        ])
+
+
 class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
     """The E12 AST guard, extended to device control.
 
@@ -11155,7 +11470,23 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
         ("REBOOT",
          "Attendance-protocol restart. acc restarts with CONTROL DEVICE "
          "03000000."),
+        ("INFO",
+         "Attendance-protocol self-report (§12.4.3). acc is asked with GET "
+         "OPTIONS."),
     ]
+
+    # Markers matched as a whole word rather than as a substring, because the
+    # substring is inside legitimate strings: `INFO` is in every `USERINFO`
+    # command. A literal carrying INFO as a word of its own (`INFO`,
+    # `C:1:INFO`, `CMD=INFO`) is still caught.
+    WHOLE_WORD = {"INFO"}
+
+    def carries(self, marker, literal):
+        import re
+
+        if marker in self.WHOLE_WORD:
+            return re.search(rf"\b{re.escape(marker)}\b", literal) is not None
+        return marker in literal
 
     # Markers now implemented for `att` terminals from the Attendance PUSH
     # document, and the only modules allowed to hold them: where the command
@@ -11178,6 +11509,11 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
         # commands.delivery_limit reads the constant, not the text, to hand it
         # over once only. Routing: AttRestartTests.
         "REBOOT": {"devicecontrol.py"},
+        # devicecontrol.QUERY_ATT_INFO (§12.4.3), and the §9 getrequest
+        # parameter of the same name (UPDATE_INFORMATION_PARAMETER). The
+        # devicecmd endpoint matches the reply against the constant, not the
+        # text. Routing: AttDeviceInfoTests.
+        "INFO": {"devicecontrol.py"},
     }
 
     def string_literals(self, tree):
@@ -11208,7 +11544,7 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
                 for marker, why in self.FORBIDDEN:
                     if path.name in self.ATTENDANCE_HOMES.get(marker, ()):
                         continue
-                    if marker in literal:
+                    if self.carries(marker, literal):
                         offenders.append(f"{path.name}: {marker!r} — {why}")
         self.assertEqual(offenders, [])
 
@@ -11224,8 +11560,19 @@ class UnverifiedControlCommandsAreNotInventedTests(unittest.TestCase):
 
         module = ast.parse('x = "C:1:AC_UNLOCK"\n')
         found = [m for m, _ in self.FORBIDDEN
-                 for lit in self.string_literals(module) if m in lit]
+                 for lit in self.string_literals(module)
+                 if self.carries(m, lit)]
         self.assertEqual(found, ["AC_UNLOCK"])
+
+    def test_the_whole_word_guard_catches_info_but_not_userinfo(self):
+        import ast
+
+        module = ast.parse(
+            'a = "C:1:INFO"\nb = "DATA QUERY USERINFO PIN=1"\n')
+        found = [(m, lit) for m, _ in self.FORBIDDEN
+                 for lit in self.string_literals(module)
+                 if self.carries(m, lit)]
+        self.assertEqual(found, [("INFO", "C:1:INFO")])
 
     def test_the_door_command_the_app_does_send_is_the_specs_own_bytes(self):
         """The positive half. The guard above forbids the wrong shapes; this

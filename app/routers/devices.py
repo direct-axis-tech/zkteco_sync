@@ -8,7 +8,7 @@ from fastapi import (
 )
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
+from zk.exception import ZKErrorConnection, ZKNetworkError
 
 from app import audit, config
 from app.database import get_db
@@ -40,16 +40,6 @@ def _get_device_or_404(sn: str, db: Session) -> Device:
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     return device
-
-
-def _safe(fn, default=None):
-    """Call an optional device getter, returning ``default`` if the device
-    reports it cannot read that field (some models lack MAC, face/fp version,
-    etc. and raise ZKErrorResponse instead of returning a value)."""
-    try:
-        return fn()
-    except ZKErrorResponse:
-        return default
 
 
 def _as_device_local(dt: datetime, zone: str) -> datetime:
@@ -827,109 +817,105 @@ def _queued_control_response(sn: str, row, response: Response, what: str,
 
 @router.get("/{sn}/info", response_model=None)
 def get_device_info(sn: str, db: Session = Depends(get_db)):
-    """What this device is.
+    """What this device is: the **last known** values it reported, parsed.
 
-    * `att` — read live over TCP 4370, unchanged.
-    * `acc` — the **last known** parameter line the device sent us, parsed.
-      Not a live read and labelled as such, with the time it arrived.
+    Not a live read and labelled as such, with the time they arrived. Both
+    protocols answer from `capabilities`, and neither dials anything:
 
-    Why last-known rather than a refusal: this is the one read where the value
-    can be sourced from something the device volunteers. Every `acc` terminal
-    pushes a complete comma-separated parameter inventory at registration, and
-    again whenever it re-sends its options (`PushOptionsFlag=1`, which this
-    hardware sets). That line is already stored verbatim in `capabilities`.
-    Rendering it is reporting what the device said; the only dishonesty
-    available would be presenting it as current, which is why the response
-    carries `source: "last_known"` and `as_of`, and why the drawer says so.
+    * `acc` — the comma-separated parameter line the terminal pushes at
+      registration and whenever it re-sends its options (`PushOptionsFlag=1`,
+      which this hardware sets), or sends in answer to `GET OPTIONS`.
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — what the terminal reports about
+      itself through Attendance PUSH's three doors, folded into one line
+      (devicecontrol, "What an `att` terminal reports about itself"): its
+      firmware, address and enrolment counts on every poll (§9), its options
+      after every connection (§8), and its answer to `INFO` (§12.4.3). Until
+      2026-10-19 this read the terminal live over the SDK, TCP 4370, which
+      never reaches a terminal behind NAT — the `GET /devices/CPV2232560497/
+      info 503` in production.
 
-    There is also a live path — `GET OPTIONS`, §12.5.2 — but it is a *queued*
-    command answered a poll later, so it cannot serve a synchronous GET. It is
-    offered separately as Refresh, below.
+    Why last-known rather than a refusal: this is the one read whose value is
+    something the device volunteers. Rendering it is reporting what the device
+    said; the only dishonesty available would be presenting it as current,
+    which is why the response carries `source: "last_known"` and `as_of`, and
+    why the drawer says so.
+
+    There is also a fresh path — `GET OPTIONS` on acc, `INFO` on att — but it
+    is a *queued* command answered a poll later, so it cannot serve a
+    synchronous GET. It is offered separately as Refresh, below.
     """
     device = _get_device_or_404(sn, db)
 
+    options = devicecontrol.parse_options(device.capabilities or "")
+    info = devicecontrol.options_as_info(options)
     if _uses_command_queue(device):
-        options = devicecontrol.parse_options(device.capabilities or "")
-        info = devicecontrol.options_as_info(options)
-        info.update({
-            "device_sn": sn,
-            "transport": "adms_last_known",
-            "source": "last_known",
-            "as_of": device.capabilities_at,
-            "parameter_count": len(options),
-            "message": (
-                "Last known values, reported by the terminal itself — not a "
-                "live reading. An access-control terminal cannot be dialled "
-                "for this; it sends its parameters when it registers and "
-                "whenever they change. Use Refresh to ask it again, which is "
-                "queued and answers on its next poll."
-                if options else
-                "This terminal has not sent its parameters yet, so there is "
-                "nothing to show. They arrive when it registers; Refresh asks "
-                "for them now, which is queued and answers on its next poll."
-            ),
-        })
-        # The serial is the one field we always know for certain, whatever the
-        # device has or has not told us about itself.
-        info["serial_number"] = info.get("serial_number") or sn
-        return info
-
-    try:
-        with device_connection(device) as conn:
-            conn.read_sizes()
-            return {
-                "serial_number": conn.get_serialnumber(),
-                "firmware_version": conn.get_firmware_version(),
-                "platform": conn.get_platform(),
-                "device_name": conn.get_device_name(),
-                "mac": _safe(conn.get_mac),
-                "face_version": _safe(conn.get_face_version),
-                "fp_version": _safe(conn.get_fp_version),
-                "pin_width": _safe(conn.get_pin_width),
-                "network": conn.get_network_params(),
-                "sizes": {
-                    "users": getattr(conn, "users", 0),
-                    "fingers": getattr(conn, "fingers", 0),
-                    "records": getattr(conn, "records", 0),
-                    "cards": getattr(conn, "cards", 0),
-                    "faces": getattr(conn, "faces", 0),
-                    "users_cap": getattr(conn, "users_cap", 0),
-                    "fingers_cap": getattr(conn, "fingers_cap", 0),
-                    "rec_cap": getattr(conn, "rec_cap", 0),
-                    "faces_cap": getattr(conn, "faces_cap", 0),
-                },
-            }
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+        how_it_reports = (
+            "An access-control terminal cannot be dialled for this; it sends "
+            "its parameters when it registers and whenever they change."
+        )
+        nothing_yet = (
+            "This terminal has not sent its parameters yet, so there is "
+            "nothing to show. They arrive when it registers;"
+        )
+    else:
+        how_it_reports = (
+            "This terminal is not dialled for this; it reports its firmware, "
+            "address and enrolment counts each time it polls, and its "
+            "parameters each time it connects."
+        )
+        nothing_yet = (
+            "This terminal has not reported anything about itself yet, so "
+            "there is nothing to show. It does so when it next polls;"
+        )
+    info.update({
+        "device_sn": sn,
+        "transport": "adms_last_known",
+        "source": "last_known",
+        "as_of": device.capabilities_at,
+        "parameter_count": len(options),
+        "message": (
+            "Last known values, reported by the terminal itself — not a live "
+            f"reading. {how_it_reports} Use Refresh to ask it again, which is "
+            "queued and answers on its next poll."
+            if options else
+            f"{nothing_yet} Refresh asks for them now, which is queued and "
+            "answers on its next poll."
+        ),
+    })
+    # The serial is the one field we always know for certain, whatever the
+    # device has or has not told us about itself.
+    info["serial_number"] = info.get("serial_number") or sn
+    return info
 
 
 @router.post("/{sn}/info/refresh", dependencies=[Depends(require_admin)])
 def refresh_device_info(sn: str, response: Response, db: Session = Depends(get_db)):
-    """Ask an `acc` terminal to re-send its parameters (`GET OPTIONS`).
+    """Ask the terminal to report itself again. 202: queued, not refreshed.
 
-    §12.5.2. The device does not answer inline: it POSTs the parameters to
-    /iclock/querydata with `tablename=options` and acknowledges separately, so
-    this returns 202 and the values appear in Device Info a poll later.
+    Neither protocol answers inline, so the values appear in Device Info a
+    poll later. An identical request already outstanding is reused rather
+    than queued twice, because asking again only delays the answer.
 
-    `att` has no equivalent and does not need one — its Device Info is read
-    live over the SDK every time the drawer opens, so there is nothing to
-    refresh.
+    * `acc` — `GET OPTIONS` (§12.5.2). The device POSTs the parameters to
+      /iclock/querydata with `tablename=options` and acknowledges separately.
+    * `att` (and a device whose protocol was never set) — `INFO`
+      (devicecontrol.QUERY_ATT_INFO, Attendance PUSH 2.4.1 §12.4.3). The
+      terminal answers on /iclock/devicecmd with its acknowledgement followed
+      by `key=value` lines, stored when it is acknowledged. Until 2026-10-19
+      this was refused with 501, because att Device Info was read live over
+      the SDK and there was nothing to refresh.
     """
     device = _get_device_or_404(sn, db)
-    if not _uses_command_queue(device):
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                f"{sn} is read live over the SDK every time Device Info is "
-                "opened, so there is nothing to refresh — close and reopen it. "
-                "Refresh exists for access-control terminals, which cannot be "
-                "dialled and answer on their next poll instead."
-            ),
-        )
-    row, created = provisioning.queue_query(
-        db, sn, devicecontrol.QUERY_OPTIONS)
+    if _uses_command_queue(device):
+        command, what = (devicecontrol.QUERY_OPTIONS,
+                         "asked the terminal to re-send its parameters")
+    else:
+        command, what = (devicecontrol.QUERY_ATT_INFO,
+                         "asked the terminal to report its information")
+    row, created = provisioning.queue_query(db, sn, command)
     return _queued_control_response(
-        sn, row, response, "asked the terminal to re-send its parameters",
+        sn, row, response, what,
         extra="" if created else
         " (an identical request was already waiting, so this reuses it "
         "rather than costing another poll cycle.)",
@@ -1290,9 +1276,9 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 # (clear_device_attendance) is queued too, as `CLEAR LOG`, and so are opening
 # its door (unlock_door), as `AC_UNLOCK` with the same short deadline as acc's
 # door command, and restarting it (restart_device), as `REBOOT`, handed over
-# once only. Device info still routes `att` to the SDK until it is moved too;
-# clock, lock state and LCD message stay there for good, having no
-# attendance-mode command.
+# once only. Device info (get_device_info) answers from what the terminal last
+# reported, and its Refresh queues `INFO`. Clock, lock state and LCD message
+# stay on the SDK for good, having no attendance-mode command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
