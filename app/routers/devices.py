@@ -1240,11 +1240,12 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 #          arrives (app/services/provisioning.note_acknowledged), not here,
 #          because until then "this person is on this device" is not true yet.
 #
-# The single-person push no longer uses the SDK for `att`: it queues one
-# `DATA UPDATE USERINFO` on the same outbox, with the same acknowledgement
-# rule, because an attendance terminal behind NAT can never be dialled (the
-# BioPro SA20 CPV2232560497 is one). See push_user_to_device. The other
-# endpoints here still route `att` to the SDK until they are moved too.
+# Pushing people — one (push_user_to_device) or several (push_users_bulk) —
+# no longer uses the SDK for `att`: each person is one `DATA UPDATE USERINFO`
+# on the same outbox, with the same acknowledgement rule, because an
+# attendance terminal behind NAT can never be dialled (the BioPro SA20
+# CPV2232560497 is one). The other endpoints here still route `att` to the
+# SDK until they are moved too.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
@@ -1276,87 +1277,67 @@ def list_device_users(sn: str, db: Session = Depends(get_db)):
 @router.post("/{sn}/users/push_bulk", dependencies=[Depends(require_admin)])
 def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
                     db: Session = Depends(get_db)):
-    """Push several employees to one device. Same two transports, same rules.
+    """Push several employees to one device: the single push, once per person.
 
-    On an `acc` device this is queueing, and the queue is deliberately slow:
-    COMMAND_BATCH_SIZE is 1 and a terminal polls about every 10 seconds, so
-    each person costs two commands and roughly 20 seconds. Ten people is
-    several minutes and it is not stuck. That number is not raised here on
-    spec — no real terminal has ever been observed acknowledging a
-    multi-command reply, and mis-acknowledging is the exact bug E7 fixed.
+    Both protocols queue on the ADMS outbox, exactly as push_user_to_device
+    does, with the same per-person command: two (user record and door
+    permission) on `acc`, one `DATA UPDATE USERINFO` on `att` and on a device
+    whose protocol was never set. Until 2026-10-19 the `att` side wrote over
+    the SDK, TCP 4370, which never reaches a terminal behind NAT.
+
+    The queue is deliberately slow: COMMAND_BATCH_SIZE is 1 and a terminal
+    polls about every 10 seconds, so each person costs roughly 10 seconds per
+    command — 20 on `acc`, 10 on `att`. Ten people is minutes and it is not
+    stuck. That number is not raised here on spec — no real terminal has ever
+    been observed acknowledging a multi-command reply, and mis-acknowledging
+    is the exact bug E7 fixed.
+
+    **202, `status: "queued"`, `transport: "adms_queue"`** whatever the
+    protocol: the device link for each person is written only when the
+    terminal acknowledges their record (provisioning.note_acknowledged).
     """
     device = _get_device_or_404(sn, db)
+    queue_person = (provisioning.provision if _uses_command_queue(device)
+                    else provisioning.provision_att)
     pushed = []
     errors = []
+    queued = []
+    for user_id in payload.user_ids:
+        emp = db.query(Employee).filter_by(user_id=user_id).first()
+        if not emp:
+            errors.append(f"{user_id}: employee not found in DB")
+            continue
+        # One person's uncollected revocation must not be undone by a bulk
+        # push aimed at everybody else. Named in `errors` so it is visible
+        # rather than being a silently missing row in the result.
+        if provisioning.outstanding_revocations(db, sn, user_id):
+            errors.append(
+                f"{user_id}: a revocation for this person on {sn} is still "
+                "queued and unconfirmed — not pushed, because that would "
+                "contradict it. Cancel the revocation to re-grant access."
+            )
+            continue
+        queued.extend(r.id for r in queue_person(db, sn, emp))
+        pushed.append(user_id)
 
-    if _uses_command_queue(device):
-        queued = []
-        for user_id in payload.user_ids:
-            emp = db.query(Employee).filter_by(user_id=user_id).first()
-            if not emp:
-                errors.append(f"{user_id}: employee not found in DB")
-                continue
-            # One person's uncollected revocation must not be undone by a bulk
-            # push aimed at everybody else. Named in `errors` so it is visible
-            # rather than being a silently missing row in the result.
-            if provisioning.outstanding_revocations(db, sn, user_id):
-                errors.append(
-                    f"{user_id}: a revocation for this person on {sn} is still "
-                    "queued and unconfirmed — not pushed, because that would "
-                    "contradict it. Cancel the revocation to re-grant access."
-                )
-                continue
-            queued.extend(r.id for r in provisioning.provision(db, sn, emp))
-            pushed.append(user_id)
-
-        response.status_code = 202
-        seconds = len(queued) * 10
-        return {
-            "device_sn": sn,
-            "transport": "adms_queue",
-            "status": "queued",
-            "pushed": pushed,
-            "errors": errors,
-            "command_ids": queued,
-            "message": (
-                f"Queued {len(queued)} commands for {len(pushed)} people. "
-                f"At one command per poll this takes roughly {seconds} seconds "
-                "to drain, and nothing is delivered until the device collects it."
-            ),
-        }
-
-    try:
-        with device_connection(device) as conn:
-            users_on_device = conn.get_users()
-            uid_by_user = {u.user_id: u for u in users_on_device}
-
-            for user_id in payload.user_ids:
-                emp = db.query(Employee).filter_by(user_id=user_id).first()
-                if not emp:
-                    errors.append(f"{user_id}: employee not found in DB")
-                    continue
-                try:
-                    existing = uid_by_user.get(str(user_id))
-                    uid = existing.uid if existing else None
-                    pre_uid = conn.next_uid
-                    conn.set_user(
-                        uid=uid,
-                        name=emp.name,
-                        privilege=emp.privilege,
-                        user_id=emp.user_id,
-                        card=int(emp.card) if emp.card and emp.card != "0" else 0,
-                    )
-                    actual_uid = uid if uid is not None else pre_uid
-                    employee_sync.link_device_employee(db, sn, user_id, uid=actual_uid)
-                    pushed.append(user_id)
-                except Exception as e:
-                    errors.append(f"{user_id}: {e}")
-
-            db.commit()
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
-
-    return {"device_sn": sn, "pushed": pushed, "errors": errors}
+    response.status_code = 202
+    seconds = len(queued) * 10
+    return {
+        "device_sn": sn,
+        "transport": "adms_queue",
+        "status": "queued",
+        "pushed": pushed,
+        "errors": errors,
+        "command_ids": queued,
+        # What the drawer shows verbatim (DeviceUsersDrawer.jsx), so it says
+        # queued, with the honest drain time, and never "pushed".
+        "message": (
+            f"Queued {len(queued)} command{'' if len(queued) == 1 else 's'} "
+            f"for {len(pushed)} {'person' if len(pushed) == 1 else 'people'}. "
+            f"At one command per poll this takes roughly {seconds} seconds "
+            "to drain, and nothing is delivered until the device collects it."
+        ),
+    }
 
 
 @router.post("/{sn}/users/{user_id}/push", dependencies=[Depends(require_admin)])

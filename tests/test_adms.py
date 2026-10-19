@@ -4728,6 +4728,61 @@ class AttProvisioningTests(ProvisioningTestCase):
         self.assertEqual([(r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
                          [("failed", -1004)])
 
+    # -- several at once -----------------------------------------------------
+
+    def push_bulk(self, user_ids):
+        return self.client.post(f"/devices/{self.ATT_SN}/users/push_bulk",
+                                json={"user_ids": user_ids})
+
+    def test_a_bulk_push_queues_one_userinfo_command_per_person(self):
+        self.create_employee("036", name="Ahmed Ali")
+        self.push_bulk(["0036", "036"])
+        self.assertEqual([row.command for row in self.outbox(self.ATT_SN)], [
+            "DATA UPDATE USERINFO PIN=0036\tName=Basila Haider\tPri=0\t"
+            "Card=7495825\tGrp=1\tTZ=0000000100000000\tVerify=0",
+            "DATA UPDATE USERINFO PIN=036\tName=Ahmed Ali\tPri=0\t"
+            "Card=\tGrp=1\tTZ=0000000100000000\tVerify=0",
+        ])
+
+    def test_a_bulk_push_answers_in_the_shape_the_device_users_drawer_reads(self):
+        """DeviceUsersDrawer.jsx shows `message` verbatim when `transport` is
+        `adms_queue`, files `errors` mentioning a revocation as skips and the
+        rest as errors, and counts `pushed`."""
+        self.create_employee("036", name="Ahmed Ali")
+        response = self.push_bulk(["0036", "036", "nobody"])
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["pushed"], ["0036", "036"])
+        self.assertEqual(body["errors"], ["nobody: employee not found in DB"])
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+        self.assertEqual(
+            body["message"],
+            "Queued 2 commands for 2 people. At one command per poll this takes "
+            "roughly 20 seconds to drain, and nothing is delivered until the "
+            "device collects it.",
+        )
+
+    def test_a_bulk_push_of_one_person_says_one_command_for_one_person(self):
+        body = self.push_bulk(["0036"]).json()
+        self.assertTrue(body["message"].startswith("Queued 1 command for 1 person."),
+                        body["message"])
+
+    def test_each_person_is_linked_when_their_own_command_is_acknowledged(self):
+        self.create_employee("036", name="Ahmed Ali")
+        self.push_bulk(["0036", "036"])
+        first, second = [row.id for row in self.outbox(self.ATT_SN)]
+
+        self.poll(self.ATT_SN)
+        self.ack_att(first, 0)
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["0036"])
+
+        self.poll(self.ATT_SN)
+        self.ack_att(second, 0)
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["0036", "036"])
+
 
 # ---------------------------------------------------------------------------
 # 20d. Transport routing: never both, for the same (device, user)
@@ -4770,30 +4825,32 @@ class TransportRoutingTests(ProvisioningTestCase):
         self.assertEqual(len(self.outbox(self.SN)), 2)
         self.assertEqual(self.links(self.SN), [])
 
-    def test_a_bulk_push_over_the_sdk_keeps_its_original_shape(self):
-        """E16 changed the drawer's wording, not the wire. The SDK branch of
-        push_users_bulk must still return only device_sn/pushed/errors — no
-        `transport`/`status`/`command_ids`/`message` invented for a transport
-        where 'pushed' was already true. The frontend fix leans on this: the
-        absence of `transport: "adms_queue"` is exactly how it tells the two
-        branches apart."""
+    def test_an_att_bulk_push_uses_the_queue_and_never_opens_a_socket(self):
+        """Every person in the batch goes on the outbox the terminal polls;
+        nothing dials TCP 4370, and no link is written ahead of the
+        acknowledgement."""
         self.create_employee("9002", name="Bilal Khan")
         from unittest import mock
-        conn = FakeConnection(next_uid=5)
+        conn = FakeConnection()
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
             response = self.client.post(
                 f"/devices/{self.ATT_SN}/users/push_bulk",
-                json={"user_ids": ["9001", "9002", "nobody"]},
+                json={"user_ids": ["9001", "9002"]},
             )
 
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertEqual(set(body.keys()), {"device_sn", "pushed", "errors"})
-        self.assertEqual(body["pushed"], ["9001", "9002"])
-        self.assertEqual(len(body["errors"]), 1)
-        self.assertIn("nobody", body["errors"][0])
-        self.assertEqual(self.outbox(self.ATT_SN), [])
-        self.assertEqual(len(conn.written), 2)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(conn.written, [])
+        self.assertEqual([r.command.split(" ", 3)[:3] for r in self.outbox(self.ATT_SN)],
+                         [["DATA", "UPDATE", "USERINFO"]] * 2)
+        self.assertEqual(self.links(self.ATT_SN), [])
+
+    def test_a_bulk_push_to_a_device_with_no_protocol_set_is_pushed_as_att(self):
+        response = self.client.post(f"/devices/{self.DEFAULT_SN}/users/push_bulk",
+                                    json={"user_ids": ["9001"]})
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([r.command.split(" ", 3)[:3] for r in self.outbox(self.DEFAULT_SN)],
+                         [["DATA", "UPDATE", "USERINFO"]])
 
     def test_a_device_with_no_protocol_set_is_pushed_as_att(self):
         """The column defaults to att, so an unclassified device gets the
@@ -6657,6 +6714,34 @@ class PushDuringRevocationTests(RevocationTestCase):
         self.assertEqual(len(body["errors"]), 1)
         self.assertIn("9001", body["errors"][0])
         self.assertIn("revocation", body["errors"][0])
+
+    def test_an_att_bulk_push_names_the_blocked_person_the_same_way(self):
+        """The revocation was queued while the terminal was classified acc and
+        the protocol was corrected afterwards (E6). Its uncollected delete
+        still stands, so the attendance-mode push skips the person exactly as
+        the acc one does — and queues nothing that would contradict it."""
+        self.create_employee("9002", name="Omar Said")
+        self.link(self.SN)
+        self.revoke(self.SN)
+        revocation = self.commands_on(self.SN)
+        db = self.Session()
+        try:
+            db.query(Device).filter_by(serial_number=self.SN).first().protocol = "att"
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.client.post(f"/devices/{self.SN}/users/push_bulk",
+                                    json={"user_ids": ["9001", "9002"]})
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["pushed"], ["9002"])
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertIn("9001", body["errors"][0])
+        self.assertIn("revocation", body["errors"][0])
+        self.assertEqual(self.commands_on(self.SN)[:len(revocation)], revocation)
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.SN)[len(revocation):]],
+                         ["DATA UPDATE USERINFO PIN=9002"])
 
     def test_a_push_to_a_different_door_is_not_blocked(self):
         self.link(self.SN)
