@@ -5766,7 +5766,8 @@ class TemplatePushRefusalTests(TemplatePushTestCase):
 
 
 class TemplateTransportRoutingTests(TemplatePushTestCase):
-    """acc goes to the outbox, att goes to the SDK, never both."""
+    """Both protocols go to the outbox, each from its own table, and nothing
+    dials a terminal."""
 
     def add_fingerprint(self, user_id="9001", finger_id=1):
         from app.models import FingerprintTemplate
@@ -5779,10 +5780,11 @@ class TemplateTransportRoutingTests(TemplatePushTestCase):
         finally:
             db.close()
 
-    def test_an_att_device_uses_the_sdk_and_never_touches_the_outbox(self):
+    def test_an_att_device_uses_the_queue_and_never_opens_a_socket(self):
+        """A terminal behind NAT can never be dialled, so the fingerprint goes
+        on the outbox it polls."""
         from unittest import mock
 
-        self.add_template(source=self.OTHER_SN)   # an ADMS-captured template
         self.add_fingerprint()
         self.link(self.ATT_SN)
 
@@ -5798,27 +5800,34 @@ class TemplateTransportRoutingTests(TemplatePushTestCase):
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
             response = self.push_templates(self.ATT_SN)
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["templates_pushed"], 1)
-        self.assertEqual(len(conn.templates), 1)
-        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertIsNone(conn.templates)
+        self.assertEqual(conn.written, [])
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.ATT_SN)],
+                         ["DATA UPDATE FINGERTMP PIN=9001"])
 
     def test_an_att_device_never_queues_a_biodata_command(self):
         """The two tables are not each other's format: `biometric_templates`
-        is ADMS base64, `fingerprint_templates` is a pyzk-packed blob. Neither
-        is offered on the other's wire."""
-        from unittest import mock
-
+        holds an access-control terminal's unified records, and
+        `fingerprint_templates` the raw fingerprints an attendance terminal
+        reported. Neither is offered on the other's wire."""
         self.add_template(source=self.OTHER_SN)
         self.link(self.ATT_SN)
-        conn = FakeConnection(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.push_templates(self.ATT_SN)
+        response = self.push_templates(self.ATT_SN)
 
-        # No fingerprint_templates row, so the SDK path has nothing to write —
-        # and it says so rather than quietly reaching for the acc table.
+        # No fingerprint_templates row, so there is nothing to send — and it
+        # says so rather than quietly reaching for the acc table.
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertIn("No fingerprint templates captured", response.json()["detail"])
+        self.assertEqual(self.outbox(), [])
+
+    def test_an_acc_device_never_queues_a_fingertmp_command(self):
+        self.add_fingerprint()
+        self.link(self.SN)
+        response = self.push_templates(self.SN)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("No biometric templates captured", response.json()["detail"])
         self.assertEqual(self.outbox(), [])
 
     def test_an_acc_device_never_opens_a_socket(self):
@@ -5833,16 +5842,17 @@ class TemplateTransportRoutingTests(TemplatePushTestCase):
         self.assertEqual(conn.written, [])
         self.assertEqual(len(self.outbox(self.SN)), 1)
 
-    def test_a_device_with_no_protocol_set_takes_the_sdk_path(self):
-        from unittest import mock
+    def test_a_device_with_no_protocol_set_is_pushed_as_att(self):
+        """The column defaults to att, so an unclassified device gets the
+        attendance commands, as Sync does."""
+        self.add_fingerprint()
+        response = self.push_templates(self.DEFAULT_SN)
 
-        self.add_template()
-        self.link(self.DEFAULT_SN)
-        conn = FakeConnection(users=[type("U", (), {"user_id": "9001", "uid": 5})()])
-        with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            self.push_templates(self.DEFAULT_SN)
-
-        self.assertEqual(self.outbox(self.DEFAULT_SN), [])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.DEFAULT_SN)], [
+            "DATA UPDATE USERINFO PIN=9001",
+            "DATA UPDATE FINGERTMP PIN=9001",
+        ])
 
     def test_the_template_push_writes_no_device_link_inline(self):
         """Same discipline E3 established for employees and device links: the
@@ -5862,6 +5872,352 @@ class TemplateTransportRoutingTests(TemplatePushTestCase):
         self.add_template()
         self.push_templates(self.SN)
         self.assertEqual(self.links(), [])
+
+
+# ---------------------------------------------------------------------------
+# 20f. Fingerprints onto an attendance terminal
+# ---------------------------------------------------------------------------
+#
+# The same push on the attendance wire: one `DATA UPDATE FINGERTMP` per finger
+# (Attendance PUSH 2.4.1 §12.1.1.3), from `fingerprint_templates`, behind a
+# `DATA UPDATE USERINFO` when the terminal has not confirmed the person.
+
+class AttFingerprintCommandShapeTests(unittest.TestCase):
+    """The literal bytes, against §12.1.1.3, with <HT> spelled as the tab it is::
+
+        DATA UPDATE FINGERTMP PIN=<s><HT>FID=<n><HT>Size=<n><HT>Valid=<n><HT>TMP=<base64>
+
+    `fingerprint_templates` holds the hex of the raw template; `TMP` is its
+    base64 and `Size` the length of that base64 text ("Length of binary data
+    of the finger template after base64 coding", and what the SA20's own `FP`
+    lines carry).
+    """
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def fingerprint(self, **fields):
+        from app.models import FingerprintTemplate
+        values = dict(user_id="0036", finger_id=6, valid=1, template="00a1ff10",
+                      source_device_sn=LEGACY_SN)
+        values.update(fields)
+        return FingerprintTemplate(**values)
+
+    def test_the_fingertmp_command_is_exactly_the_documented_shape(self):
+        self.assertEqual(
+            self.provisioning.att_fingerprint_command(self.fingerprint()),
+            "DATA UPDATE FINGERTMP PIN=0036\tFID=6\tSize=8\tValid=1\tTMP=AKH/EA==",
+        )
+
+    def test_the_template_goes_out_as_the_base64_of_its_stored_bytes(self):
+        """hex → bytes → base64 is the inverse of how the OPERLOG parser stored
+        it, so a leading zero byte and every other byte survive the trip."""
+        raw = bytes(range(256)) * 4
+        command = self.provisioning.att_fingerprint_command(
+            self.fingerprint(template=raw.hex()))
+        tmp = command.split("\tTMP=")[1]
+        self.assertEqual(base64.b64decode(tmp), raw)
+
+    def test_size_is_the_length_of_the_base64_text_not_of_the_raw_bytes(self):
+        raw = bytes(range(256)) * 4
+        command = self.provisioning.att_fingerprint_command(
+            self.fingerprint(template=raw.hex()))
+        fields = dict(f.split("=", 1) for f in command.split("\t")[1:])
+        self.assertEqual(fields["Size"], str(len(fields["TMP"])))
+        self.assertEqual(fields["Size"], "1368")      # 1024 raw bytes
+        self.assertNotEqual(fields["Size"], str(len(raw)))
+
+    def test_a_duress_template_keeps_its_valid_flag(self):
+        """§12.1.1.3: 1 normal, 3 duress, 0 invalid — the stored flag is passed
+        through, never interpreted."""
+        for valid in (0, 1, 3):
+            command = self.provisioning.att_fingerprint_command(self.fingerprint(valid=valid))
+            self.assertIn(f"\tValid={valid}\t", command)
+
+    def test_a_template_not_stored_as_hex_is_refused_not_repaired(self):
+        with self.assertRaises(ValueError) as caught:
+            self.provisioning.att_fingerprint_command(self.fingerprint(template="AKH/EA=="))
+        self.assertIn("not stored as hex", str(caught.exception))
+
+    def test_an_empty_template_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.provisioning.att_fingerprint_command(self.fingerprint(template=""))
+
+    def test_a_finger_outside_zero_to_nine_is_refused(self):
+        for finger_id in (-1, 10, None):
+            with self.assertRaises(ValueError, msg=finger_id):
+                self.provisioning.att_fingerprint_command(self.fingerprint(finger_id=finger_id))
+
+    def test_the_acknowledgement_hook_does_not_read_it_as_a_user_record(self):
+        """A confirmed fingerprint is not evidence that the person is on the
+        terminal; only their USERINFO is."""
+        command = self.provisioning.att_fingerprint_command(self.fingerprint())
+        self.assertIsNone(self.provisioning.pin_from_user_command(command))
+        self.assertIsNone(self.provisioning.pin_from_revocation_command(command))
+        self.assertFalse(self.provisioning.is_revocation_command(command))
+
+    def test_the_orphan_withdrawal_reads_its_pin_with_the_leading_zeros(self):
+        command = self.provisioning.att_fingerprint_command(self.fingerprint())
+        self.assertEqual(self.provisioning.pin_from_template_command(command), "0036")
+
+    def test_a_revocation_withdraws_it_like_any_other_push(self):
+        command = self.provisioning.att_fingerprint_command(self.fingerprint())
+        self.assertEqual(self.provisioning.pin_from_push_command(command), "0036")
+
+
+class AttFingerprintPushTests(TemplatePushTestCase):
+    """The endpoint on an attendance terminal. The SA20 echoes `CMD=DATA` for
+    every DATA command, so the acks here say that."""
+
+    def add_fingerprint(self, user_id="9001", finger_id=1, template="00a1ff10",
+                        source=None, valid=1):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id=user_id, finger_id=finger_id,
+                                       valid=valid, template=template,
+                                       source_device_sn=source or LEGACY_SN))
+            db.commit()
+        finally:
+            db.close()
+
+    def ack_att(self, command_id, return_code):
+        return self.ack(command_id, return_code=return_code, cmd="DATA", sn=self.ATT_SN)
+
+    def heads(self, sn):
+        return [c.split("\t")[0] for c in self.commands_on(sn)]
+
+    def test_a_person_on_the_device_gets_one_fingertmp_per_finger(self):
+        self.add_fingerprint(finger_id=6, template="00a1ff10")
+        self.add_fingerprint(finger_id=1, template="0a0b0c")
+        self.link(self.ATT_SN)
+
+        response = self.push_templates(self.ATT_SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.commands_on(self.ATT_SN), [
+            "DATA UPDATE FINGERTMP PIN=9001\tFID=1\tSize=4\tValid=1\tTMP=CgsM",
+            "DATA UPDATE FINGERTMP PIN=9001\tFID=6\tSize=8\tValid=1\tTMP=AKH/EA==",
+        ])
+
+    def test_the_device_is_handed_the_command_in_the_id_envelope(self):
+        self.add_fingerprint(finger_id=6)
+        self.link(self.ATT_SN)
+        self.push_templates(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(
+            self.poll(self.ATT_SN),
+            f"C:{command_id}:DATA UPDATE FINGERTMP PIN=9001\tFID=6\tSize=8\t"
+            "Valid=1\tTMP=AKH/EA==",
+        )
+
+    def test_a_fingerprint_the_terminal_uploaded_goes_out_byte_for_byte(self):
+        """The round trip the operator relies on: an `FP` line the SA20 sent on
+        OPERLOG, stored, then pushed to another attendance terminal, carries
+        the same TMP and the same Size it arrived with."""
+        tmp = base64.b64encode(bytes(range(256)) * 4).decode()
+        uploaded = f"PIN=9001\tFID=6\tSize={len(tmp)}\tValid=1\tTMP={tmp}"
+        self.client.post(f"/iclock/cdata?SN={self.ATT_SN}&table=OPERLOG&Stamp=9999",
+                         content=f"FP {uploaded}\n")
+
+        self.link(self.DEFAULT_SN)
+        response = self.push_templates(self.DEFAULT_SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.commands_on(self.DEFAULT_SN),
+                         [f"DATA UPDATE FINGERTMP {uploaded}"])
+
+    def test_the_person_is_queued_ahead_of_the_fingers_when_the_device_lacks_them(self):
+        """Appendix 1's -10 is "The user specified by PIN does not exist in the
+        equipment": a fingerprint needs its USERINFO on the terminal first."""
+        self.add_fingerprint(finger_id=1)
+        self.add_fingerprint(finger_id=6)
+        body = self.push_templates(self.ATT_SN).json()
+
+        self.assertTrue(body["user_record_queued"])
+        self.assertEqual(self.heads(self.ATT_SN), [
+            "DATA UPDATE USERINFO PIN=9001",
+            "DATA UPDATE FINGERTMP PIN=9001",
+            "DATA UPDATE FINGERTMP PIN=9001",
+        ])
+        handed = [self.poll(self.ATT_SN) for _ in range(3)]
+        self.assertIn(":DATA UPDATE USERINFO PIN=9001\t", handed[0])
+        self.assertIn(":DATA UPDATE FINGERTMP PIN=9001\tFID=1\t", handed[1])
+        self.assertIn(":DATA UPDATE FINGERTMP PIN=9001\tFID=6\t", handed[2])
+
+    def test_the_response_says_queued_the_way_the_acc_branch_does(self):
+        """Employees.jsx reads `status === 'queued'` and shows `message`."""
+        self.add_fingerprint()
+        response = self.push_templates(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["templates_queued"], 1)
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+        self.assertEqual(
+            body["message"],
+            f"Queued 2 commands for {self.ATT_SN}: 1 template(s) behind the "
+            "person's user record, which this terminal has not confirmed yet. "
+            "At one command per poll this takes roughly 20 seconds, and nothing "
+            "is delivered until the device collects it — this is not delivered yet.",
+        )
+
+    def test_the_response_never_carries_the_template_bytes(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+        body = self.push_templates(self.ATT_SN).json()
+
+        self.assertNotIn("AKH/EA==", str(body))
+        self.assertNotIn("TMP=", str(body))
+        self.assertEqual(body["commands"], ["DATA UPDATE FINGERTMP PIN=9001"])
+
+    def test_its_own_fingerprint_is_not_sent_back_while_it_holds_the_person(self):
+        self.add_fingerprint(finger_id=1, source=self.ATT_SN)
+        self.add_fingerprint(finger_id=6, source=LEGACY_SN)
+        self.link(self.ATT_SN)
+
+        body = self.push_templates(self.ATT_SN).json()
+        self.assertEqual(body["skipped_from_this_device"], [{"finger_id": 1}])
+        self.assertEqual([c.split("\t")[1] for c in self.commands_on(self.ATT_SN)],
+                         ["FID=6"])
+
+    def test_pushing_only_its_own_fingerprints_back_is_refused(self):
+        self.add_fingerprint(source=self.ATT_SN)
+        self.link(self.ATT_SN)
+
+        response = self.push_templates(self.ATT_SN)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("still holds them", response.json()["detail"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_its_own_fingerprint_goes_back_when_the_device_no_longer_holds_the_person(self):
+        self.add_fingerprint(source=self.ATT_SN)
+
+        response = self.push_templates(self.ATT_SN)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.heads(self.ATT_SN), [
+            "DATA UPDATE USERINFO PIN=9001",
+            "DATA UPDATE FINGERTMP PIN=9001",
+        ])
+
+    def test_a_person_with_no_fingerprints_is_a_404_and_queues_nothing(self):
+        response = self.push_templates(self.ATT_SN)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("must enrol a finger", response.json()["detail"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_an_unsendable_fingerprint_is_refused_and_queues_nothing(self):
+        self.add_fingerprint(template="not hex")
+        response = self.push_templates(self.ATT_SN)
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("cannot be put on the wire", response.json()["detail"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_an_unsendable_finger_is_named_when_the_rest_go(self):
+        self.add_fingerprint(finger_id=1, template="not hex")
+        self.add_fingerprint(finger_id=6)
+        self.link(self.ATT_SN)
+
+        body = self.push_templates(self.ATT_SN).json()
+        self.assertEqual([s["finger_id"] for s in body["skipped_unsendable"]], [1])
+        self.assertEqual(body["templates_queued"], 1)
+
+    def test_a_queued_revocation_blocks_the_push(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+        self.client.delete(f"/devices/{self.ATT_SN}/users/9001")
+
+        response = self.push_templates(self.ATT_SN)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.heads(self.ATT_SN), ["DATA DELETE USERINFO PIN=9001"])
+
+    def test_a_revocation_withdraws_a_queued_fingerprint(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+        self.push_templates(self.ATT_SN)
+        self.client.delete(f"/devices/{self.ATT_SN}/users/9001")
+
+        self.assertEqual(self.heads(self.ATT_SN), ["DATA DELETE USERINFO PIN=9001"])
+        withdrawn = [r for r in self.history(self.ATT_SN)
+                     if r.command.startswith("DATA UPDATE FINGERTMP")]
+        self.assertEqual([r.outcome for r in withdrawn], ["failed"])
+
+    # -- acknowledgement -----------------------------------------------------
+
+    def test_an_acknowledged_push_leaves_the_person_linked_and_the_outbox_empty(self):
+        self.add_fingerprint()
+        self.push_templates(self.ATT_SN)
+        for row in list(self.outbox(self.ATT_SN)):
+            self.poll(self.ATT_SN)
+            self.ack_att(row.id, 0)
+
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["9001"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        self.assertEqual({r.outcome for r in self.history(self.ATT_SN)}, {"acknowledged"})
+
+    def test_an_acknowledged_fingerprint_does_not_link_the_person(self):
+        """Only the USERINFO acknowledgement may say the person is on the
+        terminal."""
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+        self.push_templates(self.ATT_SN)
+        db = self.Session()
+        try:
+            employee_sync.unlink_device_employee(db, self.ATT_SN, "9001")
+            db.commit()
+        finally:
+            db.close()
+
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, 0)
+
+        self.assertEqual(self.links(self.ATT_SN), [])
+        self.assertEqual([r.outcome for r in self.history(self.ATT_SN)], ["acknowledged"])
+
+    def test_a_size_mismatch_refusal_is_recorded_and_not_retried(self):
+        """Appendix 1's -9: "The transmitted template data does not match the
+        given size". A negative code is a refusal, and a refusal is final."""
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+        self.push_templates(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, -9)
+
+        self.assertEqual([(r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
+                         [("failed", -9)])
+        self.assertEqual(self.poll(self.ATT_SN), "OK")
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["9001"])
+
+    def test_an_illegal_template_refusal_reads_as_refused_in_the_history(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN)
+        self.push_templates(self.ATT_SN)
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, -12)
+
+        rows = self.client.get(f"/devices/{self.ATT_SN}/commands/history").json()
+        self.assertEqual([(r["outcome"], r["return_code"]) for r in rows], [("failed", -12)])
+        self.assertTrue(rows[0]["command"].startswith("DATA UPDATE FINGERTMP"))
+
+    def test_a_refused_userinfo_withdraws_the_fingerprints_behind_it(self):
+        self.add_fingerprint()
+        self.push_templates(self.ATT_SN)
+        userinfo_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(userinfo_id, -1004)
+
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+        withdrawn = [r for r in self.history(self.ATT_SN)
+                     if r.command.startswith("DATA UPDATE FINGERTMP")]
+        self.assertEqual(len(withdrawn), 1)
+        self.assertIsNone(withdrawn[0].return_code)
+        self.assertIn("no confirmed user record for Pin=9001", withdrawn[0].last_error)
 
 
 class BiometricListingTests(TemplatePushTestCase):

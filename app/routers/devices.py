@@ -9,7 +9,6 @@ from fastapi import (
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from zk.exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
-from zk.finger import Finger
 
 from app import audit, config
 from app.database import get_db
@@ -1241,14 +1240,15 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 #          because until then "this person is on this device" is not true yet.
 #
 # Pushing people — one (push_user_to_device) or several (push_users_bulk) —
-# and removing one (remove_user_from_device) no longer use the SDK for `att`:
-# each person is one `DATA UPDATE USERINFO` or `DATA DELETE USERINFO` on the
-# same outbox, with the same acknowledgement rules, because an attendance
-# terminal behind NAT can never be dialled (the BioPro SA20 CPV2232560497 is
-# one). The fingerprint push and delete, remote enrolment, attendance clear,
-# unlock, restart and device info still route `att` to the SDK until they
-# are moved too; clock, lock state and LCD message stay there for good,
-# having no attendance-mode command.
+# removing one (remove_user_from_device) and pushing a person's fingerprints
+# (push_templates_to_device) no longer use the SDK for `att`: each person is
+# one `DATA UPDATE USERINFO` or `DATA DELETE USERINFO`, each finger one
+# `DATA UPDATE FINGERTMP`, on the same outbox, with the same acknowledgement
+# rules, because an attendance terminal behind NAT can never be dialled (the
+# BioPro SA20 CPV2232560497 is one). The fingerprint delete, remote
+# enrolment, attendance clear, unlock, restart and device info still route
+# `att` to the SDK until they are moved too; clock, lock state and LCD
+# message stay there for good, having no attendance-mode command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
@@ -1683,16 +1683,41 @@ def pull_templates(sn: str, response: Response, db: Session = Depends(get_db)):
                                   "its fingerprints (and the users they belong to)")
 
 
-def _queue_templates_to_device(sn, user_id, request, response, db, admin):
-    """The `acc` half of the template push: `DATA UPDATE BIODATA` on the outbox.
+@router.post("/{sn}/users/{user_id}/templates/push")
+def push_templates_to_device(
+    sn: str,
+    user_id: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Copy stored biometrics onto a device, so one enrolment works everywhere.
+
+    Both protocols queue on the ADMS outbox, chosen by Device.protocol exactly
+    as the user push is (see `_uses_command_queue`), and answer the same way:
+
+    * `acc` — one `DATA UPDATE BIODATA` per template in `biometric_templates`,
+      built verbatim from what E2 captured (provisioning.biodata_command).
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — one `DATA UPDATE FINGERTMP` per
+      finger in `fingerprint_templates` (provisioning.att_fingerprint_command).
+      Until 2026-10-19 this wrote over the SDK, TCP 4370, which never reaches
+      a terminal behind NAT.
+
+    The two draw on different tables and that is not an oversight. A
+    `biometric_templates` row is a unified-table record of an access-control
+    terminal; a `fingerprint_templates` row is the raw bytes of a fingerprint
+    an attendance terminal reported. Neither is the other's format, so
+    neither is offered on the other's wire.
 
     Everything here is queued, never delivered. The terminal collects one
     command on each poll (about every ten seconds) and reports on it
-    afterwards, so a person with two templates and no user record on that door
-    yet is four commands and roughly forty seconds. COMMAND_BATCH_SIZE stays
-    at 1: no real terminal has ever been observed acknowledging even a single
-    command, let alone several in one reply, and this is the wrong payload to
-    find that out with.
+    afterwards, so a person with two templates and no user record on an `acc`
+    door yet is four commands and roughly forty seconds. COMMAND_BATCH_SIZE
+    stays at 1: no real terminal has ever been observed acknowledging even a
+    single command, let alone several in one reply, and this is the wrong
+    payload to find that out with. **202, `status: "queued"`.**
 
     Nothing that fails here fails silently:
 
@@ -1705,6 +1730,7 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
       trimmed to fit, and the response names it,
     * a person with nothing captured is an error, not an empty success.
     """
+    device = _get_device_or_404(sn, db)
     emp = db.query(Employee).filter_by(user_id=user_id).first()
     if not emp:
         # The user record has to be buildable before a template can be queued
@@ -1718,14 +1744,27 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
     if blocked:
         raise blocked
 
-    sendable, from_this_device = provisioning.templates_for_device(db, sn, user_id)
+    if _uses_command_queue(device):
+        sendable, from_this_device = provisioning.templates_for_device(db, sn, user_id)
+        build, queue_person = provisioning.biodata_command, provisioning.provision
+        what, enrol = "biometric templates", "a face or finger"
+        user_record = "the person's user record and door permission"
+    else:
+        # Attendance PUSH §12.1.1.3 has no field for a person, only their
+        # PIN, and Appendix 1's -10 is "The user specified by PIN does not
+        # exist in the equipment": the USERINFO has to be there first, the
+        # same ordering the acc side keeps for its user record.
+        sendable, from_this_device = provisioning.fingerprints_for_device(db, sn, user_id)
+        build, queue_person = provisioning.att_fingerprint_command, provisioning.provision_att
+        what, enrol = "fingerprint templates", "a finger"
+        user_record = "the person's user record"
 
     if not sendable and not from_this_device:
         raise HTTPException(
             status_code=404,
             detail=(
-                "No biometric templates captured for this person. They must "
-                "enrol a face or finger at a terminal first — nothing was queued."
+                f"No {what} captured for this person. They must enrol {enrol} "
+                "at a terminal first — nothing was queued."
             ),
         )
     if not sendable:
@@ -1743,7 +1782,7 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
             ),
         )
 
-    bodies, unsendable = provisioning.template_commands(sendable)
+    bodies, unsendable = provisioning.template_commands(sendable, build)
     if not bodies:
         raise HTTPException(
             status_code=422,
@@ -1760,6 +1799,7 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
     already_there = provisioning.is_on_device(db, sn, user_id)
     rows = provisioning.push_templates(
         db, sn, emp, bodies, with_user_record=not already_there,
+        queue_person=queue_person,
     )
 
     audit.record(db, admin.username, "template_queue", target=f"{sn}/{user_id}",
@@ -1780,17 +1820,15 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
         # credential and there is no reason to hand them back out of the
         # database to a browser to be logged, cached or screenshotted.
         "commands": [r.command.split("\t")[0] for r in rows],
-        "skipped_from_this_device": [
-            {"type": t.type, "no": t.no} for t in from_this_device
-        ],
+        "skipped_from_this_device": [_template_ref(t) for t in from_this_device],
         "skipped_unsendable": [
-            {"type": t.type, "no": t.no, "reason": reason}
-            for t, reason in unsendable
+            {**_template_ref(t), "reason": reason} for t, reason in unsendable
         ],
         "message": (
-            f"Queued {len(rows)} commands for {sn}: {len(bodies)} template(s)"
-            + (" behind the person's user record and door permission, which "
-               "this terminal has not confirmed yet" if not already_there else "")
+            f"Queued {len(rows)} command{'' if len(rows) == 1 else 's'} for "
+            f"{sn}: {len(bodies)} template(s)"
+            + (f" behind {user_record}, which this terminal has not confirmed "
+               "yet" if not already_there else "")
             + f". At one command per poll this takes roughly {seconds} seconds, "
             "and nothing is delivered until the device collects it — this is "
             "not delivered yet."
@@ -1798,71 +1836,13 @@ def _queue_templates_to_device(sn, user_id, request, response, db, admin):
     }
 
 
-@router.post("/{sn}/users/{user_id}/templates/push")
-def push_templates_to_device(
-    sn: str,
-    user_id: str,
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-):
-    """Copy stored biometrics onto a device, so one enrolment works everywhere.
-
-    Same routing rule as every other write to a terminal, and for the same
-    reason (see `_uses_command_queue`): the transport is a function of
-    Device.protocol, never of what happens to be reachable.
-
-    * `acc` — `DATA UPDATE BIODATA` commands on the E7 outbox, built verbatim
-      from the templates E2 captured. **202, `status: "queued"`.**
-    * `att` — the SDK writes the device now over TCP 4370, from
-      `fingerprint_templates`. 200, and the count it wrote.
-
-    The two draw on different tables and that is not an oversight. A
-    `biometric_templates` row is base64 the ADMS upload handed us; a
-    `fingerprint_templates` row is a pyzk-packed blob from a TCP pull. Neither
-    is the other's format, so neither is offered on the other's wire.
-    """
-    device = _get_device_or_404(sn, db)
-
-    if _uses_command_queue(device):
-        return _queue_templates_to_device(sn, user_id, request, response, db, admin)
-
-    de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
-    if not de:
-        raise HTTPException(status_code=404, detail="User not enrolled on this device — call /push first")
-
-    templates = db.query(FingerprintTemplate).filter_by(user_id=user_id).all()
-    if not templates:
-        raise HTTPException(status_code=404, detail="No fingerprint templates in DB for this employee")
-
-    try:
-        with device_connection(device) as conn:
-            users = conn.get_users()
-            device_user = next((u for u in users if u.user_id == str(user_id)), None)
-            if not device_user:
-                raise HTTPException(status_code=422, detail="User not found on device — call /push first")
-
-            fingers = [
-                Finger.json_unpack({
-                    "uid": device_user.uid,  # uid on THIS device, not the source device
-                    "fid": ft.finger_id,
-                    "valid": ft.valid,
-                    "template": ft.template,
-                })
-                for ft in templates
-            ]
-            conn.save_user_template(device_user, fingers)
-
-        audit.record(db, admin.username, "template_push", target=f"{sn}/{user_id}",
-                     ip=client_ip(request), detail=f"fingers={len(fingers)}")
-        return {
-            "device_sn": sn,
-            "user_id": user_id,
-            "templates_pushed": len(fingers),
-        }
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+def _template_ref(template) -> dict:
+    """How a response names one template without its bytes: `type` and `no`
+    for a `biometric_templates` row, the finger for a `fingerprint_templates`
+    one, which has no type."""
+    if isinstance(template, FingerprintTemplate):
+        return {"finger_id": template.finger_id}
+    return {"type": template.type, "no": template.no}
 
 
 @router.delete("/{sn}/users/{user_id}/templates/{finger_id}", status_code=204)

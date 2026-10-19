@@ -1540,9 +1540,10 @@ async def adms_devicecmd(
             db.commit()
         elif outcome == "rejected":
             # The mirror image, and the reason E4 can queue a biometric behind
-            # a user record at all. A refused `DATA UPDATE user` means this
-            # terminal does not have the person — so any template still queued
-            # for them here has nothing to attach to and is withdrawn with the
+            # a user record at all. A refused `DATA UPDATE user` (`USERINFO`
+            # on an att terminal) means this terminal does not have the person
+            # — so any template (`BIODATA`, `FINGERTMP`) still queued for them
+            # here has nothing to attach to and is withdrawn with the
             # reason recorded, rather than being delivered to a device that
             # will either refuse it or file it against nobody.
             if provisioning.pin_from_user_command(body):

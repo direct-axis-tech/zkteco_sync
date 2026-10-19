@@ -56,6 +56,8 @@ single writer the SDK path uses. The SDK transport writes it synchronously
 because there it *is* a fact by the time the call returns.
 """
 
+import base64
+import binascii
 import logging
 import re
 
@@ -64,7 +66,7 @@ from sqlalchemy.orm import Session
 from app import config
 from app.models import (
     BiometricTemplate, DeviceCommandLog, DeviceCommandOutbox, DeviceEmployee,
-    Employee,
+    Employee, FingerprintTemplate,
 )
 from app.services import commands, employee_sync
 
@@ -459,6 +461,12 @@ def templates_for_device(db: Session, device_sn: str, user_id: str):
         .order_by(BiometricTemplate.type, BiometricTemplate.no, BiometricTemplate.id)
         .all()
     )
+    return _withhold_while_held(db, device_sn, user_id, rows)
+
+
+def _withhold_while_held(db: Session, device_sn: str, user_id: str, rows) -> tuple:
+    """``(sendable, from_this_device)``: the rule of :func:`templates_for_device`,
+    for any stored template that records its ``source_device_sn``."""
     # One query, not one per row: the answer is the same for every template
     # this person has, because it is a fact about the person and the device.
     if not is_on_device(db, device_sn, user_id):
@@ -468,18 +476,24 @@ def templates_for_device(db: Session, device_sn: str, user_id: str):
     return sendable, own
 
 
-def template_commands(templates) -> tuple:
+def template_commands(templates, build=None) -> tuple:
     """Build every command first, queue nothing. ``(commands, unsendable)``.
 
     Building the whole batch before anything is queued is deliberate: a person
     whose templates cannot all be expressed on the wire should not end up with
     a half-sent enrolment and a user record queued for templates that will
     never follow.
+
+    ``build`` turns one stored template into its command and raises
+    ValueError for one that cannot go on the wire: :func:`biodata_command`
+    (the default) for an `acc` terminal, :func:`att_fingerprint_command` for
+    an `att` one.
     """
+    build = build or biodata_command
     bodies, unsendable = [], []
     for template in templates:
         try:
-            bodies.append(biodata_command(template))
+            bodies.append(build(template))
         except ValueError as exc:
             unsendable.append((template, str(exc)))
             log.error(
@@ -510,8 +524,14 @@ def push_templates(
     employee: Employee,
     bodies: list,
     with_user_record: bool,
+    queue_person=None,
 ) -> list:
     """Queue one person's templates onto one terminal. Returns the outbox rows.
+
+    ``queue_person`` queues the user record that leads them when one is
+    needed: :func:`provision` (the default, user record and door permission)
+    for an `acc` terminal, :func:`provision_att` (one USERINFO) for an `att`
+    one.
 
     Order matters and is guaranteed by construction
     -----------------------------------------------
@@ -535,7 +555,7 @@ def push_templates(
     """
     rows = []
     if with_user_record:
-        rows.extend(provision(db, device_sn, employee))
+        rows.extend((queue_person or provision)(db, device_sn, employee))
     rows.extend(commands.queue(db, device_sn, body) for body in bodies)
     log.info(
         "queued %s biometric template(s) for %s onto %s%s — command ids %s; "
@@ -549,15 +569,127 @@ def push_templates(
 
 
 # ---------------------------------------------------------------------------
+# Fingerprints onto an attendance terminal
+# ---------------------------------------------------------------------------
+#
+# The same push, the same rules, from the other table. An attendance terminal
+# reports its fingerprints as `FP PIN=…⇥FID=…⇥Size=…⇥Valid=…⇥TMP=<base64>`
+# lines on cdata?table=OPERLOG, and adms._store_operlog keeps each in
+# `fingerprint_templates` as the hex of the decoded bytes — the form pyzk's
+# `Finger.json_pack()` gives the SDK pull on a LAN terminal too. The command
+# below is the inverse of that parse.
+
+# §12.1.1.3: "FID=${XXX}: Finger number, valued from 0 – 9."
+ATT_FINGER_IDS = range(10)
+
+
+def att_fingerprint_command(template: FingerprintTemplate) -> str:
+    """The `DATA UPDATE FINGERTMP` line for one stored fingerprint.
+
+    Attendance PUSH 2.4.1 §12.1.1.3, from the document; not yet observed on
+    hardware::
+
+        DATA UPDATE FINGERTMP PIN=<s><HT>FID=<n><HT>Size=<n><HT>Valid=<n><HT>TMP=<base64>
+
+    ``PIN``
+        The user_id verbatim, as the string it is: `036` and `0036` are two
+        people on the SA20.
+    ``FID``
+        0–9, the document's range. Anything else is refused rather than sent
+        for the terminal to file somewhere unknown.
+    ``Size``
+        The length of the base64 ``TMP`` text, not of the raw template.
+        §12.1.1.3 defines it as "Length of binary data of the finger template
+        after base64 coding", and the SA20's own `FP` upload lines agree:
+        their ``Size`` equals the length of their ``TMP`` string. A wrong
+        Size is what Appendix 1's -9 ("The transmitted template data does not
+        match the given size") answers.
+    ``Valid``
+        As stored: 1 normal, 3 duress, 0 invalid (§12.1.1.3's table). Passed
+        through, never interpreted, like ``Type`` on the `acc` side.
+    ``TMP``
+        Base64 of the raw template, decoded from the stored hex. That is the
+        exact inverse of what adms._store_operlog did with the terminal's
+        upload, so a template goes out byte for byte as it arrived. Base64 has
+        no TAB or newline to break the framing; a stored value that is not
+        hex is refused, never repaired, because a "repaired" template is a
+        different credential.
+
+    §12.1.1.3 also notes the command takes fingerprint algorithm versions up
+    to 10.0. The SA20 stores ZKFinger VX10.0; whether a template captured on
+    another model is accepted by the target terminal is a hardware question.
+    """
+    ref = f"fingerprint {getattr(template, 'id', '?')}"
+    if template.finger_id not in ATT_FINGER_IDS:
+        raise ValueError(
+            f"{ref} is finger {template.finger_id}; §12.1.1.3 only numbers "
+            f"fingers 0-9"
+        )
+    if template.valid is None:
+        raise ValueError(f"{ref} has no valid flag; refusing to guess one")
+    try:
+        raw = bytes.fromhex(template.template or "")
+    except ValueError:
+        raise ValueError(
+            f"{ref} is not stored as hex, so its bytes are unknown; refusing "
+            f"to alter biometric data to make it fit"
+        ) from None
+    if not raw:
+        raise ValueError(f"{ref} is empty; there is no template to send")
+
+    tmp = base64.b64encode(raw).decode("ascii")
+    return (
+        "DATA UPDATE FINGERTMP "
+        + HT.join([
+            f"PIN={_wire_safe(template.user_id)}",
+            f"FID={int(template.finger_id)}",
+            f"Size={len(tmp)}",
+            f"Valid={int(template.valid)}",
+            f"TMP={tmp}",
+        ])
+    )
+
+
+def fingerprints_for_device(db: Session, device_sn: str, user_id: str):
+    """This person's stored fingerprints, ``(sendable, from_this_device)``.
+
+    The rule of :func:`templates_for_device`, on `fingerprint_templates`: a
+    fingerprint is not sent back to the terminal that captured it while that
+    terminal still holds the person, and is once it does not. After a Sync
+    every person an attendance terminal reported is linked to it
+    (employee_sync.record_device_user), so the fingerprints that came with
+    them are withheld from it exactly as an `acc` terminal's own are.
+
+    Ordered by finger so a given push is reproducible.
+    """
+    rows = (
+        db.query(FingerprintTemplate)
+        .filter(FingerprintTemplate.user_id == str(user_id))
+        .order_by(FingerprintTemplate.finger_id, FingerprintTemplate.id)
+        .all()
+    )
+    return _withhold_while_held(db, device_sn, user_id, rows)
+
+
+# ---------------------------------------------------------------------------
 # The half-success this unit refuses to leave silent
 # ---------------------------------------------------------------------------
 
-_BIODATA_PIN = re.compile(r"^DATA UPDATE BIODATA\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECASE)
+# A queued template on either kind of terminal: `DATA UPDATE BIODATA Pin=…`
+# on `acc`, `DATA UPDATE FINGERTMP PIN=…` on `att` (case-insensitive, which is
+# what lets `Pin=` match `PIN=`). A FINGERTMP for a PIN the terminal does not
+# hold is refused with Appendix 1's -10 ("The user specified by PIN does not
+# exist in the equipment"), so it is withdrawn behind a failed USERINFO for the
+# same reason a BIODATA is behind a failed `user`.
+_TEMPLATE_PIN = re.compile(
+    r"^DATA UPDATE (?:BIODATA|FINGERTMP)\s+(?:.*?\t)?Pin=([^\t]*)", re.IGNORECASE
+)
 
 
-def pin_from_biodata_command(command: str):
-    """The Pin in a `DATA UPDATE BIODATA` command, or None if it is not one."""
-    match = _BIODATA_PIN.match((command or "").strip())
+def pin_from_template_command(command: str):
+    """The Pin in a `DATA UPDATE BIODATA` or `DATA UPDATE FINGERTMP` command,
+    or None if it is not one."""
+    match = _TEMPLATE_PIN.match((command or "").strip())
     if not match:
         return None
     return match.group(1).strip() or None
@@ -594,7 +726,7 @@ def withdraw_orphaned_templates(db: Session, device_sn: str = None) -> list:
 
     templates = [
         (row, pin) for row, pin in
-        ((row, pin_from_biodata_command(row.command)) for row in outstanding)
+        ((row, pin_from_template_command(row.command)) for row in outstanding)
         if pin
     ]
     if not templates:
