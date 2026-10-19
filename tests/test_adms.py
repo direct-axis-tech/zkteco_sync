@@ -7495,18 +7495,156 @@ class TemplateDeleteOnAccTests(RevocationTestCase):
         # The load-bearing assertion: nothing was queued to a door.
         self.assertEqual(self.outbox(self.SN), [])
 
-    def test_the_att_path_still_deletes_a_template_over_the_sdk(self):
-        from unittest import mock
+    def test_an_acc_refusal_queues_nothing_even_with_a_fingerprint_stored(self):
+        """The att delete did not leak onto acc: a stored fingerprint and a
+        linked person still earn the 501, and no FINGERTMP is queued."""
         from app.models import FingerprintTemplate
 
-        self.link(self.ATT_SN)
+        self.link(self.SN)
         db = self.Session()
         try:
             db.add(FingerprintTemplate(user_id="9001", finger_id=1, valid=1,
-                                       template="0a0b", source_device_sn=self.ATT_SN))
+                                       template="0a0b", source_device_sn=self.SN))
             db.commit()
         finally:
             db.close()
+
+        response = self.client.delete(f"/devices/{self.SN}/users/9001/templates/1")
+        self.assertEqual(response.status_code, 501, response.text)
+        self.assertEqual(self.outbox(), [])
+
+
+# ---------------------------------------------------------------------------
+# 20g. One fingerprint off an attendance terminal
+# ---------------------------------------------------------------------------
+#
+# `DATA DELETE FINGERTMP PIN=<s><HT>FID=<n>` (Attendance PUSH 2.4.1 §12.1.2.2),
+# queued; the stored template forgotten on the terminal's Return=0. Not a
+# revocation of the person.
+
+class AttFingerprintDeleteCommandShapeTests(unittest.TestCase):
+    """The literal bytes, against §12.1.2.2, with <HT> spelled as the tab it is::
+
+        DATA DELETE FINGERTMP PIN=<s><HT>FID=<n>
+
+    "When only PIN information is transmitted, all fingerprints of the user
+    are deleted" — so FID is never optional here.
+    """
+
+    def setUp(self):
+        from app.services import provisioning
+        self.provisioning = provisioning
+
+    def test_the_delete_is_exactly_the_documented_shape(self):
+        self.assertEqual(
+            self.provisioning.att_fingerprint_delete_command("0036", 6),
+            "DATA DELETE FINGERTMP PIN=0036\tFID=6",
+        )
+
+    def test_finger_zero_is_still_sent_as_a_fid(self):
+        """0 is a real finger, not an absent one; dropping it would delete
+        every finger the person has."""
+        self.assertEqual(
+            self.provisioning.att_fingerprint_delete_command("9001", 0),
+            "DATA DELETE FINGERTMP PIN=9001\tFID=0",
+        )
+
+    def test_a_finger_outside_zero_to_nine_is_refused(self):
+        for finger_id in (-1, 10, None, True):
+            with self.assertRaises(ValueError, msg=finger_id):
+                self.provisioning.att_fingerprint_delete_command("9001", finger_id)
+
+    def test_a_pin_that_is_empty_once_made_wire_safe_is_refused(self):
+        """A PIN-less delete names nobody; refused rather than sent."""
+        for pin in ("", "\t", None):
+            with self.assertRaises(ValueError, msg=repr(pin)):
+                self.provisioning.att_fingerprint_delete_command(pin, 1)
+
+    def test_a_tab_in_the_pin_cannot_invent_a_field(self):
+        command = self.provisioning.att_fingerprint_delete_command("90\t01", 1)
+        self.assertEqual(command.count("\t"), 1)
+        self.assertTrue(command.endswith("\tFID=1"))
+
+    def test_it_is_not_read_as_a_revocation_of_the_person(self):
+        """No revocation group, no push blocking, no link dropped on its ack."""
+        command = self.provisioning.att_fingerprint_delete_command("0036", 6)
+        self.assertFalse(self.provisioning.is_revocation_command(command))
+        self.assertIsNone(self.provisioning.pin_from_revocation_command(command))
+        self.assertIsNone(self.provisioning.pin_from_user_command(command))
+
+    def test_it_is_not_withdrawn_as_a_push(self):
+        """Neither a person revocation nor a refused USERINFO retires it."""
+        command = self.provisioning.att_fingerprint_delete_command("0036", 6)
+        self.assertIsNone(self.provisioning.pin_from_push_command(command))
+        self.assertIsNone(self.provisioning.pin_from_template_command(command))
+
+    def test_the_acknowledgement_hook_reads_its_pin_and_finger(self):
+        command = self.provisioning.att_fingerprint_delete_command("0036", 6)
+        self.assertEqual(self.provisioning.finger_from_fingerprint_delete(command),
+                         ("0036", 6))
+
+    def test_a_pin_only_delete_names_no_single_finger(self):
+        """Typed by hand it deletes every finger; it does not forget one."""
+        self.assertIsNone(self.provisioning.finger_from_fingerprint_delete(
+            "DATA DELETE FINGERTMP PIN=0036"))
+
+    def test_it_is_retried_on_the_revocation_schedule(self):
+        """Until it lands the finger still verifies the person."""
+        from app.services import commands
+        command = self.provisioning.att_fingerprint_delete_command("0036", 6)
+        self.assertTrue(commands.is_revocation(command))
+        self.assertEqual(commands.backoff_for(1, command),
+                         timedelta(seconds=config.REVOCATION_BACKOFF_SECONDS[0]))
+
+
+class AttFingerprintDeleteTests(RevocationTestCase):
+    """The endpoint on an attendance terminal. The SA20 echoes `CMD=DATA` for
+    every DATA command, so the acks here say that."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("0036", name="Basila Haider")
+
+    def add_fingerprint(self, user_id="0036", finger_id=6, template="00a1ff10"):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id=user_id, finger_id=finger_id,
+                                       valid=1, template=template,
+                                       source_device_sn=LEGACY_SN))
+            db.commit()
+        finally:
+            db.close()
+
+    def stored_fingers(self, user_id="0036"):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            return sorted(r.finger_id for r in
+                          db.query(FingerprintTemplate).filter_by(user_id=user_id))
+        finally:
+            db.close()
+
+    def delete_finger(self, sn=None, user_id="0036", finger_id=6):
+        return self.client.delete(
+            f"/devices/{sn or self.ATT_SN}/users/{user_id}/templates/{finger_id}")
+
+    def ack_att(self, command_id, return_code):
+        return self.ack(command_id, return_code=return_code, cmd="DATA", sn=self.ATT_SN)
+
+    def deliver_and_ack(self, return_code):
+        command_id = self.outbox(self.ATT_SN)[-1].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, return_code)
+
+    # -- routing -----------------------------------------------------------
+
+    def test_an_att_device_queues_the_exact_delete_and_never_opens_a_socket(self):
+        """Until 2026-10-19 this deleted over TCP 4370, which never reaches a
+        terminal behind NAT."""
+        from unittest import mock
+
+        self.link(self.ATT_SN, "0036")
 
         class Conn(FakeConnection):
             def __init__(self):
@@ -7518,12 +7656,190 @@ class TemplateDeleteOnAccTests(RevocationTestCase):
 
         conn = Conn()
         with mock.patch("app.routers.devices.device_connection", fake_sdk(conn)):
-            response = self.client.delete(
-                f"/devices/{self.ATT_SN}/users/9001/templates/1")
+            response = self.delete_finger()
 
-        self.assertEqual(response.status_code, 204, response.text)
-        self.assertEqual(conn.removed, [(0, 1, "9001")])
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(conn.removed, [])
+        self.assertEqual(self.commands_on(self.ATT_SN),
+                         ["DATA DELETE FINGERTMP PIN=0036\tFID=6"])
+
+    def test_the_bytes_are_what_the_terminal_is_actually_handed(self):
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        command_id = self.outbox(self.ATT_SN)[0].id
+
+        self.assertEqual(self.poll(self.ATT_SN).encode(),
+                         f"C:{command_id}:DATA DELETE FINGERTMP PIN=0036\tFID=6".encode())
+
+    def test_an_unclassified_device_is_deleted_from_as_an_attendance_terminal(self):
+        self.link(self.DEFAULT_SN, "0036")
+        response = self.delete_finger(sn=self.DEFAULT_SN)
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.commands_on(self.DEFAULT_SN),
+                         ["DATA DELETE FINGERTMP PIN=0036\tFID=6"])
+
+    def test_the_response_says_queued_the_way_the_other_queued_replies_do(self):
+        """Employees.jsx awaits the call and toasts on success; a 202 with a
+        JSON body satisfies its request() as the 204 did."""
+        self.link(self.ATT_SN, "0036")
+        response = self.delete_finger()
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["transport"], "adms_queue")
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["finger_id"], 6)
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+        self.assertEqual(body["commands"], ["DATA DELETE FINGERTMP PIN=0036\tFID=6"])
+        self.assertIn("not removed yet", body["message"])
+
+    def test_a_finger_outside_zero_to_nine_is_a_422_and_queues_nothing(self):
+        self.link(self.ATT_SN, "0036")
+        response = self.delete_finger(finger_id=10)
+
+        self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(self.outbox(), [])
+
+    def test_a_person_not_on_the_terminal_with_nothing_queued_is_a_404(self):
+        response = self.delete_finger()
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(self.outbox(), [])
+
+    # -- server-side state ---------------------------------------------------
+
+    def test_queueing_keeps_the_stored_template(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        self.poll(self.ATT_SN)
+
+        self.assertEqual(self.stored_fingers(), [6], "queued is not deleted")
+
+    def test_return_zero_forgets_that_finger_and_only_that_finger(self):
+        self.add_fingerprint(finger_id=6)
+        self.add_fingerprint(finger_id=1)
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        self.deliver_and_ack(0)
+
+        self.assertEqual(self.stored_fingers(), [1])
+        self.assertEqual([(r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
+                         [("acknowledged", 0)])
+
+    def test_a_refused_delete_keeps_the_stored_template_and_is_not_retried(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        self.deliver_and_ack(-1004)
+
+        self.assertEqual(self.stored_fingers(), [6])
+        self.assertEqual([(r.outcome, r.return_code) for r in self.history(self.ATT_SN)],
+                         [("failed", -1004)])
+        self.assertEqual(self.poll(self.ATT_SN), "OK")
+
+    def test_an_unreadable_answer_keeps_the_stored_template(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        self.deliver_and_ack(3)
+
+        self.assertEqual(self.stored_fingers(), [6])
+
+    def test_a_confirmed_delete_leaves_the_person_on_the_terminal(self):
+        self.add_fingerprint()
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        self.deliver_and_ack(0)
+
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["0036"])
+
+    # -- not a revocation of the person ----------------------------------------
+
+    def test_it_is_not_listed_or_counted_as_a_revocation(self):
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+
+        self.assertEqual(self.client.get(f"/devices/{self.ATT_SN}/revocations").json(), [])
+        device = self.client.get(f"/devices/{self.ATT_SN}").json()
+        self.assertEqual(device["pending_revocations"], 0)
+
+    def test_it_does_not_block_a_push_of_the_person(self):
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+
+        response = self.push(self.ATT_SN, "0036")
+        self.assertEqual(response.status_code, 202, response.text)
+
+    def test_a_refusal_is_logged_at_error_about_the_finger_not_the_door(self):
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+
+        with self.assertLogs("app.services.commands", level="ERROR") as logs:
+            self.ack_att(command_id, -1004)
+
+        joined = "\n".join(logs.output)
+        self.assertIn("FINGERPRINT NOT REMOVED", joined)
+        self.assertIn(self.ATT_SN, joined)
+        self.assertNotIn("ACCESS NOT REVOKED", joined)
+
+    def test_an_outstanding_revocation_refuses_it_and_queues_nothing(self):
+        """Removing the person already takes every finger (§12.1.2.1)."""
+        self.link(self.ATT_SN, "0036")
+        self.revoke(self.ATT_SN, "0036")
+
+        response = self.delete_finger()
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.commands_on(self.ATT_SN), ["DATA DELETE USERINFO PIN=0036"])
+
+    def test_revoking_the_person_leaves_a_queued_finger_delete_in_place(self):
+        """It is not a push, so the revocation does not withdraw it; queued
+        first, it is delivered first."""
+        self.link(self.ATT_SN, "0036")
+        self.delete_finger()
+        response = self.revoke(self.ATT_SN, "0036")
+
+        self.assertEqual(response.json()["withdrawn_command_ids"], [])
+        self.assertEqual(self.commands_on(self.ATT_SN), [
+            "DATA DELETE FINGERTMP PIN=0036\tFID=6",
+            "DATA DELETE USERINFO PIN=0036",
+        ])
+
+    # -- a queued push of the same finger --------------------------------------
+
+    def test_queueing_it_withdraws_a_queued_push_of_the_same_finger_only(self):
+        self.add_fingerprint(finger_id=6)
+        self.add_fingerprint(finger_id=1, template="0a0b0c")
+        self.link(self.ATT_SN, "0036")
+        self.client.post(f"/devices/{self.ATT_SN}/users/0036/templates/push")
+        finger_6 = [r.id for r in self.outbox(self.ATT_SN) if "\tFID=6\t" in r.command]
+
+        body = self.delete_finger().json()
+        self.assertEqual(body["withdrawn_command_ids"], finger_6)
+        self.assertEqual([c.split("\tSize=")[0] for c in self.commands_on(self.ATT_SN)], [
+            "DATA UPDATE FINGERTMP PIN=0036\tFID=1",
+            "DATA DELETE FINGERTMP PIN=0036\tFID=6",
+        ])
+        [withdrawn] = self.history(self.ATT_SN)
+        self.assertEqual(withdrawn.outcome, "failed")
+        self.assertIn("finger 6 of 0036 is being deleted", withdrawn.last_error)
+
+    def test_a_person_not_yet_confirmed_has_the_queued_push_withdrawn_instead(self):
+        """Nothing on the terminal to delete: calling the push off is the
+        whole answer, and nothing is sent."""
+        self.add_fingerprint()
+        self.client.post(f"/devices/{self.ATT_SN}/users/0036/templates/push")
+
+        response = self.delete_finger()
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "withdrawn")
+        self.assertEqual(len(body["withdrawn_command_ids"]), 1)
+        self.assertEqual([c.split("\t")[0] for c in self.commands_on(self.ATT_SN)],
+                         ["DATA UPDATE USERINFO PIN=0036"])
+        self.assertEqual(self.stored_fingers(), [6])
 
 
 class RevocationSingleWriterTests(RevocationTestCase):

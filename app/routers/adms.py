@@ -1537,6 +1537,11 @@ async def adms_devicecmd(
             # earlier, because until this ack arrives the delete was merely
             # queued and the person could still open the door.
             provisioning.note_revocation_acknowledged(db, SN, body)
+            # And one finger, on an att terminal: a confirmed `DATA DELETE
+            # FINGERTMP PIN=…⇥FID=…` is when the stored template is forgotten,
+            # not when the delete was queued. A refusal leaves both the finger
+            # on the terminal and the stored copy that matches it.
+            provisioning.note_fingerprint_delete_acknowledged(db, SN, body)
             db.commit()
         elif outcome == "rejected":
             # The mirror image, and the reason E4 can queue a biometric behind

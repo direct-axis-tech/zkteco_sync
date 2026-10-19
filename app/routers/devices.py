@@ -1240,15 +1240,16 @@ def clear_lcd(sn: str, db: Session = Depends(get_db)):
 #          because until then "this person is on this device" is not true yet.
 #
 # Pushing people — one (push_user_to_device) or several (push_users_bulk) —
-# removing one (remove_user_from_device) and pushing a person's fingerprints
-# (push_templates_to_device) no longer use the SDK for `att`: each person is
-# one `DATA UPDATE USERINFO` or `DATA DELETE USERINFO`, each finger one
-# `DATA UPDATE FINGERTMP`, on the same outbox, with the same acknowledgement
+# removing one (remove_user_from_device), pushing a person's fingerprints
+# (push_templates_to_device) and deleting one of them (delete_user_template)
+# no longer use the SDK for `att`: each person is one `DATA UPDATE USERINFO`
+# or `DATA DELETE USERINFO`, each finger one `DATA UPDATE FINGERTMP` or
+# `DATA DELETE FINGERTMP`, on the same outbox, with the same acknowledgement
 # rules, because an attendance terminal behind NAT can never be dialled (the
-# BioPro SA20 CPV2232560497 is one). The fingerprint delete, remote
-# enrolment, attendance clear, unlock, restart and device info still route
-# `att` to the SDK until they are moved too; clock, lock state and LCD
-# message stay there for good, having no attendance-mode command.
+# BioPro SA20 CPV2232560497 is one). Remote enrolment, attendance clear,
+# unlock, restart and device info still route `att` to the SDK until they
+# are moved too; clock, lock state and LCD message stay there for good,
+# having no attendance-mode command.
 #
 # A device has exactly one protocol at a time, so exactly one of these runs
 # for a given (device, user). Neither writes DeviceEmployee inline any more:
@@ -1845,16 +1846,38 @@ def _template_ref(template) -> dict:
     return {"type": template.type, "no": template.no}
 
 
-@router.delete("/{sn}/users/{user_id}/templates/{finger_id}", status_code=204)
+@router.delete("/{sn}/users/{user_id}/templates/{finger_id}")
 def delete_user_template(
     sn: str,
     user_id: str,
     finger_id: int,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    """Delete a specific finger template from device and from DB (`att` only).
+    """Take one finger off one attendance terminal, and forget it once it is gone.
+
+    * `att` (and a device whose protocol was never set, which the column
+      treats as att, exactly as Sync does) — one `DATA DELETE FINGERTMP
+      PIN=<pin><HT>FID=<n>` on the ADMS outbox
+      (provisioning.att_fingerprint_delete_command, Attendance PUSH 2.4.1
+      §12.1.2.2). **202, `status: "queued"`**, the shape of every other
+      queued reply. Until 2026-10-19 this deleted over the SDK, TCP 4370,
+      which never reaches a terminal behind NAT.
+
+      The stored template in `fingerprint_templates` is deleted when the
+      terminal acknowledges with ``Return=0``
+      (provisioning.note_fingerprint_delete_acknowledged), not now: the
+      SDK path deleted it only after the device call had succeeded, and a
+      queued delete has not succeeded yet. A refused one leaves the finger on
+      the terminal and the stored copy that matches it.
+
+      A push of the same finger still queued for this terminal is withdrawn
+      first, so the outbox never holds both. A person the terminal has not
+      confirmed (no `device_employees` row) has nothing on it to delete: if
+      a push of this finger was waiting for them, withdrawing it is the
+      whole answer (200, `status: "withdrawn"`); otherwise 404.
 
     On an `acc` terminal this is REFUSED — 501 — and the refusal is a finding,
     not a gap somebody forgot to fill.
@@ -1899,20 +1922,74 @@ def delete_user_template(
                 "UNVERIFIED against real hardware."
             ),
         )
+    try:
+        provisioning.att_fingerprint_delete_command(user_id, finger_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # A queued revocation already takes every finger with the person
+    # (§12.1.2.1), and a finger delete delivered behind it would be refused or
+    # answered for nobody, reading as a failure for something that happened.
+    revoking = provisioning.outstanding_revocations(db, sn, user_id)
+    if revoking:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{user_id} is already being removed from {sn} (command(s) "
+                f"{', '.join(str(r.id) for r in revoking)} still queued), and "
+                "removing the person takes every fingerprint with them — "
+                "nothing was queued."
+            ),
+        )
+
     de = db.query(DeviceEmployee).filter_by(device_sn=sn, user_id=user_id).first()
     if not de:
-        raise HTTPException(status_code=404, detail="User not enrolled on this device")
-    try:
-        with device_connection(device) as conn:
-            conn.delete_user_template(uid=de.uid, temp_id=finger_id, user_id=user_id)
-        ft = db.query(FingerprintTemplate).filter_by(user_id=user_id, finger_id=finger_id).first()
-        if ft:
-            db.delete(ft)
-            db.commit()
-        audit.record(db, admin.username, "template_delete", target=f"{sn}/{user_id}/{finger_id}",
-                     ip=client_ip(request))
-    except (ZKErrorConnection, ZKNetworkError):
-        raise HTTPException(status_code=503, detail="Could not connect to device")
+        withdrawn = provisioning.withdraw_fingerprint_push(
+            db, sn, user_id, finger_id,
+            reason=f"withdrawn: finger {finger_id} of {user_id} was deleted "
+                   f"from {sn} before delivery",
+        )
+        if not withdrawn:
+            raise HTTPException(status_code=404, detail="User not enrolled on this device")
+        audit.record(db, admin.username, "template_delete",
+                     target=f"{sn}/{user_id}/{finger_id}", ip=client_ip(request),
+                     detail=f"withdrew {len(withdrawn)} undelivered push(es)")
+        return {
+            "device_sn": sn,
+            "user_id": user_id,
+            "finger_id": finger_id,
+            "transport": "adms_queue",
+            "status": "withdrawn",
+            "withdrawn_command_ids": withdrawn,
+            "message": (
+                f"This person was never confirmed on {sn}; the push of finger "
+                f"{finger_id} still waiting to go there has been withdrawn. "
+                "Nothing was sent to the device."
+            ),
+        }
+
+    row, withdrawn = provisioning.delete_att_fingerprint(db, sn, user_id, finger_id)
+    audit.record(db, admin.username, "template_delete",
+                 target=f"{sn}/{user_id}/{finger_id}", ip=client_ip(request),
+                 detail=f"queued={row.id} withdrew={len(withdrawn)}")
+    response.status_code = 202
+    return {
+        "device_sn": sn,
+        "user_id": user_id,
+        "finger_id": finger_id,
+        "transport": "adms_queue",
+        "status": "queued",
+        "command_ids": [row.id],
+        "commands": [row.command],
+        "withdrawn_command_ids": withdrawn,
+        "message": (
+            f"Queued the deletion of finger {finger_id} for {sn} — not "
+            "removed yet. The device collects it on its next poll (about 10 "
+            "seconds) and confirms afterwards; until it does, that finger "
+            "still verifies this person there, and the stored template is "
+            "kept until the device confirms."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

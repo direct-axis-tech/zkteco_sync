@@ -1217,6 +1217,164 @@ def revocation_groups(db: Session, device_sn: str, user_id: str = None) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Taking one fingerprint off an attendance terminal
+# ---------------------------------------------------------------------------
+#
+# Not a revocation of the person, and kept out of everything above that means
+# one. The person stays on the terminal and keeps every other finger, so a
+# finger delete is not counted, grouped or cancelled as a revocation, does not
+# block a push of the person, and its acknowledgement drops no
+# `device_employees` link: none of the revocation parsers above match
+# `FINGERTMP`. What it does share with a revocation is commands.is_revocation
+# (any `DATA DELETE`): until it lands the finger still verifies the person,
+# so it is retried on the shorter schedule, and a failure is said at ERROR in
+# words about the finger, not the door (commands.conclude).
+#
+# The `acc` side has no counterpart and refuses one with a 501 (see
+# app/routers/devices.py, delete_user_template): the Security PUSH command set
+# has no biometric delete. Attendance PUSH has one, §12.1.2.2.
+
+
+def att_fingerprint_delete_command(user_id, finger_id) -> str:
+    """`DATA DELETE FINGERTMP PIN=<s><HT>FID=<n>` — one finger off an `att`
+    terminal.
+
+    Attendance PUSH 2.4.1 §12.1.2.2, from the document; not yet observed on
+    hardware::
+
+        DATA DELETE FINGERTMP PIN=<s>
+        DATA DELETE FINGERTMP PIN=<s><HT>FID=<n>
+
+    ``FID`` is always sent, and that is the point of this function. The
+    section says "When only PIN information is transmitted, all fingerprints
+    of the user are deleted", so a FID that went missing on the way would
+    turn a one-finger delete into every finger the person has. A finger
+    outside the document's 0–9 is refused rather than sent, as
+    :func:`att_fingerprint_command` refuses one; so is an empty PIN, which
+    names nobody.
+
+    ``PIN`` goes out verbatim, as the string it is (`036` and `0036` are two
+    people on the SA20).
+    """
+    pin = _wire_safe(user_id)
+    if not pin:
+        raise ValueError("no PIN; a fingerprint delete has to name its person")
+    if isinstance(finger_id, bool) or finger_id not in ATT_FINGER_IDS:
+        raise ValueError(
+            f"finger {finger_id} is outside 0-9, the only fingers §12.1.2.2 "
+            f"numbers; nothing was queued"
+        )
+    return f"DATA DELETE FINGERTMP PIN={pin}{HT}FID={int(finger_id)}"
+
+
+# One finger on the attendance wire, `(PIN, FID)`: the push (§12.1.1.3) and the
+# delete (§12.1.2.2) both lead with PIN and then FID. The delete only matches
+# with its FID: a PIN-only delete (typed by hand into the command box) takes
+# every finger and is not this command, so no single stored finger is
+# forgotten on its account.
+_FINGER_PUSH = re.compile(
+    r"^DATA UPDATE FINGERTMP\s+PIN=([^\t]*)\tFID=(\d+)(?:\t|$)", re.IGNORECASE
+)
+_FINGER_DELETE = re.compile(
+    r"^DATA DELETE FINGERTMP\s+PIN=([^\t]*)\tFID=(\d+)$", re.IGNORECASE
+)
+
+
+def _finger_named_by(pattern, command: str):
+    match = pattern.match((command or "").strip())
+    if not match or not match.group(1).strip():
+        return None
+    return match.group(1).strip(), int(match.group(2))
+
+
+def finger_from_fingerprint_delete(command: str):
+    """``(pin, finger_id)`` of a one-finger `DATA DELETE FINGERTMP`, or None."""
+    return _finger_named_by(_FINGER_DELETE, command)
+
+
+def withdraw_fingerprint_push(db: Session, device_sn: str, user_id: str,
+                              finger_id: int, reason: str) -> list:
+    """Retire a queued `DATA UPDATE FINGERTMP` for this one finger. Returns
+    the ids.
+
+    The finger-sized :func:`withdraw_pushes_for`: a queued push and a queued
+    delete of the same finger contradict each other, and the outbox is FIFO,
+    so the push is concluded ``failed`` with the reason recorded before the
+    delete is queued. The person's other fingers and their USERINFO are left
+    alone: only this finger was asked about.
+    """
+    withdrawn = []
+    for row in db.query(DeviceCommandOutbox).filter(
+        DeviceCommandOutbox.device_sn == device_sn
+    ).order_by(DeviceCommandOutbox.id).all():
+        if _finger_named_by(_FINGER_PUSH, row.command) != (str(user_id), finger_id):
+            continue
+        row_id = row.id
+        if commands.conclude(db, row, "failed", last_error=reason):
+            withdrawn.append(row_id)
+            log.warning(
+                "withdrew queued fingerprint push %s (finger %s of %s on %s): %s",
+                row_id, finger_id, user_id, device_sn, reason,
+            )
+    return withdrawn
+
+
+def delete_att_fingerprint(db: Session, device_sn: str, user_id: str,
+                           finger_id: int) -> tuple:
+    """Queue one finger's removal from one `att` terminal.
+
+    Returns ``(row, withdrawn)``: the outbox row and the ids of any push of
+    the same finger retired to make room for it. Raises ValueError, queueing
+    nothing, for a finger :func:`att_fingerprint_delete_command` refuses.
+
+    Deletes nothing from `fingerprint_templates`. That happens when the
+    terminal confirms (:func:`note_fingerprint_delete_acknowledged`), for the
+    reason `device_employees` waits for an acknowledgement: until then the
+    finger is still on the terminal, and the stored copy is what would put it
+    back if the delete is refused.
+    """
+    body = att_fingerprint_delete_command(user_id, finger_id)
+    withdrawn = withdraw_fingerprint_push(
+        db, device_sn, user_id, finger_id,
+        reason=f"withdrawn: finger {finger_id} of {user_id} is being deleted "
+               f"from {device_sn}",
+    )
+    row = commands.queue(db, device_sn, body)
+    log.info(
+        "deleting finger %s of %s from %s: queued command %s%s — not removed "
+        "until the terminal acknowledges",
+        finger_id, user_id, device_sn, row.id,
+        f", withdrew {len(withdrawn)} push(es) of the same finger" if withdrawn else "",
+    )
+    return row, withdrawn
+
+
+def note_fingerprint_delete_acknowledged(db: Session, device_sn: str, command: str):
+    """The terminal confirmed a one-finger delete: forget the stored finger.
+
+    `fingerprint_templates` is keyed on the person and the finger, not the
+    device, so this is the same server-side effect the SDK delete had
+    (removed after the device call succeeded): the finger is no longer
+    offered to any terminal by a later push. Only on ``Return=0`` — a refused
+    or unconfirmed delete leaves the finger on the terminal, and the stored
+    copy with it.
+
+    Does not commit — the caller owns the transaction.
+    """
+    finger = finger_from_fingerprint_delete(command)
+    if not finger:
+        return False
+    user_id, finger_id = finger
+    removed = employee_sync.forget_fingerprint(db, user_id, finger_id)
+    log.info(
+        "device %s acknowledged deleting finger %s of %s%s",
+        device_sn, finger_id, user_id,
+        "" if removed else " (no stored template for that finger to forget)",
+    )
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Asking the terminal for what it already holds (E12)
 # ---------------------------------------------------------------------------
 #

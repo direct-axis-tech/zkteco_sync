@@ -93,8 +93,21 @@ def is_revocation(command: str) -> bool:
     Used for two things and nothing else: a shorter retry schedule, and a
     louder log line when one is given up on. Both exist because while a
     revocation is outstanding the person it names can still open the door.
+
+    That includes a one-finger delete on an attendance terminal (`DATA DELETE
+    FINGERTMP`, Attendance PUSH §12.1.2.2): it takes away one credential, not
+    the person, but until it lands that finger still verifies them, so it
+    earns the same urgency. Its log line says so (:func:`conclude`). Whether a
+    delete is a *person's* revocation — counted, grouped, blocking pushes — is
+    provisioning.is_revocation_command's question, not this one's.
     """
     return bool(_REVOCATION.match((command or "").strip()))
+
+
+# The one delete that takes a single credential rather than the person: a
+# finger off an attendance terminal. Named apart only so its alarm describes
+# what is actually still there.
+_CREDENTIAL_DELETE = re.compile(r"^DATA DELETE FINGERTMP\b", re.IGNORECASE)
 
 
 def backoff_for(attempts: int, command: str = None) -> timedelta:
@@ -411,11 +424,19 @@ def conclude(
                 f"answered Return={return_code}, which this system cannot read "
                 "as either success or refusal"
             )
-        log.error(
-            "ACCESS NOT REVOKED: %s never confirmed %r (%s). That person may "
-            "still be able to open this door — check the terminal directly.",
-            snapshot["device_sn"], snapshot["command"][:120], reason,
-        )
+        if _CREDENTIAL_DELETE.match(snapshot["command"].strip()):
+            log.error(
+                "FINGERPRINT NOT REMOVED: %s never confirmed %r (%s). That "
+                "finger may still verify this person at this terminal — check "
+                "the terminal directly.",
+                snapshot["device_sn"], snapshot["command"][:120], reason,
+            )
+        else:
+            log.error(
+                "ACCESS NOT REVOKED: %s never confirmed %r (%s). That person may "
+                "still be able to open this door — check the terminal directly.",
+                snapshot["device_sn"], snapshot["command"][:120], reason,
+            )
     return True
 
 

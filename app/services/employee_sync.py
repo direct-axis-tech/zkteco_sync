@@ -415,3 +415,16 @@ def record_device_fingerprint(db: Session, device_sn: str, user_id, finger_id,
     row.source_device_sn = device_sn
     db.flush()
     return row
+
+
+def forget_fingerprint(db: Session, user_id, finger_id) -> bool:
+    """Drop one stored fingerprint, the mirror of :func:`record_device_fingerprint`.
+
+    Returns True if a row was removed. Does not commit.
+    """
+    removed = (
+        db.query(FingerprintTemplate)
+        .filter_by(user_id=str(user_id), finger_id=finger_id)
+        .delete(synchronize_session=False)
+    )
+    return bool(removed)
