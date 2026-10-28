@@ -585,7 +585,8 @@ async def adms_receive(
         tablename = _query(request, "tablename").strip()
         count = _query(request, "count").strip()
         if not tablename:
-            log.warning("ADMS tabledata from %s with no tablename: %s", SN, _clip(body))
+            log.warning("ADMS tabledata from %s with no tablename: %s", SN,
+                        _clip(_without_passwords(body)))
             return PlainTextResponse(content="OK")
 
         count = _log_bulk_payload("tabledata", SN, tablename, count, raw, body)
@@ -603,7 +604,7 @@ async def adms_receive(
     log.warning(
         "ADMS cdata: unhandled table=%r from serial=%s query=%r body=%s",
         name, SN, str(request.query_params),
-        _clip(raw.decode("utf-8", errors="ignore")),
+        _clip(_without_passwords(raw.decode("utf-8", errors="ignore"))),
     )
     return PlainTextResponse(content="OK")
 
@@ -650,7 +651,8 @@ def _log_bulk_payload(source: str, sn: str, tablename: str, count: str,
     else:
         log.info(
             "ADMS %s from %s: tablename=%s count=%s body=%s",
-            source, sn, tablename, count, _clip(body, _TABLEDATA_LOG_LIMIT),
+            source, sn, tablename, count,
+            _clip(_without_passwords(body), _TABLEDATA_LOG_LIMIT),
         )
     return count
 
@@ -664,6 +666,16 @@ _OPERLOG_BLOB_VALUE = re.compile(r"\b(tmp|content)=([^\t\r\n]*)", re.IGNORECASE)
 # that open the door. A journal is readable by more people than the device
 # menu, so a set value is logged only as being set.
 _OPERLOG_SECRET_VALUE = re.compile(r"\b(passwd|card|vicecard)=([^\t\r\n]+)", re.IGNORECASE)
+
+# A keypad password in any other upload: `password=` on the Security PUSH
+# `user` table, `Passwd=` on an attendance `USER` line. The app keeps it
+# sealed, so a log line must not keep it in the clear.
+_PASSWORD_VALUE = re.compile(r"\b(password|passwd)=([^\t\r\n]+)", re.IGNORECASE)
+
+
+def _without_passwords(text: str) -> str:
+    """``text`` with every keypad password value replaced by ``<set>``."""
+    return _PASSWORD_VALUE.sub(lambda m: f"{m.group(1)}=<set>", text)
 
 
 def _log_operlog(sn: str, body: str) -> None:
@@ -713,8 +725,9 @@ def _store_operlog(db: Session, sn: str, body: str) -> None:
     * ``USER PIN=…⇥Name=…⇥Pri=…⇥Passwd=…⇥Card=…⇥…`` — §11.5. Written through
       ``employee_sync.record_device_user``, the writer every other transport
       uses, so its "fill in, never empty out" rule holds here too.
-      ``Passwd``, ``Grp``, ``TZ``, ``Verify``, ``ViceCard`` and the validity
-      dates have nowhere to go in the schema and are dropped.
+      ``Passwd`` is kept there, sealed. ``Grp``, ``TZ``, ``Verify``,
+      ``ViceCard`` and the validity dates have nowhere to go in the schema
+      and are dropped.
     * ``FP PIN=…⇥FID=…⇥Size=…⇥Valid=…⇥TMP=<base64>`` — §11.9. The template is
       decoded and stored hex-encoded, the form the SDK path stores.
 
@@ -743,6 +756,7 @@ def _store_operlog(db: Session, sn: str, body: str) -> None:
                 name=fields.get("name"),
                 privilege=fields.get("pri"),
                 card=fields.get("card"),
+                password=fields.get("passwd"),
             )
             users += 1
             continue
@@ -1161,10 +1175,11 @@ def _store_user_table(db: Session, sn: str, body: str) -> None:
     out" rule lives there, and it is what keeps an operator-entered name alive
     through an upload like the captured one, where every record has ``name=``.
 
-    ``password``, ``group``, ``starttime``, ``endtime``, ``disable`` and
-    ``verify`` have nowhere to go in the current schema. They are dropped
-    rather than guessed at — the log line above keeps the raw record if they
-    ever turn out to matter.
+    ``password`` is kept by employee_sync, sealed, and is the one field the
+    log line above does not keep. ``group``, ``starttime``, ``endtime``,
+    ``disable`` and ``verify`` have nowhere to go in the current schema. They
+    are dropped rather than guessed at — the log line keeps the raw record if
+    they ever turn out to matter.
     """
     stored = set()
     skipped = 0
@@ -1183,7 +1198,8 @@ def _store_user_table(db: Session, sn: str, body: str) -> None:
             # will not send it again. Logged rather than dropped silently, for
             # the same reason every other unknown thing here is.
             log.warning(
-                "ADMS user upload from %s: skipping unusable record %r", sn, _clip(line, 300)
+                "ADMS user upload from %s: skipping unusable record %r", sn,
+                _clip(_without_passwords(line), 300)
             )
             skipped += 1
             continue
@@ -1197,6 +1213,7 @@ def _store_user_table(db: Session, sn: str, body: str) -> None:
             name=fields.get("name"),
             privilege=fields.get("privilege"),
             card=fields.get("cardno"),
+            password=fields.get("password"),
         )
         stored.add(pin.strip())
 
@@ -1947,7 +1964,8 @@ async def adms_querydata(
         # answered so the device stops asking.
         log.warning(
             "ADMS querydata from %s with no tablename: query=%r body=%s",
-            SN, str(request.query_params), _clip(body, _TABLEDATA_LOG_LIMIT),
+            SN, str(request.query_params),
+            _clip(_without_passwords(body), _TABLEDATA_LOG_LIMIT),
         )
         return PlainTextResponse(content="OK")
 
@@ -1971,7 +1989,7 @@ async def adms_querydata(
         log.warning(
             "ADMS querydata from %s: no parser for tablename=%r — payload "
             "logged and acknowledged, not stored: %s",
-            SN, tablename, _clip(payload, _TABLEDATA_LOG_LIMIT),
+            SN, tablename, _clip(_without_passwords(payload), _TABLEDATA_LOG_LIMIT),
         )
 
     # Last, and only now. The command is concluded once its answer is whole and
@@ -2115,6 +2133,6 @@ async def adms_unknown(request: Request, path: str):
         "ADMS: unhandled /iclock request — method=%s path=/iclock/%s query=%r "
         "client=%s user_agent=%r body=%s",
         request.method, path, str(request.query_params), client_ip(request),
-        request.headers.get("user-agent", ""), _clip(body),
+        request.headers.get("user-agent", ""), _clip(_without_passwords(body)),
     )
     return PlainTextResponse(content="Not Found", status_code=404)

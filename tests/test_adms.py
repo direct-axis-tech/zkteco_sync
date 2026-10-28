@@ -1861,6 +1861,114 @@ class SdkAndPushAgreeTests(AdmsTestCase):
             db.close()
 
 
+class KeypadPasswordStorageTests(AdmsTestCase):
+    """The keypad password a device reports is kept — sealed, never in the
+    clear, and never emptied by a device that simply does not have it."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_device(ACC_SN, protocol="acc")
+        self.add_device(LEGACY_SN, protocol="att")
+
+    def acc_upload(self, line):
+        return self.client.post(
+            f"/iclock/cdata?SN={ACC_SN}&table=tabledata&tablename=user&count=1",
+            content=line + "\n")
+
+    def att_upload(self, line):
+        return self.client.post(
+            f"/iclock/cdata?SN={LEGACY_SN}&table=OPERLOG&Stamp=9999", content=line + "\n")
+
+    def stored(self, user_id="1"):
+        from app import keypad_password
+        token = self.employees()[user_id].keypad_password
+        return token, keypad_password.unseal(token)
+
+    def test_an_access_control_user_upload_keeps_the_password_sealed(self):
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821\tname=Aisha")
+        token, password = self.stored()
+        self.assertEqual(password, "4821")
+        self.assertNotIn("4821", token)
+
+    def test_an_attendance_user_line_keeps_the_password_sealed(self):
+        self.att_upload("USER PIN=036\tName=Ahmed\tPri=0\tPasswd=7350\tCard=\tGrp=1")
+        self.assertEqual(self.stored("036")[1], "7350")
+
+    def test_an_sdk_pull_keeps_the_password(self):
+        db = self.Session()
+        try:
+            employee_sync.record_device_user(db, ACC_SN, "1", uid=1, name="",
+                                             privilege=0, card=0, password="9912")
+            db.commit()
+        finally:
+            db.close()
+        self.assertEqual(self.stored()[1], "9912")
+
+    def test_the_poller_hands_the_writer_the_password_it_read(self):
+        """Structural, like the poller test above: pyzk's User carries the
+        password, and the pull must pass it on."""
+        import inspect as _inspect
+        from app.services import poller
+        self.assertIn("password=user.password", _inspect.getsource(poller.pull_employees))
+
+    def test_a_device_without_the_password_does_not_erase_it(self):
+        """Pushed to a second terminal with no password, the person is
+        reported back from it with `Passwd=` empty."""
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821")
+        self.att_upload("USER PIN=1\tName=\tPri=0\tPasswd=\tCard=\tGrp=1")
+        self.assertEqual(self.stored()[1], "4821")
+
+    def test_a_changed_password_replaces_the_stored_one(self):
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821")
+        self.acc_upload("user uid=1\tpin=1\tpassword=1111")
+        self.assertEqual(self.stored()[1], "1111")
+
+    def test_the_same_password_reported_again_leaves_the_row_alone(self):
+        """A fresh seal of the same digits is a different token; rewriting it
+        on every poll would churn the row for nothing."""
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821")
+        token, _ = self.stored()
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821")
+        self.assertEqual(self.stored()[0], token)
+
+    def test_a_password_no_terminal_could_be_given_back_is_not_stored(self):
+        self.acc_upload("user uid=1\tpin=1\tpassword=" + "9" * 40 + "\tname=Aisha")
+        self.assertEqual(self.employees()["1"].name, "Aisha")
+        self.assertIsNone(self.stored()[0])
+
+    def test_without_a_secret_key_the_person_still_lands_without_the_password(self):
+        from unittest import mock
+        with mock.patch.object(config, "SECRET_KEY", None):
+            self.acc_upload("user uid=1\tpin=1\tpassword=4821\tname=Aisha")
+        self.assertEqual(self.employees()["1"].name, "Aisha")
+        self.assertIsNone(self.stored()[0])
+
+    def test_a_token_the_current_key_cannot_open_reads_as_no_password(self):
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821")
+        from unittest import mock
+        from app import keypad_password
+        token, _ = self.stored()
+        with mock.patch.object(config, "SECRET_KEY", "y" * 48):
+            self.assertIsNone(keypad_password.unseal(token))
+
+    def test_the_upload_log_does_not_carry_the_password(self):
+        with self.assertLogs("app.routers.adms", level="INFO") as logs:
+            self.acc_upload("user uid=1\tpin=1\tpassword=4821\tname=Aisha")
+        self.assertFalse([line for line in logs.output if "4821" in line], logs.output)
+        self.assertTrue([line for line in logs.output if "password=<set>" in line])
+
+    def test_the_api_shape_says_whether_a_password_is_set_and_never_what_it_is(self):
+        from app.schemas import EmployeeOut
+        self.acc_upload("user uid=1\tpin=1\tpassword=4821")
+        self.acc_upload("user uid=2\tpin=2\tpassword=")
+        shown = {u: EmployeeOut.model_validate(e).model_dump()
+                 for u, e in self.employees().items()}
+        self.assertEqual((shown["1"]["has_keypad_password"], shown["2"]["has_keypad_password"]),
+                         (True, False))
+        self.assertNotIn("keypad_password", shown["1"])
+        self.assertNotIn("4821", repr(shown["1"]))
+
+
 # ---------------------------------------------------------------------------
 # 5. The catch-all
 # ---------------------------------------------------------------------------

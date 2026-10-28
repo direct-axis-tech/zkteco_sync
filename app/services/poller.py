@@ -58,6 +58,7 @@ def pull_employees(serial_number: str) -> dict:
                     name=user.name,
                     privilege=user.privilege,
                     card=user.card,
+                    password=user.password,
                 )
                 result["users_synced"] += 1
 

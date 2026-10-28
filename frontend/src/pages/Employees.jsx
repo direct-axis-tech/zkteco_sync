@@ -593,6 +593,9 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
             ['User ID', <span key="uid" className="font-mono text-xs">{employee.user_id}</span>],
             ['Card', employee.card && employee.card !== '0' ? employee.card : '—'],
             ['Privilege', <PrivilegeBadge key="priv" privilege={employee.privilege} />],
+            // Only whether one is stored: the password itself never leaves
+            // the server.
+            ['Keypad password', employee.has_keypad_password ? 'Set' : '—'],
             ['Added', new Date(employee.created_at).toLocaleDateString()],
           ].map(([label, value]) => (
             <div key={label} className="flex justify-between items-center py-2.5 text-sm">

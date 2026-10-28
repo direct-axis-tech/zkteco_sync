@@ -126,8 +126,16 @@ class Employee(Base):
     name = Column(String(100), nullable=False)
     privilege = Column(Integer, default=0)
     card = Column(String(20), default="0")
+    # The person's device keypad password, sealed (app/keypad_password.py) —
+    # never the digits. NULL is "none known". Write-only from the API's point
+    # of view, like Device.comm_key: only `has_keypad_password` leaves here.
+    keypad_password = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    @property
+    def has_keypad_password(self) -> bool:
+        return bool(self.keypad_password)
 
 
 class DeviceEmployee(Base):

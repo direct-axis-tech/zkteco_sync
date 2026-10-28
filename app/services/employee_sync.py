@@ -36,6 +36,13 @@ The two conventions that follow from it:
 * ``privilege`` is the exception: ``0`` is a real value (an ordinary user, as
   opposed to ``14`` for an admin), so it is applied whenever the field was
   present at all. Only an absent or unparseable ``privilege`` is ignored.
+* ``password`` — the keypad password — follows the main rule, and for a
+  reason beyond the device having nothing to say: a person pushed to a
+  second terminal without their password is reported back from it with
+  ``Passwd=`` empty, and emptying on that report would lose the password the
+  first terminal still holds. It is stored sealed (app/keypad_password.py);
+  what a device reports is kept verbatim, as a template is, so a push hands
+  the next terminal exactly what the first one said.
 
 Nothing here commits. Both callers own their own transaction — the poller
 commits once per pull, the ADMS handler once per upload — and a helper that
@@ -49,6 +56,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app import keypad_password
 from app.models import (
     BiometricTemplate, DeviceEmployee, Employee, EmployeePhoto,
     FingerprintTemplate,
@@ -61,6 +69,11 @@ log = logging.getLogger(__name__)
 _USER_ID_LIMIT = 24
 _NAME_LIMIT = 100
 _CARD_LIMIT = 20
+
+# Longer than any terminal's keypad accepts (the Security PUSH document says
+# "up to 6"). A longer value is not a password this application can hand back
+# to a device, and clipping it would store a different one, so it is refused.
+_PASSWORD_LIMIT = 32
 
 # What a device sends for "this user has no card". The SDK path reports it as
 # the integer 0 and Employee.card defaults to the string "0", so neither of
@@ -84,7 +97,32 @@ def _int_or_none(value):
         return None
 
 
-def upsert_employee(db: Session, user_id, *, name=None, privilege=None, card=None):
+def _apply_keypad_password(emp: Employee, password: str) -> bool:
+    """Seal ``password`` onto ``emp`` unless it is already what is stored.
+    True if the row changed.
+
+    Compared by unsealing, because a fresh seal of the same digits is a
+    different token: re-sealing on every report would rewrite the row, and
+    bump ``updated_at``, on every poll of every terminal.
+    """
+    if len(password) > _PASSWORD_LIMIT or any(c in password for c in "\t\r\n"):
+        log.warning("keypad password for %s refused: not a value a terminal can "
+                    "be given back", emp.user_id)
+        return False
+    if keypad_password.unseal(emp.keypad_password) == password:
+        return False
+    try:
+        emp.keypad_password = keypad_password.seal(password)
+    except RuntimeError as exc:
+        # No key to seal with. The rest of the person still lands: losing a
+        # whole sync over one field would be worse than not keeping it.
+        log.warning("keypad password for %s not stored: %s", emp.user_id, exc)
+        return False
+    return True
+
+
+def upsert_employee(db: Session, user_id, *, name=None, privilege=None, card=None,
+                    password=None):
     """Create or update the ``employees`` row for one device user ID.
 
     Keyed on ``user_id`` — the device's ``pin`` — because that is already the
@@ -128,6 +166,9 @@ def upsert_employee(db: Session, user_id, *, name=None, privilege=None, card=Non
         if emp.card != value:
             emp.card = value
             changed = True
+
+    if not _blank(password) and _apply_keypad_password(emp, str(password).strip()):
+        changed = True
 
     if changed:
         emp.updated_at = _now()
@@ -376,6 +417,7 @@ def record_device_user(
     name=None,
     privilege=None,
     card=None,
+    password=None,
 ):
     """One person, as reported by one device: the employee row plus the link.
 
@@ -383,7 +425,8 @@ def record_device_user(
     is what guarantees the SDK pull and the ADMS push cannot drift apart in
     what they write.
     """
-    emp = upsert_employee(db, user_id, name=name, privilege=privilege, card=card)
+    emp = upsert_employee(db, user_id, name=name, privilege=privilege, card=card,
+                          password=password)
     if emp is None:
         return None, None
     return emp, link_device_employee(db, device_sn, emp.user_id, uid)

@@ -71,6 +71,9 @@ class EmployeeOut(BaseModel):
     name: str
     privilege: int
     card: str
+    # Whether a keypad password is stored for this person — never the
+    # password, which does not leave the server (Employee.keypad_password).
+    has_keypad_password: bool = False
     created_at: datetime
     updated_at: datetime
 
