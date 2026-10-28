@@ -187,6 +187,11 @@ export const api = {
     cancelRevocation: (sn, userId) =>
       request('DELETE', `/devices/${sn}/users/${userId}/revocation`),
     pushTemplates: (sn, userId) => request('POST', `/devices/${sn}/users/${userId}/templates/push`),
+    // Several people's stored templates, each behind their record where the
+    // device has not confirmed them. Answers `skipped` (deliberately not
+    // queued) apart from `errors`, unlike pushBulk.
+    pushTemplatesBulk: (sn, user_ids) =>
+      request('POST', `/devices/${sn}/templates/push_bulk`, { user_ids }),
     enrollUser: (sn, userId, fingerId) =>
       request('POST', `/devices/${sn}/users/${userId}/enroll`, { finger_id: fingerId }),
     deleteTemplate: (sn, userId, fingerId) =>

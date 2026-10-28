@@ -1779,12 +1779,145 @@ def push_templates_to_device(
         # behind it — a template belongs to a Pin the terminal knows.
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    try:
+        queued = _queue_person_templates(db, device, emp, admin, client_ip(request))
+    except _TemplatesNotQueued as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.detail)
+
+    rows, bodies = queued["rows"], queued["bodies"]
+    already_there = queued["already_there"]
+    response.status_code = 202
+    seconds = len(rows) * 10
+    return {
+        "device_sn": sn,
+        "user_id": user_id,
+        "transport": "adms_queue",
+        "status": "queued",
+        "templates_queued": len(bodies),
+        "user_record_queued": not already_there,
+        "command_ids": [r.id for r in rows],
+        # The command *names* only. The bytes of a template are a biometric
+        # credential and there is no reason to hand them back out of the
+        # database to a browser to be logged, cached or screenshotted.
+        "commands": [r.command.split("\t")[0] for r in rows],
+        "skipped_from_this_device": [_template_ref(t) for t in queued["from_this_device"]],
+        "skipped_unsendable": [
+            {**_template_ref(t), "reason": reason} for t, reason in queued["unsendable"]
+        ],
+        "message": (
+            f"Queued {len(rows)} command{'' if len(rows) == 1 else 's'} for "
+            f"{sn}: {len(bodies)} template(s)"
+            + (f" behind {queued['user_record']}, which this terminal has not "
+               "confirmed yet" if not already_there else "")
+            + f". At one command per poll this takes roughly {seconds} seconds, "
+            "and nothing is delivered until the device collects it — this is "
+            "not delivered yet."
+        ),
+    }
+
+
+@router.post("/{sn}/templates/push_bulk")
+def push_templates_bulk(
+    sn: str,
+    payload: BulkPushRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Copy several people's stored biometrics onto one device: the single
+    template push, once per person.
+
+    The per-person rules are push_templates_to_device's, unchanged — the
+    person's record queued ahead of their templates when the device has not
+    confirmed them, a device's own captures withheld while it holds them, an
+    outstanding revocation respected. What a single push answers with a 4xx
+    is filed here under the person instead, so one person with nothing
+    captured does not stop everybody else:
+
+    * `skipped` — deliberately not queued: a revocation still outstanding,
+      nothing captured, or only templates this device captured itself and
+      still holds. Each line says which, because the remedy differs.
+    * `errors` — the person is unknown, or their stored templates cannot be
+      put on the wire.
+
+    **202, `status: "queued"`, `transport: "adms_queue"`** whatever the
+    protocol, as push_users_bulk answers.
+    """
+    device = _get_device_or_404(sn, db)
+    ip = client_ip(request)
+    pushed, skipped, errors, queued = [], [], [], []
+    templates = 0
+    for user_id in payload.user_ids:
+        emp = db.query(Employee).filter_by(user_id=user_id).first()
+        if not emp:
+            errors.append(f"{user_id}: employee not found in DB")
+            continue
+        try:
+            person = _queue_person_templates(db, device, emp, admin, ip)
+        except _TemplatesNotQueued as refused:
+            (skipped if refused.skip else errors).append(f"{user_id}: {refused.reason}")
+            continue
+        queued.extend(r.id for r in person["rows"])
+        templates += len(person["bodies"])
+        pushed.append(user_id)
+
+    response.status_code = 202
+    seconds = len(queued) * 10
+    return {
+        "device_sn": sn,
+        "transport": "adms_queue",
+        "status": "queued",
+        "pushed": pushed,
+        "skipped": skipped,
+        "errors": errors,
+        "templates_queued": templates,
+        "command_ids": queued,
+        # What the drawer shows verbatim (DeviceUsersDrawer.jsx): queued, with
+        # the honest drain time, never "pushed".
+        "message": (
+            f"Queued {len(queued)} command{'' if len(queued) == 1 else 's'} "
+            f"({templates} template{'' if templates == 1 else 's'}) for "
+            f"{len(pushed)} {'person' if len(pushed) == 1 else 'people'}. "
+            f"At one command per poll this takes roughly {seconds} seconds "
+            "to drain, and nothing is delivered until the device collects it."
+        ),
+    }
+
+
+class _TemplatesNotQueued(Exception):
+    """Why nothing was queued for one person's templates.
+
+    ``status`` and ``detail`` are the single push's HTTP answer, ``reason`` is
+    the line the bulk push files under that person, and ``skip`` tells a
+    deliberate refusal (a revocation outstanding, nothing captured, only the
+    device's own originals) from data that cannot go on the wire.
+    """
+
+    def __init__(self, status: int, detail: str, reason: str, skip: bool):
+        super().__init__(detail)
+        self.status, self.detail, self.reason, self.skip = status, detail, reason, skip
+
+
+def _queue_person_templates(db: Session, device: Device, emp: Employee,
+                            admin: User, ip) -> dict:
+    """Queue one person's stored templates onto one device, their record
+    first if the device has not confirmed them. Raises _TemplatesNotQueued,
+    queueing nothing, when there is nothing that may be sent."""
+    sn, user_id = device.serial_number, emp.user_id
+
     # Same rule as the user push: a biometric queued behind an uncollected
     # delete would put the credential back on the door the delete is meant to
     # take it off.
     blocked = _revocation_block(db, sn, user_id)
     if blocked:
-        raise blocked
+        raise _TemplatesNotQueued(
+            blocked.status_code, blocked.detail,
+            f"a revocation for this person on {sn} is still queued and "
+            "unconfirmed — not pushed, because that would contradict it. "
+            "Cancel the revocation to re-grant access.",
+            skip=True,
+        )
 
     if _uses_command_queue(device):
         sendable, from_this_device = provisioning.templates_for_device(db, sn, user_id)
@@ -1802,37 +1935,38 @@ def push_templates_to_device(
         user_record = "the person's user record"
 
     if not sendable and not from_this_device:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No {what} captured for this person. They must enrol {enrol} "
-                "at a terminal first — nothing was queued."
-            ),
+        raise _TemplatesNotQueued(
+            404,
+            f"No {what} captured for this person. They must enrol {enrol} "
+            "at a terminal first — nothing was queued.",
+            f"no {what} captured — they must enrol {enrol} at a terminal first",
+            skip=True,
         )
     if not sendable:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"All {len(from_this_device)} stored template(s) for this person "
-                f"were captured on {sn} itself, and {sn} still holds them — it "
-                "has the originals. Sending this server's copy back would "
-                "overwrite a live enrolment for no gain, so nothing was queued. "
-                "(If the terminal has actually lost them — a wipe, or a "
-                "revocation — revoke the person from this door first; once the "
-                "device no longer holds them, the same templates become "
-                "sendable and a push restores them.)"
-            ),
+        raise _TemplatesNotQueued(
+            409,
+            f"All {len(from_this_device)} stored template(s) for this person "
+            f"were captured on {sn} itself, and {sn} still holds them — it "
+            "has the originals. Sending this server's copy back would "
+            "overwrite a live enrolment for no gain, so nothing was queued. "
+            "(If the terminal has actually lost them — a wipe, or a "
+            "revocation — revoke the person from this door first; once the "
+            "device no longer holds them, the same templates become "
+            "sendable and a push restores them.)",
+            f"every stored template was captured on {sn}, which still holds "
+            "them — it has the originals",
+            skip=True,
         )
 
     bodies, unsendable = provisioning.template_commands(sendable, build)
     if not bodies:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Stored template data cannot be put on the wire: "
-                + "; ".join(reason for _, reason in unsendable)
-                + " — nothing was queued."
-            ),
+        why = "; ".join(reason for _, reason in unsendable)
+        raise _TemplatesNotQueued(
+            422,
+            f"Stored template data cannot be put on the wire: {why} — nothing "
+            "was queued.",
+            f"stored template data cannot be put on the wire: {why}",
+            skip=False,
         )
 
     # The person first, unless this terminal has already confirmed it holds
@@ -1845,36 +1979,14 @@ def push_templates_to_device(
     )
 
     audit.record(db, admin.username, "template_queue", target=f"{sn}/{user_id}",
-                 ip=client_ip(request),
-                 detail=f"templates={len(bodies)} user_record={not already_there}")
-
-    response.status_code = 202
-    seconds = len(rows) * 10
+                 ip=ip, detail=f"templates={len(bodies)} user_record={not already_there}")
     return {
-        "device_sn": sn,
-        "user_id": user_id,
-        "transport": "adms_queue",
-        "status": "queued",
-        "templates_queued": len(bodies),
-        "user_record_queued": not already_there,
-        "command_ids": [r.id for r in rows],
-        # The command *names* only. The bytes of a template are a biometric
-        # credential and there is no reason to hand them back out of the
-        # database to a browser to be logged, cached or screenshotted.
-        "commands": [r.command.split("\t")[0] for r in rows],
-        "skipped_from_this_device": [_template_ref(t) for t in from_this_device],
-        "skipped_unsendable": [
-            {**_template_ref(t), "reason": reason} for t, reason in unsendable
-        ],
-        "message": (
-            f"Queued {len(rows)} command{'' if len(rows) == 1 else 's'} for "
-            f"{sn}: {len(bodies)} template(s)"
-            + (f" behind {user_record}, which this terminal has not confirmed "
-               "yet" if not already_there else "")
-            + f". At one command per poll this takes roughly {seconds} seconds, "
-            "and nothing is delivered until the device collects it — this is "
-            "not delivered yet."
-        ),
+        "rows": rows,
+        "bodies": bodies,
+        "already_there": already_there,
+        "from_this_device": from_this_device,
+        "unsendable": unsendable,
+        "user_record": user_record,
     }
 
 

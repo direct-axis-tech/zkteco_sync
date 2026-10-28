@@ -15,7 +15,8 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
   const [enrolledIds, setEnrolledIds] = useState(new Set())
   const [selected, setSelected] = useState(new Set())
   const [loading, setLoading] = useState(true)
-  const [pushing, setPushing] = useState(false)
+  // Which push is in flight: 'users', 'templates', or null.
+  const [pushing, setPushing] = useState(null)
   const [loadError, setLoadError] = useState('')
   const [pushErrors, setPushErrors] = useState([])
   const [skipped, setSkipped] = useState([])
@@ -51,15 +52,19 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
     }
   }
 
-  async function handlePush() {
+  async function handlePush(what) {
     if (selected.size === 0) return
-    setPushing(true)
+    setPushing(what)
     setPushErrors([])
     setSkipped([])
     try {
-      const result = await api.devices.pushBulk(device.serial_number, [...selected])
+      const push = what === 'templates' ? api.devices.pushTemplatesBulk : api.devices.pushBulk
+      const result = await push(device.serial_number, [...selected])
       const errors = result.errors || []
-      const skips = errors.filter(isSkipReason)
+      // The template push files its deliberate skips (nothing captured, the
+      // device's own originals, a revocation) in `skipped`; the user push
+      // still mixes them into `errors`.
+      const skips = (result.skipped || []).concat(errors.filter(isSkipReason))
       const realErrors = errors.filter((e) => !isSkipReason(e))
       setSkipped(skips)
       setPushErrors(realErrors)
@@ -83,7 +88,7 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
     } catch (e) {
       setPushErrors([e.message])
     } finally {
-      setPushing(false)
+      setPushing(null)
     }
   }
 
@@ -167,15 +172,31 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
             })}
           </div>
 
-          <button
-            onClick={handlePush}
-            disabled={pushing || selected.size === 0}
-            className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-          >
-            {pushing
-              ? 'Pushing…'
-              : `Push ${selected.size} user${selected.size !== 1 ? 's' : ''} to device`}
-          </button>
+          <div className="flex flex-col gap-2">
+            <button
+              onClick={() => handlePush('users')}
+              disabled={pushing !== null || selected.size === 0}
+              className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+            >
+              {pushing === 'users'
+                ? 'Pushing…'
+                : `Push ${selected.size} user${selected.size !== 1 ? 's' : ''} to device`}
+            </button>
+            <button
+              onClick={() => handlePush('templates')}
+              disabled={pushing !== null || selected.size === 0}
+              className="w-full border border-blue-600 text-blue-700 hover:bg-blue-50 disabled:opacity-50 text-sm font-medium py-2 rounded-lg transition-colors"
+            >
+              {pushing === 'templates'
+                ? 'Pushing templates…'
+                : `Push templates of ${selected.size} user${selected.size !== 1 ? 's' : ''}`}
+            </button>
+            <p className="text-xs text-gray-400">
+              Templates are the fingerprints (and, on access-control doors, faces)
+              this app has stored. A person the device does not hold yet is sent
+              ahead of their templates.
+            </p>
+          </div>
         </>
       )}
     </Drawer>

@@ -6251,6 +6251,138 @@ class AttFingerprintPushTests(TemplatePushTestCase):
         self.assertIn("no confirmed user record for Pin=9001", withdrawn[0].last_error)
 
 
+class BulkTemplatePushTests(TemplatePushTestCase):
+    """Several people's stored biometrics onto one device in one request: the
+    single template push, once per person, with each person's refusal filed
+    under them instead of failing the request."""
+
+    def add_fingerprint(self, user_id="9001", finger_id=1, template="00a1ff10",
+                        source=None):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id=user_id, finger_id=finger_id,
+                                       valid=1, template=template,
+                                       source_device_sn=source or LEGACY_SN))
+            db.commit()
+        finally:
+            db.close()
+
+    def push_bulk(self, sn, user_ids):
+        return self.client.post(f"/devices/{sn}/templates/push_bulk",
+                                json={"user_ids": user_ids})
+
+    def heads(self, sn):
+        return [c.split("\t")[0] for c in self.commands_on(sn)]
+
+    def test_each_person_gets_their_fingers_and_their_record_only_where_missing(self):
+        self.create_employee("9002", name="Bilal Khan")
+        self.add_fingerprint("9001", finger_id=1)
+        self.add_fingerprint("9002", finger_id=6)
+        self.link(self.ATT_SN, "9001")
+
+        response = self.push_bulk(self.ATT_SN, ["9001", "9002"])
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.heads(self.ATT_SN), [
+            "DATA UPDATE FINGERTMP PIN=9001",
+            "DATA UPDATE USERINFO PIN=9002",
+            "DATA UPDATE FINGERTMP PIN=9002",
+        ])
+
+    def test_an_acc_door_gets_biodata_behind_the_user_record_and_permission(self):
+        self.add_template("9001", type=9, no=0)
+        self.push_bulk(self.SN, ["9001"])
+        self.assertEqual([c.split(" Pin=")[0] for c in self.commands_on(self.SN)], [
+            "DATA UPDATE user", "DATA UPDATE userauthorize", "DATA UPDATE BIODATA",
+        ])
+
+    def test_a_person_with_nothing_captured_is_skipped_and_the_rest_still_go(self):
+        self.create_employee("9002", name="Bilal Khan")
+        self.add_fingerprint("9002", finger_id=6)
+
+        body = self.push_bulk(self.ATT_SN, ["9001", "9002", "nobody"]).json()
+
+        self.assertEqual(body["pushed"], ["9002"])
+        self.assertEqual(body["skipped"], [
+            "9001: no fingerprint templates captured — they must enrol a finger "
+            "at a terminal first",
+        ])
+        self.assertEqual(body["errors"], ["nobody: employee not found in DB"])
+        self.assertEqual(self.heads(self.ATT_SN), [
+            "DATA UPDATE USERINFO PIN=9002", "DATA UPDATE FINGERTMP PIN=9002",
+        ])
+
+    def test_a_device_is_not_sent_back_the_fingers_it_captured_and_still_holds(self):
+        self.add_fingerprint("9001", finger_id=1, source=self.ATT_SN)
+        self.link(self.ATT_SN, "9001")
+
+        body = self.push_bulk(self.ATT_SN, ["9001"]).json()
+
+        self.assertEqual(body["pushed"], [])
+        self.assertEqual(len(body["skipped"]), 1)
+        self.assertIn(f"captured on {self.ATT_SN}", body["skipped"][0])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_an_outstanding_revocation_skips_the_person_and_queues_nothing_for_them(self):
+        self.add_fingerprint("9001", finger_id=1)
+        self.link(self.ATT_SN, "9001")
+        self.client.delete(f"/devices/{self.ATT_SN}/users/9001")
+        before = self.commands_on(self.ATT_SN)
+
+        body = self.push_bulk(self.ATT_SN, ["9001"]).json()
+
+        self.assertEqual(body["pushed"], [])
+        self.assertEqual(len(body["skipped"]), 1)
+        self.assertIn("revocation", body["skipped"][0])
+        self.assertEqual(self.commands_on(self.ATT_SN), before)
+
+    def test_a_template_that_cannot_go_on_the_wire_is_an_error_not_a_skip(self):
+        self.add_fingerprint("9001", finger_id=1, template="not hex")
+
+        body = self.push_bulk(self.ATT_SN, ["9001"]).json()
+
+        self.assertEqual(body["skipped"], [])
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertTrue(body["errors"][0].startswith(
+            "9001: stored template data cannot be put on the wire:"), body["errors"])
+        self.assertEqual(self.outbox(self.ATT_SN), [])
+
+    def test_the_answer_says_queued_with_the_command_and_template_counts(self):
+        """DeviceUsersDrawer.jsx shows `message` verbatim."""
+        self.add_fingerprint("9001", finger_id=1)
+        self.add_fingerprint("9001", finger_id=6)
+
+        response = self.push_bulk(self.ATT_SN, ["9001"])
+
+        body = response.json()
+        self.assertEqual((body["transport"], body["status"]), ("adms_queue", "queued"))
+        self.assertEqual(body["templates_queued"], 2)
+        self.assertEqual(body["command_ids"], [r.id for r in self.outbox(self.ATT_SN)])
+        self.assertEqual(
+            body["message"],
+            "Queued 3 commands (2 templates) for 1 person. At one command per "
+            "poll this takes roughly 30 seconds to drain, and nothing is "
+            "delivered until the device collects it.",
+        )
+
+    def test_each_person_queued_leaves_their_own_audit_entry(self):
+        from app.models import AuditLog
+        self.create_employee("9002", name="Bilal Khan")
+        self.add_fingerprint("9001", finger_id=1)
+        self.add_fingerprint("9002", finger_id=6)
+
+        self.push_bulk(self.ATT_SN, ["9001", "9002"])
+
+        db = self.Session()
+        try:
+            targets = [a.target for a in db.query(AuditLog)
+                       .filter_by(action="template_queue").order_by(AuditLog.id)]
+        finally:
+            db.close()
+        self.assertEqual(targets, [f"{self.ATT_SN}/9001", f"{self.ATT_SN}/9002"])
+
+
 class BiometricListingTests(TemplatePushTestCase):
     """What the operator reads before deciding to copy an enrolment."""
 
