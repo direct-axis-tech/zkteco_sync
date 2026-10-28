@@ -1307,6 +1307,15 @@ def list_device_users(sn: str, db: Session = Depends(get_db)):
     return [{"user_id": r.user_id, "uid": r.uid, "synced_at": r.synced_at} for r in rows]
 
 
+# Said whenever a push carried less than the person's privilege.
+_WITHHELD_PRIVILEGE = (
+    "Sent as an ordinary user, not an administrator: this device holds no "
+    "keypad password, fingerprint or face for them, so as an administrator "
+    "they would lock its menu. Their privilege here is unchanged — set a "
+    "keypad password or push their templates, then push them again."
+)
+
+
 @router.post("/{sn}/users/push_bulk", dependencies=[Depends(require_admin)])
 def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
                     db: Session = Depends(get_db)):
@@ -1335,6 +1344,7 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
     pushed = []
     errors = []
     queued = []
+    withheld = []
     for user_id in payload.user_ids:
         emp = db.query(Employee).filter_by(user_id=user_id).first()
         if not emp:
@@ -1350,6 +1360,8 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
                 "contradict it. Cancel the revocation to re-grant access."
             )
             continue
+        if provisioning.withholds_privilege(db, sn, emp):
+            withheld.append(user_id)
         queued.extend(r.id for r in queue_person(db, sn, emp))
         pushed.append(user_id)
 
@@ -1362,6 +1374,9 @@ def push_users_bulk(sn: str, payload: BulkPushRequest, response: Response,
         "pushed": pushed,
         "errors": errors,
         "command_ids": queued,
+        # Pushed, but as ordinary users: privileged people with no way to log
+        # in on this device (provisioning.withholds_privilege).
+        "privilege_withheld": withheld,
         # What the drawer shows verbatim (DeviceUsersDrawer.jsx), so it says
         # queued, with the honest drain time, and never "pushed".
         "message": (
@@ -1404,6 +1419,7 @@ def push_user_to_device(sn: str, user_id: str, response: Response, db: Session =
     blocked = _revocation_block(db, sn, user_id)
     if blocked:
         raise blocked
+    withheld = provisioning.withholds_privilege(db, sn, emp)
     if _uses_command_queue(device):
         rows = provisioning.provision(db, sn, emp)
     else:
@@ -1425,7 +1441,9 @@ def push_user_to_device(sn: str, user_id: str, response: Response, db: Session =
             f"device collects {'them' if plural else 'it'} on its next poll "
             "(about 10 seconds) and acknowledges afterwards — this is not "
             "delivered yet."
+            + (f" {_WITHHELD_PRIVILEGE}" if withheld else "")
         ),
+        "privilege_withheld": withheld,
     }
 
 
@@ -2220,6 +2238,7 @@ def enroll_user(
             # here to put them there with.
             raise HTTPException(status_code=404, detail="Employee not found")
 
+    withheld = emp is not None and provisioning.withholds_privilege(db, sn, emp)
     rows = provisioning.enrol_att_fingerprint(db, sn, user_id, finger_id, employee=emp)
     audit.record(db, admin.username, "fingerprint_enrol",
                  target=f"{sn}/{user_id}/{finger_id}", ip=client_ip(request),
@@ -2243,5 +2262,8 @@ def enroll_user(
             "the person must be standing at it then to press that finger. "
             "Watch Commands for the outcome; the new fingerprint is stored "
             "when the terminal uploads it."
+            + (f" {_WITHHELD_PRIVILEGE} Once this finger is enrolled, pushing "
+               "them again sends their privilege." if withheld else "")
         ),
+        "privilege_withheld": withheld,
     }

@@ -446,7 +446,10 @@ function DetailPanel({ employee, allDevices, onEdit, onDeleted, isAdmin }) {
       // commands on its next poll — about ten seconds — and confirms them
       // afterwards; claiming success here would be a guess.
       if (result?.status === 'queued') {
-        showToast(result.message || `Queued for ${pushDeviceSn} — not delivered yet`)
+        // Withheld privilege is a successful push reporting an unwelcome
+        // truth, which is what the lingering amber toast is for.
+        showToast(result.message || `Queued for ${pushDeviceSn} — not delivered yet`,
+                  result.privilege_withheld ? 'warn' : undefined)
       } else {
         showToast(`Written to ${pushDeviceSn}`)
       }

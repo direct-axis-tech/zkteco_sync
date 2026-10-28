@@ -5093,6 +5093,141 @@ class KeypadPasswordPushTests(ProvisioningTestCase):
         self.assertNotIn("sealed", handed)
 
 
+class AdminLockoutGuardTests(ProvisioningTestCase):
+    """A privileged person goes to a device as privileged only with a way to
+    log in there; otherwise as an ordinary user, said out loud, and without
+    losing their privilege anywhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("0001", name="Site Admin", privilege=14)
+
+    def ack_att(self, command_id, return_code=0):
+        return self.ack(command_id, return_code=return_code, cmd="DATA", sn=self.ATT_SN)
+
+    def deliver_all(self, sn):
+        """Poll and acknowledge until the device's outbox is empty."""
+        while self.outbox(sn):
+            command_id = self.outbox(sn)[0].id
+            self.poll(sn)
+            self.ack(command_id, return_code=0,
+                     cmd="DATA" if sn == self.ATT_SN else "DATA UPDATE", sn=sn)
+
+    def add_fingerprint(self, user_id="0001", source=LEGACY_SN):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id=user_id, finger_id=1, valid=1,
+                                       template="00a1ff10", source_device_sn=source))
+            db.commit()
+        finally:
+            db.close()
+
+    def sent_privilege(self, sn):
+        import re
+        return [int(m.group(1)) for row in self.outbox(sn)
+                for m in [re.search(r"\t(?:Pri|Privilege)=(\d+)", row.command)] if m]
+
+    def report_att(self, line):
+        self.client.post(f"/iclock/cdata?SN={self.ATT_SN}&table=OPERLOG&Stamp=9999",
+                         content=line + "\n")
+
+    def link_row(self, sn, user_id="0001"):
+        return next(l for l in self.links(sn) if l.user_id == user_id)
+
+    def test_an_admin_with_no_way_in_goes_to_an_attendance_terminal_as_ordinary(self):
+        body = self.push(self.ATT_SN, "0001").json()
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [0])
+        self.assertTrue(body["privilege_withheld"])
+        self.assertIn("Sent as an ordinary user, not an administrator", body["message"])
+        self.assertEqual(self.employee("0001").privilege, 14)
+
+    def test_an_admin_with_no_way_in_goes_to_a_door_as_ordinary(self):
+        self.push(self.SN, "0001")
+        self.assertEqual(self.sent_privilege(self.SN), [0])
+
+    def test_every_privileged_level_is_guarded_not_only_super_admin(self):
+        self.create_employee("0002", privilege=2)
+        self.push(self.ATT_SN, "0002")
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [0])
+
+    def test_an_ordinary_user_is_pushed_as_before(self):
+        self.create_employee("0002")
+        body = self.push(self.ATT_SN, "0002").json()
+        self.assertFalse(body["privilege_withheld"])
+        self.assertNotIn("ordinary user", body["message"])
+
+    def test_a_stored_keypad_password_is_a_way_in(self):
+        self.client.patch("/employees/0001", json={"keypad_password": "4821"})
+        body = self.push(self.ATT_SN, "0001").json()
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [14])
+        self.assertFalse(body["privilege_withheld"])
+
+    def test_a_card_alone_is_not_a_way_in(self):
+        self.client.patch("/employees/0001", json={"card": "778899"})
+        self.push(self.ATT_SN, "0001")
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [0])
+
+    def test_templates_pushed_with_the_record_are_a_way_in(self):
+        self.add_fingerprint()
+        self.client.post(f"/devices/{self.ATT_SN}/users/0001/templates/push")
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [14])
+
+    def test_a_fingerprint_the_device_captured_itself_is_a_way_in(self):
+        self.add_fingerprint(source=self.ATT_SN)
+        db = self.Session()
+        try:
+            employee_sync.link_device_employee(db, self.ATT_SN, "0001")
+            db.commit()
+        finally:
+            db.close()
+        self.push(self.ATT_SN, "0001")
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [14])
+
+    def test_a_fingerprint_the_device_acknowledged_is_a_way_in_on_a_later_push(self):
+        self.add_fingerprint()
+        self.client.post(f"/devices/{self.ATT_SN}/users/0001/templates/push")
+        self.deliver_all(self.ATT_SN)
+
+        self.push(self.ATT_SN, "0001")
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [14])
+
+    def test_a_bulk_push_names_only_the_people_whose_privilege_was_withheld(self):
+        self.create_employee("0002")
+        self.create_employee("0003", privilege=14, keypad_password="1357")
+        body = self.client.post(f"/devices/{self.ATT_SN}/users/push_bulk",
+                                json={"user_ids": ["0001", "0002", "0003"]}).json()
+        self.assertEqual(body["privilege_withheld"], ["0001"])
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [0, 0, 14])
+
+    def test_the_device_echoing_ordinary_does_not_demote_the_admin(self):
+        self.push(self.ATT_SN, "0001")
+        self.deliver_all(self.ATT_SN)
+        self.assertTrue(self.link_row(self.ATT_SN).privilege_withheld)
+
+        self.report_att("USER PIN=0001\tName=Site Admin\tPri=0\tPasswd=\tCard=\tGrp=1")
+        self.assertEqual(self.employee("0001").privilege, 14)
+
+    def test_a_device_that_got_the_full_privilege_can_still_report_a_demotion(self):
+        self.client.patch("/employees/0001", json={"keypad_password": "4821"})
+        self.push(self.ATT_SN, "0001")
+        self.deliver_all(self.ATT_SN)
+        self.assertFalse(self.link_row(self.ATT_SN).privilege_withheld)
+
+        self.report_att("USER PIN=0001\tName=Site Admin\tPri=0\tPasswd=\tCard=\tGrp=1")
+        self.assertEqual(self.employee("0001").privilege, 0)
+
+    def test_a_later_push_with_a_way_in_sends_the_privilege_and_clears_the_mark(self):
+        self.push(self.ATT_SN, "0001")
+        self.deliver_all(self.ATT_SN)
+        self.client.patch("/employees/0001", json={"keypad_password": "4821"})
+
+        self.push(self.ATT_SN, "0001")
+        self.assertEqual(self.sent_privilege(self.ATT_SN), [14])
+        self.deliver_all(self.ATT_SN)
+        self.assertFalse(self.link_row(self.ATT_SN).privilege_withheld)
+
+
 # ---------------------------------------------------------------------------
 # 20d. Transport routing: never both, for the same (device, user)
 # ---------------------------------------------------------------------------

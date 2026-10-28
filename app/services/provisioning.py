@@ -120,7 +120,7 @@ def _password_field(employee: Employee):
     return keypad_password.in_command(employee.keypad_password)
 
 
-def user_command(employee: Employee) -> str:
+def user_command(employee: Employee, privilege: int = None) -> str:
     """The `DATA UPDATE user` line for one person, §3.8 field order.
 
     Verbatim from the vendor's own example, which is the field order used
@@ -156,7 +156,8 @@ def user_command(employee: Employee) -> str:
     ``Privilege``
         0 = ordinary user, 14 = device administrator. Taken from the employee
         row, which the UI defaults to 0 — pushing 14 hands somebody the
-        terminal's own menus, so it is deliberately not implicit.
+        terminal's own menus, so it is deliberately not implicit. A caller
+        passes ``privilege`` to send less (:func:`withholds_privilege`).
     """
     return (
         "DATA UPDATE user "
@@ -168,7 +169,7 @@ def user_command(employee: Employee) -> str:
             "StartTime=0",
             "EndTime=0",
             f"Name={_wire_safe(employee.name)}",
-            f"Privilege={int(employee.privilege or 0)}",
+            f"Privilege={_privilege(employee, privilege)}",
         ])
     )
 
@@ -196,18 +197,26 @@ def authorize_command(user_id, timezone_id: int = None) -> str:
     return f"DATA UPDATE userauthorize Pin={_wire_safe(user_id)}{HT}AuthorizeTimezoneId={tz}"
 
 
-def commands_for(employee: Employee) -> list:
+def commands_for(employee: Employee, privilege: int = None) -> list:
     """Both command bodies for one person, in the order they must be sent."""
-    return [user_command(employee), authorize_command(employee.user_id)]
+    return [user_command(employee, privilege), authorize_command(employee.user_id)]
 
 
-def provision(db: Session, device_sn: str, employee: Employee) -> list:
+def provision(db: Session, device_sn: str, employee: Employee,
+              with_templates: bool = False) -> list:
     """Queue one person onto one `acc` terminal. Returns the outbox rows.
 
     Queued, not delivered: the device collects these on its next poll and
     acknowledges afterwards. Callers must not report this as done.
+
+    ``with_templates`` says the caller queues the person's templates right
+    behind this record, which is what lets an administrator keep their
+    privilege on a door that holds nothing else of theirs
+    (:func:`withholds_privilege`).
     """
-    rows = [commands.queue(db, device_sn, body) for body in commands_for(employee)]
+    privilege = _sent_privilege(db, device_sn, employee, with_templates)
+    rows = [commands.queue(db, device_sn, body)
+            for body in commands_for(employee, privilege)]
     log.info(
         "provisioning %s onto %s: queued command ids %s (user + userauthorize) "
         "— awaiting the device's next getrequest",
@@ -249,7 +258,7 @@ ATT_USER_TIME_ZONES = "0000000100000000"
 ATT_USER_VERIFY = 0
 
 
-def att_user_command(employee: Employee) -> str:
+def att_user_command(employee: Employee, privilege: int = None) -> str:
     """The `DATA UPDATE USERINFO` line for one person, §12.1.1.1 field order.
 
     The document's shape is
@@ -264,7 +273,8 @@ def att_user_command(employee: Employee) -> str:
         May be empty, as on the acc side: the terminal then shows the PIN.
     ``Pri``
         0 = ordinary user, 14 = super administrator (§12.1.1.1's table; the
-        SA20's admins report 14). From the employee row, never implied.
+        SA20's admins report 14). From the employee row, never implied; a
+        caller passes ``privilege`` to send less (:func:`withholds_privilege`).
     ``Passwd`` — sent only when one is stored
         The person's stored keypad password, as a sealed placeholder the
         dispatcher opens only on the wire (:func:`_password_field`). With
@@ -296,7 +306,7 @@ def att_user_command(employee: Employee) -> str:
         + HT.join([
             f"PIN={_wire_safe(employee.user_id)}",
             f"Name={_wire_safe(employee.name)}",
-            f"Pri={int(employee.privilege or 0)}",
+            f"Pri={_privilege(employee, privilege)}",
             *([f"Passwd={password}"] if password else []),
             f"Card={'' if card in _NO_CARD else card}",
             f"Grp={ATT_USER_GROUP}",
@@ -306,20 +316,100 @@ def att_user_command(employee: Employee) -> str:
     )
 
 
-def provision_att(db: Session, device_sn: str, employee: Employee) -> list:
+def provision_att(db: Session, device_sn: str, employee: Employee,
+                  with_templates: bool = False) -> list:
     """Queue one person onto one `att` terminal. Returns the outbox rows.
 
     One row, returned as a list so a caller answers the same way it does for
     :func:`provision`. Queued, not delivered: the link to the device is
     written when the terminal acknowledges (:func:`note_acknowledged`).
+    ``with_templates`` as for :func:`provision`.
     """
-    rows = [commands.queue(db, device_sn, att_user_command(employee))]
+    privilege = _sent_privilege(db, device_sn, employee, with_templates)
+    rows = [commands.queue(db, device_sn, att_user_command(employee, privilege))]
     log.info(
         "provisioning %s onto %s: queued command id %s (USERINFO) — awaiting "
         "the device's next getrequest",
         employee.user_id, device_sn, rows[0].id,
     )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Never an administrator who cannot log in
+# ---------------------------------------------------------------------------
+#
+# A ZKTeco terminal that holds any privileged user asks for one of them before
+# it opens its menu. A person pushed there as an administrator with nothing
+# the terminal can verify them by — no keypad password, no fingerprint or face
+# it holds — locks that menu for everyone, and the only way back in is over
+# the command queue. That is what happened when a whole device's people,
+# admins among them, were pushed to another before passwords or templates
+# went with them.
+#
+# So such a person is pushed with privilege 0 and the caller says so. Their
+# own privilege is untouched: the device link remembers it was withheld
+# (DeviceEmployee.privilege_withheld), so that device reporting them back as
+# an ordinary user does not demote them everywhere else, and a push once they
+# have a way to log in there sends the real one.
+
+def _privilege(employee: Employee, privilege) -> int:
+    return int(employee.privilege or 0) if privilege is None else int(privilege)
+
+
+def withholds_privilege(db: Session, device_sn: str, employee: Employee,
+                        with_templates: bool = False) -> bool:
+    """Would ``employee`` be privileged on ``device_sn`` with no way to log in?
+
+    Counts as a way in: a stored keypad password (pushed with them), the
+    templates the caller queues behind the record (``with_templates``), and
+    a biometric the device holds for them — one it captured itself, or one a
+    push to it was acknowledged for. A card does not count: whether a card
+    alone may open a terminal's menu depends on its verification settings,
+    and guessing wrong here is the lockout.
+    """
+    if not int(employee.privilege or 0):
+        return False
+    if with_templates or _password_field(employee):
+        return False
+    return not _device_holds_biometric(db, device_sn, employee.user_id)
+
+
+def _device_holds_biometric(db: Session, device_sn: str, user_id: str) -> bool:
+    if not is_on_device(db, device_sn, user_id):
+        return False
+    for table in (FingerprintTemplate, BiometricTemplate):
+        if (db.query(table.id)
+                .filter(table.user_id == str(user_id),
+                        table.source_device_sn == device_sn)
+                .first()):
+            return True
+    pin = _like_literal(_wire_safe(user_id))
+    return db.query(DeviceCommandLog.id).filter(
+        DeviceCommandLog.device_sn == device_sn,
+        DeviceCommandLog.outcome == "acknowledged",
+        DeviceCommandLog.command.like(f"DATA UPDATE FINGERTMP PIN={pin}{HT}%", escape="\\")
+        | DeviceCommandLog.command.like(f"DATA UPDATE BIODATA Pin={pin}{HT}%", escape="\\"),
+    ).first() is not None
+
+
+def _like_literal(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _sent_privilege(db: Session, device_sn: str, employee: Employee,
+                    with_templates: bool):
+    """The privilege to put in this push: None for the employee's own, 0 when
+    it is withheld."""
+    if not withholds_privilege(db, device_sn, employee, with_templates):
+        return None
+    log.warning(
+        "pushing %s to %s as an ordinary user, not privilege %s: they have no "
+        "keypad password stored and no fingerprint or face that device holds, "
+        "so as an administrator they would lock its menu",
+        employee.user_id, device_sn, employee.privilege,
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +435,21 @@ def pin_from_user_command(command: str):
     return match.group(1).strip() or None
 
 
+# The privilege a user record carried: `Privilege=` on acc, `Pri=` on att.
+_SENT_PRIVILEGE = re.compile(r"\t(?:Privilege|Pri)=(\d+)(?:\t|$)", re.IGNORECASE)
+
+
+def _remember_withheld_privilege(db: Session, link: DeviceEmployee, command: str):
+    """Mark the link when the record this device accepted carried less than
+    the employee's privilege, and clear the mark when it carried all of it."""
+    match = _SENT_PRIVILEGE.search(command or "")
+    employee = db.query(Employee).filter_by(user_id=link.user_id).first()
+    if not match or employee is None:
+        return
+    link.privilege_withheld = int(match.group(1)) < int(employee.privilege or 0)
+    db.flush()
+
+
 def note_acknowledged(db: Session, device_sn: str, command: str):
     """The device confirmed a user command: record the person as being on it.
 
@@ -360,6 +465,8 @@ def note_acknowledged(db: Session, device_sn: str, command: str):
     if not user_id:
         return None
     link = employee_sync.link_device_employee(db, device_sn, user_id)
+    if link is not None:
+        _remember_withheld_privilege(db, link, command)
     log.info(
         "device %s acknowledged the user record for %s — provisioned; the "
         "person can now enrol a face or finger at that terminal",
@@ -574,7 +681,8 @@ def push_templates(
     """
     rows = []
     if with_user_record:
-        rows.extend((queue_person or provision)(db, device_sn, employee))
+        rows.extend((queue_person or provision)(db, device_sn, employee,
+                                                with_templates=True))
     rows.extend(commands.queue(db, device_sn, body) for body in bodies)
     log.info(
         "queued %s biometric template(s) for %s onto %s%s — command ids %s; "

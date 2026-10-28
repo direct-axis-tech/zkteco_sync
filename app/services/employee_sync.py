@@ -445,12 +445,33 @@ def record_device_user(
     This is the entry point both transports call. Keeping it a single function
     is what guarantees the SDK pull and the ADMS push cannot drift apart in
     what they write.
+
+    One report of a privilege is not taken: a lower one from a device the
+    person was deliberately pushed to with less, because they had no way to
+    log in there as an administrator (DeviceEmployee.privilege_withheld).
+    That device saying "ordinary user" is the push, echoed — not a demotion.
     """
+    if _withheld_on(db, device_sn, user_id, privilege):
+        privilege = None
     emp = upsert_employee(db, user_id, name=name, privilege=privilege, card=card,
                           password=password)
     if emp is None:
         return None, None
     return emp, link_device_employee(db, device_sn, emp.user_id, uid)
+
+
+def _withheld_on(db: Session, device_sn, user_id, privilege) -> bool:
+    """Is ``privilege`` this device echoing a privilege the push withheld?"""
+    reported = _int_or_none(privilege)
+    user_id = str(user_id or "").strip()[:_USER_ID_LIMIT]
+    if reported is None or not user_id:
+        return False
+    link = db.query(DeviceEmployee).filter_by(
+        device_sn=str(device_sn or "").strip(), user_id=user_id).first()
+    if link is None or not link.privilege_withheld:
+        return False
+    emp = db.query(Employee).filter_by(user_id=user_id).first()
+    return emp is not None and reported < int(emp.privilege or 0)
 
 
 def record_device_fingerprint(db: Session, device_sn: str, user_id, finger_id,

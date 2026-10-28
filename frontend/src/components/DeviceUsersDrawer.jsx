@@ -20,6 +20,9 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
   const [loadError, setLoadError] = useState('')
   const [pushErrors, setPushErrors] = useState([])
   const [skipped, setSkipped] = useState([])
+  // Privileged people the push sent as ordinary users, because this device
+  // holds no password, fingerprint or face for them (privilege_withheld).
+  const [withheld, setWithheld] = useState([])
 
   useEffect(() => {
     Promise.all([
@@ -57,6 +60,7 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
     setPushing(what)
     setPushErrors([])
     setSkipped([])
+    setWithheld([])
     try {
       const push = what === 'templates' ? api.devices.pushTemplatesBulk : api.devices.pushBulk
       const result = await push(device.serial_number, [...selected])
@@ -68,6 +72,8 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
       const realErrors = errors.filter((e) => !isSkipReason(e))
       setSkipped(skips)
       setPushErrors(realErrors)
+      const lowered = result.privilege_withheld || []
+      setWithheld(lowered)
 
       // `transport` only appears on the adms_queue branch (see
       // push_users_bulk) — its absence is how the SDK branch, where
@@ -82,7 +88,7 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
         }
       }
 
-      if (skips.length === 0 && realErrors.length === 0) {
+      if (skips.length === 0 && realErrors.length === 0 && lowered.length === 0) {
         onClose()
       }
     } catch (e) {
@@ -117,6 +123,19 @@ export default function DeviceUsersDrawer({ device, onClose, showToast }) {
             <div className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
               <p className="font-medium mb-1">Skipped on purpose — not pushed</p>
               <p className="whitespace-pre-wrap">{skipped.join('\n')}</p>
+            </div>
+          )}
+
+          {withheld.length > 0 && (
+            <div className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+              <p className="font-medium mb-1">Pushed as ordinary users, not administrators</p>
+              <p className="mb-1">{withheld.join(', ')}</p>
+              <p className="text-xs">
+                This device holds no keypad password, fingerprint or face for
+                them, so as administrators they would lock its menu. Their
+                privilege is unchanged — set a keypad password or push their
+                templates, then push them again.
+              </p>
             </div>
           )}
 

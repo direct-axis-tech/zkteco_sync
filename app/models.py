@@ -145,6 +145,11 @@ class DeviceEmployee(Base):
     device_sn = Column(String(50), nullable=False, index=True)
     user_id = Column(String(24), nullable=False, index=True)
     uid = Column(Integer, nullable=False)  # device-local sequence number, varies per device
+    # True when the record this device acknowledged carried a lower privilege
+    # than the employee's, because they had no way to log in there as an
+    # administrator (provisioning.withholds_privilege). This device then
+    # reports them back as ordinary, and that report is not a demotion.
+    privilege_withheld = Column(Boolean, nullable=False, default=False)
     synced_at = Column(DateTime, default=_now, onupdate=_now)
 
     __table_args__ = (
