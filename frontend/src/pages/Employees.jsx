@@ -135,7 +135,7 @@ function Field({ label, hint, children }) {
   )
 }
 
-// Creating a person and editing one are the same six fields, minus the PIN:
+// Creating a person and editing one are the same fields, minus the PIN:
 // the PIN is the key every attendance record and every biometric hangs off,
 // so it is set once and never renamed.
 function EmployeeForm({ employee, onDone, onCancel }) {
@@ -145,6 +145,10 @@ function EmployeeForm({ employee, onDone, onCancel }) {
     name: employee?.name || '',
     card: employee && employee.card !== '0' ? employee.card : '',
     privilege: employee?.privilege ?? 0,
+    // Never pre-filled: the server does not hand a stored password back.
+    // Empty on an edit means "keep whatever is stored".
+    keypad_password: '',
+    remove_keypad_password: false,
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
@@ -156,17 +160,21 @@ function EmployeeForm({ employee, onDone, onCancel }) {
     setSaving(true)
     setError(null)
     try {
+      const edit = {
+        name: form.name,
+        card: form.card,
+        privilege: Number(form.privilege),
+      }
+      // Sent only when the operator said something about it: absent keeps the
+      // stored password, "" removes it.
+      if (form.remove_keypad_password) edit.keypad_password = ''
+      else if (form.keypad_password) edit.keypad_password = form.keypad_password
       const saved = editing
-        ? await api.employees.update(employee.user_id, {
-            name: form.name,
-            card: form.card,
-            privilege: Number(form.privilege),
-          })
+        ? await api.employees.update(employee.user_id, edit)
         : await api.employees.create({
             user_id: form.user_id.trim(),
-            name: form.name,
-            card: form.card,
-            privilege: Number(form.privilege),
+            ...edit,
+            keypad_password: form.keypad_password,
           })
       onDone(saved, editing)
     } catch (err) {
@@ -235,6 +243,41 @@ function EmployeeForm({ employee, onDone, onCancel }) {
             <option value={14}>Administrator</option>
           </select>
         </Field>
+
+        <Field
+          label="Keypad password"
+          hint={
+            editing && employee.has_keypad_password
+              ? 'A password is stored. Type a new one to replace it, or leave empty to keep it.'
+              : 'Optional, digits only, up to 8.'
+          }
+        >
+          <input
+            className="input w-full text-sm"
+            type="password"
+            inputMode="numeric"
+            autoComplete="new-password"
+            value={form.keypad_password}
+            onChange={(e) => set('keypad_password', e.target.value)}
+            disabled={form.remove_keypad_password}
+            pattern="[0-9]*"
+            maxLength={8}
+            placeholder={editing && employee.has_keypad_password ? 'Stored — unchanged' : ''}
+          />
+        </Field>
+        {/* Outside the Field: a checkbox inside that <label> would hand its
+            clicks to the password input. */}
+        {editing && employee.has_keypad_password && (
+          <label className="flex items-center gap-2 -mt-1 mb-3 text-xs text-gray-600 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={form.remove_keypad_password}
+              onChange={(e) => set('remove_keypad_password', e.target.checked)}
+              className="rounded"
+            />
+            Remove the stored password
+          </label>
+        )}
 
         {error && <p className="text-sm text-red-600 mb-3">{error}</p>}
 

@@ -32,6 +32,15 @@ router = APIRouter(prefix="/employees", tags=["employees"], dependencies=[Depend
 _PHOTO_SOURCE_PREFERENCE = ("biophoto", "userpic")
 
 
+def _cannot_seal(exc: RuntimeError) -> HTTPException:
+    """A keypad password was given and this server has no key to seal it
+    with (app/keypad_password.py). Nothing was saved."""
+    return HTTPException(
+        status_code=503,
+        detail=f"The keypad password cannot be stored: {exc}. Nothing was saved.",
+    )
+
+
 @router.get("", response_model=List[EmployeeOut])
 def list_employees(db: Session = Depends(get_db)):
     return db.query(Employee).order_by(Employee.name).all()
@@ -64,10 +73,13 @@ def create_employee(
             name=payload.name,
             privilege=payload.privilege,
             card=payload.card,
+            keypad_password=payload.keypad_password,
         )
     except ValueError as exc:
         # 409, not 400: the request is well-formed, the PIN is simply taken.
         raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise _cannot_seal(exc)
 
     db.commit()
     db.refresh(emp)
@@ -106,9 +118,12 @@ def update_employee(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    changed = employee_sync.apply_operator_edit(
-        db, emp, **payload.model_dump(exclude_unset=True)
-    )
+    try:
+        changed = employee_sync.apply_operator_edit(
+            db, emp, **payload.model_dump(exclude_unset=True)
+        )
+    except RuntimeError as exc:
+        raise _cannot_seal(exc)
     db.commit()
     db.refresh(emp)
 

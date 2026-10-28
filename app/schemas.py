@@ -81,6 +81,12 @@ class EmployeeOut(BaseModel):
         from_attributes = True
 
 
+# A device keypad takes digits only; eight is the most this application
+# accepts, which no terminal it has met exceeds (the Security PUSH document
+# says "up to 6").
+_KEYPAD_PASSWORD = dict(max_length=8, pattern=r"^[0-9]*$")
+
+
 class EmployeeCreate(BaseModel):
     """A person an operator is adding centrally, before any device knows them.
 
@@ -94,6 +100,8 @@ class EmployeeCreate(BaseModel):
     # inherited from anything: 14 hands somebody the terminal's own menus.
     privilege: int = 0
     card: str = Field(default="", max_length=20)
+    # Empty is "none". Stored sealed; never returned (see EmployeeOut).
+    keypad_password: str = Field(default="", **_KEYPAD_PASSWORD)
 
 
 class EmployeeUpdate(BaseModel):
@@ -108,6 +116,8 @@ class EmployeeUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=100)
     privilege: Optional[int] = None
     card: Optional[str] = Field(default=None, max_length=20)
+    # Absent keeps the stored password, "" removes it, digits replace it.
+    keypad_password: Optional[str] = Field(default=None, **_KEYPAD_PASSWORD)
 
 
 class DeviceEmployeeOut(BaseModel):

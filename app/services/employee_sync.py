@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app import keypad_password
+from app import keypad_password as keypad_seal
 from app.models import (
     BiometricTemplate, DeviceEmployee, Employee, EmployeePhoto,
     FingerprintTemplate,
@@ -109,10 +109,10 @@ def _apply_keypad_password(emp: Employee, password: str) -> bool:
         log.warning("keypad password for %s refused: not a value a terminal can "
                     "be given back", emp.user_id)
         return False
-    if keypad_password.unseal(emp.keypad_password) == password:
+    if keypad_seal.unseal(emp.keypad_password) == password:
         return False
     try:
-        emp.keypad_password = keypad_password.seal(password)
+        emp.keypad_password = keypad_seal.seal(password)
     except RuntimeError as exc:
         # No key to seal with. The rest of the person still lands: losing a
         # whole sync over one field would be worse than not keeping it.
@@ -276,12 +276,15 @@ def unlink_device_employee(db: Session, device_sn: str, user_id: str) -> bool:
 _UNSET = object()
 
 
-def create_employee(db: Session, user_id, *, name="", privilege=0, card=""):
+def create_employee(db: Session, user_id, *, name="", privilege=0, card="",
+                    keypad_password=""):
     """Create one employee row from operator input.
 
     Raises ValueError if the user_id is missing or already taken — a PIN is
     the device's primary key for a person, so silently merging into somebody
-    else's row would be the worst possible outcome of a typo.
+    else's row would be the worst possible outcome of a typo. Raises
+    RuntimeError, creating nothing, for a keypad password there is no key to
+    seal with.
     """
     user_id = str(user_id or "").strip()[:_USER_ID_LIMIT]
     if not user_id:
@@ -297,6 +300,7 @@ def create_employee(db: Session, user_id, *, name="", privilege=0, card=""):
         # "0" not "": the column's own convention for "no card", shared with
         # the device and with every fallback in the UI.
         card=(str(card or "").strip()[:_CARD_LIMIT] or "0"),
+        keypad_password=_operator_seal(keypad_password),
     )
     db.add(emp)
     db.flush()
@@ -304,13 +308,24 @@ def create_employee(db: Session, user_id, *, name="", privilege=0, card=""):
     return emp
 
 
+def _operator_seal(password):
+    """The stored form of a keypad password an operator typed: None for
+    none, the sealed value otherwise. Raises RuntimeError when there is no
+    key — to an operator that is an error to show, not a field to drop."""
+    password = str(password or "").strip()
+    return keypad_seal.seal(password) if password else None
+
+
 def apply_operator_edit(db: Session, emp: Employee, *,
-                        name=_UNSET, privilege=_UNSET, card=_UNSET):
+                        name=_UNSET, privilege=_UNSET, card=_UNSET,
+                        keypad_password=_UNSET):
     """Apply a deliberate edit. Unlike a device, an operator may empty a field.
 
     Only the fields passed are touched. Returns the set of field names that
     actually changed, so the caller can audit the edit rather than the
-    request.
+    request — a changed keypad password is named, its value never is.
+    Raises RuntimeError, changing nothing, for a keypad password there is no
+    key to seal with.
     """
     changed = set()
 
@@ -333,6 +348,12 @@ def apply_operator_edit(db: Session, emp: Employee, *,
         if emp.card != value:
             emp.card = value
             changed.add("card")
+
+    if keypad_password is not _UNSET:
+        typed = str(keypad_password or "").strip()
+        if typed != (keypad_seal.unseal(emp.keypad_password) or ""):
+            emp.keypad_password = _operator_seal(typed)
+            changed.add("keypad_password")
 
     if changed:
         emp.updated_at = _now()

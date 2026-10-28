@@ -4663,6 +4663,84 @@ class EmployeeCreationTests(ProvisioningTestCase):
         self.assertEqual(len(self.outbox()), before)
 
 
+class OperatorKeypadPasswordTests(ProvisioningTestCase):
+    """An operator may set, change and remove a person's keypad password; the
+    API never hands it back."""
+
+    def stored(self, user_id="9001"):
+        from app import keypad_password
+        return keypad_password.unseal(self.employee(user_id).keypad_password)
+
+    def audit_details(self):
+        from app.models import AuditLog
+        db = self.Session()
+        try:
+            return [a.detail for a in db.query(AuditLog)
+                    .filter_by(action="employee_update").order_by(AuditLog.id)]
+        finally:
+            db.close()
+
+    def test_a_password_given_at_creation_is_stored_sealed(self):
+        response = self.create_employee("9001", name="Aisha", keypad_password="4821")
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(self.stored(), "4821")
+        self.assertNotIn("4821", self.employee("9001").keypad_password)
+
+    def test_the_api_says_set_and_never_returns_the_password(self):
+        body = self.create_employee("9001", keypad_password="4821").json()
+        self.assertTrue(body["has_keypad_password"])
+        self.assertNotIn("keypad_password", body)
+        self.assertNotIn("4821", self.client.get("/employees/9001").text)
+        self.assertNotIn("4821", self.client.get("/employees").text)
+
+    def test_an_edit_replaces_the_password(self):
+        self.create_employee("9001", keypad_password="4821")
+        self.client.patch("/employees/9001", json={"keypad_password": "1111"})
+        self.assertEqual(self.stored(), "1111")
+
+    def test_an_empty_password_in_an_edit_removes_it(self):
+        self.create_employee("9001", keypad_password="4821")
+        body = self.client.patch("/employees/9001", json={"keypad_password": ""}).json()
+        self.assertFalse(body["has_keypad_password"])
+        self.assertIsNone(self.employee("9001").keypad_password)
+
+    def test_an_edit_that_does_not_mention_the_password_keeps_it(self):
+        self.create_employee("9001", keypad_password="4821")
+        self.client.patch("/employees/9001", json={"name": "Aisha R"})
+        self.assertEqual(self.stored(), "4821")
+
+    def test_the_audit_names_the_change_and_not_the_value(self):
+        self.create_employee("9001")
+        self.client.patch("/employees/9001", json={"keypad_password": "4821"})
+        self.client.patch("/employees/9001", json={"keypad_password": "4821"})
+        self.assertEqual(self.audit_details(), ["keypad_password"])
+
+    def test_a_password_a_keypad_cannot_type_is_refused(self):
+        for bad in ("12ab", "123456789", "12 34"):
+            with self.subTest(bad=bad):
+                response = self.client.post(
+                    "/employees", json={"user_id": "9001", "keypad_password": bad})
+                self.assertEqual(response.status_code, 422, response.text)
+        self.assertIsNone(self.employee("9001"))
+
+    def test_without_a_key_to_seal_with_nothing_is_saved(self):
+        from unittest import mock
+        self.create_employee("9001", name="Aisha")
+        with mock.patch.object(config, "SECRET_KEY", None):
+            created = self.create_employee("9002", keypad_password="4821")
+            edited = self.client.patch("/employees/9001",
+                                       json={"name": "Changed", "keypad_password": "4821"})
+        self.assertEqual((created.status_code, edited.status_code), (503, 503))
+        self.assertIsNone(self.employee("9002"))
+        self.assertEqual(self.employee("9001").name, "Aisha")
+
+    def test_a_device_report_does_not_erase_what_an_operator_typed(self):
+        self.create_employee("9001", keypad_password="4821")
+        self.client.post(f"/iclock/cdata?SN={self.ATT_SN}&table=OPERLOG&Stamp=9999",
+                         content="USER PIN=9001\tName=\tPri=0\tPasswd=\tCard=\tGrp=1\n")
+        self.assertEqual(self.stored(), "4821")
+
+
 # ---------------------------------------------------------------------------
 # 20c. Provisioning onto an `acc` terminal, over the queue
 # ---------------------------------------------------------------------------
