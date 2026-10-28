@@ -13,8 +13,8 @@ from zk.exception import ZKErrorConnection, ZKNetworkError
 from app import audit, config, keypad_password
 from app.database import get_db
 from app.models import (
-    Device, DeviceCommandLog, DeviceCommandOutbox, DeviceEmployee, Employee,
-    FingerprintTemplate, User,
+    BiometricTemplate, Device, DeviceCommandLog, DeviceCommandOutbox,
+    DeviceEmployee, Employee, FingerprintTemplate, User,
 )
 from app.deps import require_admin, require_auth
 from app.net import client_ip, valid_cidrs
@@ -1741,6 +1741,25 @@ def pull_templates(sn: str, response: Response, db: Session = Depends(get_db)):
     row, created = provisioning.query_att_users(db, sn)
     return _queued_query_response(sn, [row], int(created), response,
                                   "its fingerprints (and the users they belong to)")
+
+
+@router.get("/{sn}/templates/sendable")
+def list_sendable_templates(sn: str, db: Session = Depends(get_db)):
+    """Who has stored templates this device could be sent, and how many.
+
+    One row per person with any stored template for this device's protocol
+    (`biometric_templates` on `acc`, `fingerprint_templates` on `att`):
+    ``sendable`` is what push_templates_to_device would queue for them now,
+    ``withheld`` what it would hold back because this device captured them
+    and still holds the person. Counts only — no template bytes.
+    """
+    device = _get_device_or_404(sn, db)
+    table = BiometricTemplate if _uses_command_queue(device) else FingerprintTemplate
+    return [
+        {"user_id": user_id, "sendable": sendable, "withheld": withheld}
+        for user_id, (sendable, withheld)
+        in sorted(provisioning.template_counts(db, sn, table).items())
+    ]
 
 
 @router.post("/{sn}/users/{user_id}/templates/push")

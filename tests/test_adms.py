@@ -6796,6 +6796,59 @@ class BulkTemplatePushTests(TemplatePushTestCase):
         self.assertEqual(targets, [f"{self.ATT_SN}/9001", f"{self.ATT_SN}/9002"])
 
 
+class SendableTemplateListingTests(TemplatePushTestCase):
+    """What the device users drawer reads to offer a filter by who has
+    anything to push: per person, what a template push would send."""
+
+    def add_fingerprint(self, user_id="9001", finger_id=1, source=LEGACY_SN):
+        from app.models import FingerprintTemplate
+        db = self.Session()
+        try:
+            db.add(FingerprintTemplate(user_id=user_id, finger_id=finger_id, valid=1,
+                                       template="00a1ff10", source_device_sn=source))
+            db.commit()
+        finally:
+            db.close()
+
+    def listing(self, sn):
+        response = self.client.get(f"/devices/{sn}/templates/sendable")
+        self.assertEqual(response.status_code, 200, response.text)
+        return {r["user_id"]: (r["sendable"], r["withheld"]) for r in response.json()}
+
+    def test_an_attendance_terminal_counts_fingerprints(self):
+        self.create_employee("9002")
+        self.add_fingerprint("9001", 1)
+        self.add_fingerprint("9001", 6)
+        self.add_fingerprint("9002", 1)
+        self.add_template("9001")          # a door template: not this wire
+        self.assertEqual(self.listing(self.ATT_SN), {"9001": (2, 0), "9002": (1, 0)})
+
+    def test_a_door_counts_biodata_templates(self):
+        self.add_template("9001", type=9, no=0)
+        self.add_fingerprint("9001", 1)
+        self.assertEqual(self.listing(self.SN), {"9001": (1, 0)})
+
+    def test_the_devices_own_captures_are_withheld_only_while_it_holds_the_person(self):
+        self.add_fingerprint("9001", 1, source=self.ATT_SN)
+        self.add_fingerprint("9001", 6)
+        self.assertEqual(self.listing(self.ATT_SN), {"9001": (2, 0)})
+        self.link(self.ATT_SN)
+        self.assertEqual(self.listing(self.ATT_SN), {"9001": (1, 1)})
+
+    def test_the_counts_agree_with_what_a_push_queues(self):
+        self.add_fingerprint("9001", 1, source=self.ATT_SN)
+        self.add_fingerprint("9001", 6)
+        self.link(self.ATT_SN)
+        sendable, _ = self.listing(self.ATT_SN)["9001"]
+        body = self.push_templates(self.ATT_SN).json()
+        self.assertEqual(body["templates_queued"], sendable)
+
+    def test_the_listing_carries_no_template_bytes(self):
+        self.add_fingerprint("9001", 1)
+        text = self.client.get(f"/devices/{self.ATT_SN}/templates/sendable").text
+        self.assertNotIn("00a1ff10", text)
+
+
 class BiometricListingTests(TemplatePushTestCase):
     """What the operator reads before deciding to copy an enrolment."""
 

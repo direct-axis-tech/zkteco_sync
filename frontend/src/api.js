@@ -192,6 +192,8 @@ export const api = {
     // queued) apart from `errors`, unlike pushBulk.
     pushTemplatesBulk: (sn, user_ids) =>
       request('POST', `/devices/${sn}/templates/push_bulk`, { user_ids }),
+    // Per person, how many stored templates a push to this device would send.
+    sendableTemplates: (sn) => request('GET', `/devices/${sn}/templates/sendable`),
     enrollUser: (sn, userId, fingerId) =>
       request('POST', `/devices/${sn}/users/${userId}/enroll`, { finger_id: fingerId }),
     deleteTemplate: (sn, userId, fingerId) =>

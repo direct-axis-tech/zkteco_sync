@@ -61,6 +61,7 @@ import binascii
 import logging
 import re
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import config, keypad_password
@@ -600,6 +601,31 @@ def _withhold_while_held(db: Session, device_sn: str, user_id: str, rows) -> tup
     sendable = [r for r in rows if r.source_device_sn != device_sn]
     own = [r for r in rows if r.source_device_sn == device_sn]
     return sendable, own
+
+
+def template_counts(db: Session, device_sn: str, table) -> dict:
+    """``{user_id: (sendable, withheld)}`` for everyone with a stored template
+    in ``table`` (BiometricTemplate on `acc`, FingerprintTemplate on `att`).
+
+    The rule of :func:`_withhold_while_held`, counted for everyone at once
+    rather than queried per person: what a push to ``device_sn`` would send
+    for them, and how many of their templates it would hold back because
+    this device captured them and still holds the person. Lets a list of
+    people say who has anything to push before any push is tried.
+    """
+    held = {row.user_id for row in
+            db.query(DeviceEmployee.user_id).filter_by(device_sn=device_sn)}
+    counts = {}
+    rows = (db.query(table.user_id, table.source_device_sn == device_sn, func.count(table.id))
+            .group_by(table.user_id, table.source_device_sn == device_sn))
+    for user_id, own, n in rows:
+        sendable, withheld = counts.get(user_id, (0, 0))
+        if own and user_id in held:
+            withheld += n
+        else:
+            sendable += n
+        counts[user_id] = (sendable, withheld)
+    return counts
 
 
 def template_commands(templates, build=None) -> tuple:
