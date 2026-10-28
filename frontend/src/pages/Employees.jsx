@@ -248,8 +248,8 @@ function EmployeeForm({ employee, onDone, onCancel }) {
           label="Keypad password"
           hint={
             editing && employee.has_keypad_password
-              ? 'A password is stored. Type a new one to replace it, or leave empty to keep it.'
-              : 'Optional, digits only, up to 8.'
+              ? 'A password is stored. Type a new one to replace it, or leave empty to keep it. A device gets the change when the person is next pushed to it.'
+              : 'Optional, digits only, up to 8. Sent to a device whenever the person is pushed to it.'
           }
         >
           <input

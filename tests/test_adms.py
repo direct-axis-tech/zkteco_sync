@@ -5001,6 +5001,98 @@ class AttProvisioningTests(ProvisioningTestCase):
         self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["0036", "036"])
 
 
+class KeypadPasswordPushTests(ProvisioningTestCase):
+    """A stored keypad password goes to the device with the person — and is
+    in the clear only on the line the device is handed."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_employee("0036", name="Basila Haider", keypad_password="4821")
+
+    def ack_att(self, command_id, return_code=0):
+        return self.ack(command_id, return_code=return_code, cmd="DATA", sn=self.ATT_SN)
+
+    def test_an_attendance_push_hands_the_device_passwd_after_pri(self):
+        self.push(self.ATT_SN, "0036")
+        handed = self.poll(self.ATT_SN)
+        self.assertIn("\tPri=0\tPasswd=4821\tCard=\t", handed)
+
+    def test_an_access_control_push_hands_the_door_the_password(self):
+        self.push(self.SN, "0036")
+        self.assertIn("\tPassword=4821\tGroup=", self.poll(self.SN))
+
+    def test_a_person_with_no_password_is_pushed_as_before(self):
+        self.create_employee("036", name="Ahmed Ali")
+        self.push(self.ATT_SN, "036")
+        self.push(self.SN, "036")
+        self.assertNotIn("Passwd=", self.outbox(self.ATT_SN)[0].command)
+        self.assertIn("\tPassword=\tGroup=", self.outbox(self.SN)[0].command)
+
+    def test_the_queued_row_holds_the_sealed_value_not_the_digits(self):
+        self.push(self.ATT_SN, "0036")
+        stored = self.outbox(self.ATT_SN)[0].command
+        self.assertNotIn("4821", stored)
+        self.assertIn("\tPasswd={sealed:", stored)
+
+    def test_nothing_that_shows_a_command_shows_the_password(self):
+        pushed = self.push(self.ATT_SN, "0036").json()
+        listed = self.client.get(f"/devices/{self.ATT_SN}/commands").json()
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, -1004)
+        history = self.client.get(f"/devices/{self.ATT_SN}/commands/history").json()
+
+        for shown in (pushed["commands"][0], listed[0]["command"], history[0]["command"]):
+            with self.subTest(shown=shown):
+                self.assertIn("\tPasswd=<set>\t", shown)
+                self.assertNotIn("4821", shown)
+                self.assertNotIn("sealed", shown)
+
+    def test_the_log_never_carries_the_password(self):
+        with self.assertLogs(level="INFO") as logs:
+            self.push(self.ATT_SN, "0036")
+            command_id = self.outbox(self.ATT_SN)[0].id
+            self.poll(self.ATT_SN)
+            self.ack_att(command_id)
+        self.assertFalse([line for line in logs.output if "4821" in line], logs.output)
+
+    def test_the_acknowledged_push_still_links_the_person(self):
+        self.push(self.ATT_SN, "0036")
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id)
+        self.assertEqual([l.user_id for l in self.links(self.ATT_SN)], ["0036"])
+
+    def test_a_retried_push_hands_the_device_the_password_again(self):
+        self.push(self.ATT_SN, "0036")
+        command_id = self.outbox(self.ATT_SN)[0].id
+        self.poll(self.ATT_SN)
+        self.ack_att(command_id, -1004)
+        log_id = self.history(self.ATT_SN)[0].id
+
+        retried = self.client.post(f"/devices/{self.ATT_SN}/commands/history/{log_id}/retry")
+
+        self.assertNotIn("4821", retried.text)
+        self.assertIn("\tPasswd=4821\t", self.poll(self.ATT_SN))
+
+    def test_a_bulk_push_carries_each_persons_password(self):
+        self.create_employee("036", name="Ahmed Ali", keypad_password="7350")
+        self.client.post(f"/devices/{self.ATT_SN}/users/push_bulk",
+                         json={"user_ids": ["0036", "036"]})
+        handed = [self.poll(self.ATT_SN) for _ in range(2)]
+        self.assertIn("\tPasswd=4821\t", handed[0])
+        self.assertIn("\tPasswd=7350\t", handed[1])
+
+    def test_a_password_the_key_can_no_longer_open_goes_out_empty(self):
+        """SECRET_KEY rotated between queueing and delivery."""
+        from unittest import mock
+        self.push(self.ATT_SN, "0036")
+        with mock.patch.object(config, "SECRET_KEY", "y" * 48):
+            handed = self.poll(self.ATT_SN)
+        self.assertIn("\tPasswd=\tCard=", handed)
+        self.assertNotIn("sealed", handed)
+
+
 # ---------------------------------------------------------------------------
 # 20d. Transport routing: never both, for the same (device, user)
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ import re
 
 from sqlalchemy.orm import Session
 
-from app import config
+from app import config, keypad_password
 from app.models import (
     BiometricTemplate, DeviceCommandLog, DeviceCommandOutbox, DeviceEmployee,
     Employee, FingerprintTemplate,
@@ -106,6 +106,20 @@ def _card_field(card) -> str:
     return "0" if value in _NO_CARD else value
 
 
+def _password_field(employee: Employee):
+    """The value a user command carries for the person's keypad password, or
+    None when none is stored or the current key cannot open it.
+
+    Never the digits: the command is a database row and a line in the
+    Commands drawer long before it is a line on the wire, so it carries the
+    sealed value and commands.wire_line opens it at dispatch
+    (keypad_password.in_command / revealed).
+    """
+    if not keypad_password.unseal(employee.keypad_password):
+        return None
+    return keypad_password.in_command(employee.keypad_password)
+
+
 def user_command(employee: Employee) -> str:
     """The `DATA UPDATE user` line for one person, §3.8 field order.
 
@@ -124,10 +138,11 @@ def user_command(employee: Employee) -> str:
     ``CardNo``
         0 when there is no card. See :func:`_card_field`.
     ``Password``
-        Sent **empty**. This application has no concept of a device keypad
-        password, and the people it provisions verify by face or finger.
-        Worth knowing, because DATA UPDATE is an upsert: pushing a person who
-        already has a keypad password set on the terminal will clear it.
+        The person's stored keypad password (Employee.keypad_password), as
+        a sealed placeholder the dispatcher opens only on the wire — see
+        :func:`_password_field`. **Empty** when none is stored, as before
+        passwords were kept: DATA UPDATE is an upsert, so pushing a person
+        with no stored password clears one set at the terminal's keypad.
     ``Group``
         config.PROVISION_USER_GROUP (0 by default, as in the vendor example).
         Access-group membership is not how this application grants access.
@@ -148,7 +163,7 @@ def user_command(employee: Employee) -> str:
         + HT.join([
             f"Pin={_wire_safe(employee.user_id)}",
             f"CardNo={_card_field(employee.card)}",
-            "Password=",
+            f"Password={_password_field(employee) or ''}",
             f"Group={int(config.PROVISION_USER_GROUP)}",
             "StartTime=0",
             "EndTime=0",
@@ -250,14 +265,16 @@ def att_user_command(employee: Employee) -> str:
     ``Pri``
         0 = ordinary user, 14 = super administrator (§12.1.1.1's table; the
         SA20's admins report 14). From the employee row, never implied.
-    ``Passwd`` — not sent
-        This application holds no keypad password. Sending ``Passwd=`` empty
-        would assert one — that the person has none — and DATA UPDATE is an
-        upsert, so on a terminal that merges fields it would wipe a password
-        set at the keypad. Left out, a terminal that merges keeps it, and one
-        that replaces the record clears it either way. The vendor's own sample
-        records (§12.5.2, `DATA UPDATE USERINFO PIN=1 Name=1 Pri=0 Passwd=1
-        Grp=1`) leave fields out the same way.
+    ``Passwd`` — sent only when one is stored
+        The person's stored keypad password, as a sealed placeholder the
+        dispatcher opens only on the wire (:func:`_password_field`). With
+        none stored it is left out: ``Passwd=`` empty would assert that the
+        person has none, and DATA UPDATE is an upsert, so on a terminal that
+        merges fields it would wipe a password set at the keypad. Left out, a
+        terminal that merges keeps it, and one that replaces the record clears
+        it either way. The vendor's own sample records (§12.5.2, `DATA UPDATE
+        USERINFO PIN=1 Name=1 Pri=0 Passwd=1 Grp=1`) leave fields out the same
+        way.
     ``Card``
         The card number as a string (§12.1.1.1's format b). "No card" is
         ``Card=`` empty, which is how the SA20 reports a cardless person — the
@@ -273,12 +290,14 @@ def att_user_command(employee: Employee) -> str:
         the same reason as ``Passwd``.
     """
     card = _wire_safe(employee.card)
+    password = _password_field(employee)
     return (
         "DATA UPDATE USERINFO "
         + HT.join([
             f"PIN={_wire_safe(employee.user_id)}",
             f"Name={_wire_safe(employee.name)}",
             f"Pri={int(employee.privilege or 0)}",
+            *([f"Passwd={password}"] if password else []),
             f"Card={'' if card in _NO_CARD else card}",
             f"Grp={ATT_USER_GROUP}",
             f"TZ={ATT_USER_TIME_ZONES}",

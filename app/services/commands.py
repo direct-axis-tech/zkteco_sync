@@ -52,7 +52,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app import config
+from app import config, keypad_password
 from app.models import DeviceCommandLog, DeviceCommandOutbox
 from app.services import devicecontrol
 
@@ -77,8 +77,9 @@ def strip_envelope(command: str) -> str:
 
 
 def wire_line(row: DeviceCommandOutbox) -> str:
-    """The exact bytes handed to the device for one command (§3.8)."""
-    return f"C:{row.id}:{row.command}"
+    """The exact bytes handed to the device for one command (§3.8) — the one
+    place a queued keypad password is opened (app/keypad_password.py)."""
+    return f"C:{row.id}:{keypad_password.revealed(row.command)}"
 
 
 # A command that takes access away rather than granting it (E8). Matched on
@@ -458,7 +459,8 @@ def queue(db: Session, device_sn: str, command: str,
     db.add(row)
     db.commit()
     db.refresh(row)
-    log.info("command %s queued for %s: %s", row.id, device_sn, row.command[:120])
+    log.info("command %s queued for %s: %s", row.id, device_sn,
+             keypad_password.masked(row.command)[:120])
     return row
 
 
@@ -684,17 +686,18 @@ def next_commands(db: Session, device_sn: str, limit: int = None, now: datetime 
             row_id, device_sn, attempts,
         )
 
-    lines = []
+    lines, shown = [], []
     for row in live[:limit]:
         row.attempts += 1
         row.status = "sent"
         row.sent_at = now
         row.next_attempt_at = now + backoff_for(row.attempts, row.command)
         lines.append(wire_line(row))
+        shown.append(keypad_password.masked(f"C:{row.id}:{row.command}"))
 
     db.commit()
     if lines:
-        log.info("handed %s command(s) to %s: %s", len(lines), device_sn, lines)
+        log.info("handed %s command(s) to %s: %s", len(lines), device_sn, shown)
     return lines
 
 

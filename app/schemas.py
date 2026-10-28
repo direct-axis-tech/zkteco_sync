@@ -2,6 +2,8 @@ from pydantic import BaseModel, Field, computed_field, field_serializer
 from datetime import datetime
 from typing import Literal, Optional, List
 
+from app import keypad_password
+
 
 class DeviceCreate(BaseModel):
     serial_number: str
@@ -185,6 +187,10 @@ class CommandOut(BaseModel):
     created_at: datetime
     sent_at: Optional[datetime] = None
 
+    @field_serializer("command")
+    def _command_without_passwords(self, command: str) -> str:
+        return keypad_password.masked(command)
+
     class Config:
         from_attributes = True
 
@@ -208,6 +214,10 @@ class CommandLogOut(BaseModel):
     created_at: datetime
     sent_at: Optional[datetime] = None
     concluded_at: datetime
+
+    @field_serializer("command")
+    def _command_without_passwords(self, command: str) -> str:
+        return keypad_password.masked(command)
 
     @computed_field
     @property

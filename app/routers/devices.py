@@ -10,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from zk.exception import ZKErrorConnection, ZKNetworkError
 
-from app import audit, config
+from app import audit, config, keypad_password
 from app.database import get_db
 from app.models import (
     Device, DeviceCommandLog, DeviceCommandOutbox, DeviceEmployee, Employee,
@@ -762,7 +762,7 @@ def retry_command(
     return {
         "id": new_row.id,
         "device_sn": sn,
-        "command": new_row.command,
+        "command": keypad_password.masked(new_row.command),
         "retried_from_log_id": log_id,
         "was_device_refusal": was_refusal,
         "verdict": verdict,
@@ -1416,7 +1416,7 @@ def push_user_to_device(sn: str, user_id: str, response: Response, db: Session =
         "transport": "adms_queue",
         "status": "queued",
         "command_ids": [r.id for r in rows],
-        "commands": [r.command for r in rows],
+        "commands": [keypad_password.masked(r.command) for r in rows],
         # Said in the response rather than only in a docstring, because
         # this string is what the UI shows and what stops "pushed" from
         # being read as "done".
@@ -2233,7 +2233,7 @@ def enroll_user(
         "status": "queued",
         "user_record_queued": not already_there,
         "command_ids": [r.id for r in rows],
-        "commands": [r.command for r in rows],
+        "commands": [keypad_password.masked(r.command) for r in rows],
         "message": (
             f"Queued the enrolment of finger {finger_id} for {user_id} at {sn}"
             + (" behind the person's user record, which this terminal has not "

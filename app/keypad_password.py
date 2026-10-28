@@ -14,10 +14,21 @@ Rotating SECRET_KEY makes every stored password unreadable. :func:`unseal`
 then answers None, which every caller treats as "no password stored" — the
 person is pushed without one, exactly as before this column existed, and the
 next device report or operator edit seals it again under the new key.
+
+In a queued command
+-------------------
+A push has to put the digits on the wire, but a queued command is a row in
+`device_command_outbox`, then in `device_command_log`, and it is listed in
+the Commands drawer and written to the log. So the command is queued with
+:func:`in_command` — the sealed value in a ``{sealed:…}`` placeholder — and
+:func:`revealed` swaps the digits in only for the line handed to the device.
+Everything that shows a command shows :func:`masked`, ``<set>``. A retry
+re-queues the placeholder, not the digits, so it works the same way.
 """
 
 import base64
 import logging
+import re
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -61,3 +72,26 @@ def unseal(token):
         log.warning("a stored keypad password could not be unsealed with the "
                     "current SECRET_KEY; treating it as not set")
         return None
+
+
+# Fernet tokens are URL-safe base64: no TAB, no newline, no brace, so the
+# placeholder can never swallow the field separator that follows it.
+_IN_COMMAND = re.compile(r"\{sealed:([A-Za-z0-9_=-]+)\}")
+
+
+def in_command(token: str) -> str:
+    """The field value a queued command carries for a stored password."""
+    return f"{{sealed:{token}}}"
+
+
+def revealed(command: str) -> str:
+    """``command`` as the device must receive it: each placeholder replaced by
+    the password it seals. One this key cannot open (SECRET_KEY rotated after
+    it was queued) becomes an empty field — the person is still delivered,
+    with no password, rather than not at all."""
+    return _IN_COMMAND.sub(lambda m: unseal(m.group(1)) or "", command)
+
+
+def masked(command: str) -> str:
+    """``command`` as anyone but the device may see it."""
+    return _IN_COMMAND.sub("<set>", command or "")
